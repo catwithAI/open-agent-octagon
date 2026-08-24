@@ -1,0 +1,1 @@
+"""Consortium insight subsystem."""

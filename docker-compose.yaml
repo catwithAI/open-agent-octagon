@@ -1,0 +1,76 @@
+# OpenAgentOctagon 后端的容器化部署。
+#
+#   docker compose up -d --build
+#   docker compose logs -f octagon
+#
+# 关键点：
+# - `mem_limit` 是防止后端把宿主机拖垮的机制：超限只杀容器，机器仍可管理。
+#   按部署机内存调整；纯展示节点可以更低。
+# - agent CLI 从宿主机 bind mount 进来，**不打进镜像**——它们是被测对象，
+#   打进镜像会改变被测环境的定义（见 Dockerfile 顶部说明）。
+# - 场景目录（envs）通过 volume 挂载 + 配置 envs_path 注入，不打进镜像。
+
+services:
+  octagon:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: open-agent-octagon:latest
+    container_name: octagon
+    restart: always
+    ports:
+      - "8100:8100"
+
+    # ---- 资源上限 -----------------------------------------------------
+    # 上限把「后端自己 OOM」与「整台宿主机不可管理」分开：超限只杀容器，
+    # 机器仍可登录处置，restart 再拉起。按部署机内存调整。
+    mem_limit: 6g
+    mem_reservation: 2g
+    # memswap_limit 必须等于 mem_limit，否则 docker 会额外允许等量 swap，
+    # 进程写满 swap 而不触发 OOM kill，限额形同虚设。设成相等即禁用 swap。
+    memswap_limit: 6g
+    cpus: "4.0"
+    # 子进程多（agent CLI + MCP server），放宽 pid 上限但仍有界，防 fork 炸。
+    pids_limit: 4096
+
+    environment:
+      # 凭据来自 .env 文件，**不写进 compose、不进 git**。
+      - BLADE_API_KEY=${BLADE_API_KEY:-}
+      - BLADE_GATEWAY_API_KEY=${BLADE_GATEWAY_API_KEY:-}
+      - BLADE_JUDGE_API_KEY=${BLADE_JUDGE_API_KEY:-}
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
+      - OPENROUTER_MANAGEMENT_KEY=${OPENROUTER_MANAGEMENT_KEY:-}
+      - OCTAGON_ENVS_PATH=/app/envs
+      - SELECTED_SKILLS_DIR=${SELECTED_SKILLS_DIR:-}
+      # agent CLI 装在宿主机的各自目录里，必须补进 PATH——adapter 用
+      # shutil.which 找 CLI，漏了直接 cli_not_found。按你的安装位置调整。
+      - PATH=/app/.venv/bin:/host-cli/bin:/usr/local/bin:/usr/bin:/bin
+
+    volumes:
+      # 运行数据与产物：必须持久化，否则重建容器就丢历史。
+      - ./data:/app/data
+      - ./octagon.yaml:/app/octagon.yaml:ro
+      # 场景目录：指向你的 agent-octagon-envs checkout（配 OCTAGON_ENVS_PATH）。
+      - ${OCTAGON_ENVS_HOST_DIR:-./envs}:/app/envs:ro
+      # ---- agent CLI 从宿主机注入（不打进镜像，只读）----
+      # 指向你宿主机上安装 agent CLI 的目录。
+      - ${HOST_CLI_DIR:-/dev/null}:/host-cli/bin:ro
+      # 外部专有 skill 源（部分 env 需要）；没有就留空目录。
+      - ${SELECTED_SKILLS_HOST_DIR:-/dev/null}:/app/selected-skills:ro
+
+    # blade server / llm-gateway 若在宿主机上，容器需能回连。
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8100/api/healthz"]
+      interval: 30s
+      timeout: 10s
+      start_period: 40s
+      retries: 3
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"

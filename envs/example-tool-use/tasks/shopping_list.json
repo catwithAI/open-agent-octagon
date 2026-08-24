@@ -1,0 +1,16 @@
+{
+  "id": "shopping_list",
+  "env_name": "example-tool-use",
+  "prompt": "You are keeping a shopping list in a notebook. Use the add_note tool to add these three items, one note per item: \"milk\", \"eggs\", \"bread\". You can call list_notes to check your work.",
+  "context": {
+    "fake_agent": {
+      "tool_calls": [
+        {"name": "add_note", "arguments": {"text": "milk"}},
+        {"name": "add_note", "arguments": {"text": "eggs"}},
+        {"name": "add_note", "arguments": {"text": "bread"}}
+      ]
+    }
+  },
+  "constraints": {},
+  "timeout_seconds": 600
+}

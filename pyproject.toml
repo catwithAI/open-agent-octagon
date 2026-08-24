@@ -1,0 +1,63 @@
+[project]
+name = "open-agent-octagon"
+version = "0.1.0"
+description = "OpenAgentOctagon — same-task, multi-agent comparison harness for evaluating coding/model agents side by side"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "pydantic>=2.6",
+    "pydantic-settings>=2.5",
+    "httpx>=0.27",
+    "aiosqlite>=0.20",
+    "pyyaml>=6.0",
+    "python-socketio[asyncio_client]>=5.11",
+    "mcp>=1.0",
+    "rfc8785>=0.1.4",
+]
+
+[project.urls]
+Homepage = "https://github.com/catwithAI/open-agent-octagon"
+Repository = "https://github.com/catwithAI/open-agent-octagon"
+
+[project.optional-dependencies]
+# blade-agent adapter 走 REST + Socket.IO。适配器是懒 import + cli_not_found 早退，
+# 缺此包不影响其余 agent，故设为可选依赖。
+blade = [
+    "blade-agent-kit>=1.1.7",
+]
+# dsh（DeepSeek Harness）走 Python SDK，同样懒 import、可选。pin 精确版本——
+# dsh 是 developer preview，明示会有 breaking change。
+dsh = [
+    "deepseek-harness-sdk==0.1.0rc6",
+]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "respx>=0.21",
+    "python-multipart>=0.0.18",
+    # blade_skill/tools.py 在 blade-agent 进程加载,这里仅为单测 import 时用。
+    "langchain>=0.3",
+    "langchain-core>=0.3",
+    # swebench-pytest-* 的 materials 是完整上游 src 树，import 它需要 pytest
+    # 当时的运行时依赖。评测机（沙盒 / CLI agent 侧）同样要装这一组。
+    "py>=1.9",
+    "iniconfig>=1.0",
+    "toml>=0.10",
+    "more-itertools>=8.4",
+    "wcwidth>=0.2",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["backend", "octagon"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+pythonpath = ["."]

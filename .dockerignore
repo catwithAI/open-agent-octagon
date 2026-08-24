@@ -1,0 +1,41 @@
+# 构建上下文瘦身 + 防止把凭据和历史数据打进镜像。
+
+# 凭据：绝不进镜像
+octagon.yaml
+.env
+*.bak
+*.bak-*
+
+# 运行数据与产物（bind mount 进来，不该固化在镜像里）
+data/
+logs/
+reports/
+
+# 前端（后端镜像不需要）
+web/node_modules/
+web/dist/
+
+# Python 本地环境与缓存
+.venv/
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# 版本控制与本地工具配置
+.git/
+.github/
+.claude/
+.idea/
+.vscode/
+
+# 测试与文档（运行时不需要）
+tests/
+docs/
+*.md
+!README.md
+
+# 杂项
+.DS_Store
+skills-lock.json

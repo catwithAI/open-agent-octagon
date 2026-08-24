@@ -1,0 +1,19 @@
+name: example-tool-use
+schema_version: "1.0"
+type: skill
+category: baseline
+test_focus: "最小的工具调用示例：agent 通过 env 提供的业务工具（便签本）完成任务，业务状态落 env DB，scorer 据此判分。用于 quickstart 与契约参考。"
+description: "OpenAgentOctagon 自带的 skill 类示例场景。env 暴露 add_note / list_notes 两个工具，任务要求 agent 存入若干便签；scorer 读 env DB 检查业务状态。演示工具注册、Env Attempt Server 调用与业务态判分的完整链路。"
+pass_threshold: 100
+
+prerequisites:
+  level: none
+  summary: "零特殊依赖，工具与判分都是本地 SQLite。"
+  requires:
+    - "python3"
+  on_missing: "无（自包含）。"
+
+dimensions:
+  - name: task_completion
+    weight: 100
+    description: "便签本 env DB 中的便签数是否达到任务要求。"

@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+*.egg-info/
+
+# 本地数据 / 日志
+data/
+logs/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# 配置(只入库 example,不入库真实凭据)
+.env
+.env.local
+octagon.yaml
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# 本地 Agent 配置；项目级 Skills 需要随仓库保存
+.agents/*
+!.agents/skills/
+!.agents/skills/**
+
+# 历史归档资料（非代码产物）
+docs/patents/
+docs/insights/
+
+# 本地协作工作树与生成式分析报告
+.claude/
+reports/
+report/
+coding_world
+RUNTRACE_*.html
+RUNTRACE_*.md
+TRAJECTORY_API_TRACE_CONTRAST_ANALYSIS.md
+ba-agent-eval-benchmark-selection.html

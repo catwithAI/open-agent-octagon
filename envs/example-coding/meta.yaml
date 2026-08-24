@@ -1,0 +1,19 @@
+name: example-coding
+schema_version: "1.0"
+type: coding
+category: coding
+test_focus: "最小编程示例：agent 读题、计算一个确定性结果、把答案写到 answer.txt。用于 quickstart 与契约参考，不含隐藏数据集。"
+description: "OpenAgentOctagon 自带的编程类示例场景。任务给一个可精确验证的小计算题，agent 需把最终答案写到 workspace 的 answer.txt。scorer 做精确匹配打分。"
+pass_threshold: 100
+
+prerequisites:
+  level: none
+  summary: "零特殊依赖，只需能读写工作区文件。"
+  requires:
+    - "python3"
+  on_missing: "无（自包含）。"
+
+dimensions:
+  - name: answer_correctness
+    weight: 100
+    description: "answer.txt 是否精确等于参考答案（去除首尾空白）。"

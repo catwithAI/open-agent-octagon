@@ -1,0 +1,19 @@
+{
+  "id": "sum_of_squares",
+  "env_name": "example-coding",
+  "prompt": "Compute the sum of the squares of the first 10 positive integers (1^2 + 2^2 + ... + 10^2). Write exactly the final number, with no explanation or label, to `answer.txt` in the workspace root.",
+  "context": {
+    "answer_contract": "workspace/answer.txt",
+    "fake_agent": {
+      "files": {
+        "answer.txt": "385"
+      }
+    }
+  },
+  "constraints": {
+    "required_outputs": [
+      "answer.txt"
+    ]
+  },
+  "timeout_seconds": 600
+}

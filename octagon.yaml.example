@@ -1,0 +1,252 @@
+# Octagon 本地配置样板。
+# 复制为 octagon.yaml(已 gitignore)后填实际值。
+# 环境变量优先级高于本文件,见每个字段注释。
+
+octagon:
+  # Octagon 数据目录:attempt trace / blade events / final_state / sqlite DB。
+  # env: OCTAGON_DATA_PATH
+  data_path: "./data"
+
+  # env 仓库根。M1 默认仓库内 envs/。
+  # env: OCTAGON_ENVS_PATH
+  envs_path: "./envs"
+
+  # Versioned research method profiles (metadata only; never contains keys).
+  # env: OCTAGON_PROFILES_PATH
+  profiles_path: "./profiles"
+
+  # blade skill `tools.py` 通过 HTTP 回调 Env Attempt Server 的地址。
+  # blade-agent 进程访问此地址,所以必须是 blade 能解析到的对外 URL。
+  # 跨机器部署时不要写 127.0.0.1,要写当前 Octagon 机器对 blade 可达的 IP/域名。
+  # env: OCTAGON_PUBLIC_BASE_URL
+  public_base_url: "http://127.0.0.1:8100"
+
+  # 全局 attempt 并发闸，旧 /runs 与 Experiment/RunGroup 共用。
+  # env: OCTAGON_MAX_ACTIVE_ATTEMPTS（允许 1..32）
+  max_active_attempts: 16
+  # Experiment protocol deployment ceilings. Profiles/request overrides may
+  # tighten but never widen these values.
+  research_max_cells: 1000
+  research_max_attempts: 32000
+  research_capture_max_policy: metadata
+  research_launch_stagger_ms: 300
+
+  # 纯展示部署：只迁移历史数据、对外展示的节点开这个。开启后后端拒绝
+  # 一切执行型写请求（创建/调度/停止/重跑，403），不要求任何模型或成本凭据，
+  # 历史 Run/Attempt/wire/artifact/score/cost 仍可完整读取。拒绝在后端，
+  # 不依赖前端隐藏入口。默认 false = 普通可执行部署。
+  display_only: false
+
+  # 常驻 deadline sweeper：周期扫描超过持久化 deadline 的执行/评分任务
+  # 并收敛，不必等到下次重启。0 = 关闭。
+  deadline_sweep_interval_seconds: 60
+  deadline_sweep_grace_seconds: 60
+
+  # 启动恢复单个 wire spool 的体积上限。超限的 attempt 直接隔离成
+  # failed manifest 并记原因，原始 spool 保留供离线分析——709 MB 的 spool 曾把
+  # 恢复路径的 RSS 推到约 7.6 GiB 并打爆 16 GiB 无 swap 的展示节点。0 = 不限制。
+  wire_recovery_max_spool_bytes: 268435456
+
+  # 外部专有 skill 源目录（部分 env 的 core.py import 它）。仓库外资产——
+  # 换机器需改此项，否则相关 env 加载报错。自包含的 env 不需要它。
+  # load_settings 会桥接到 SELECTED_SKILLS_DIR 环境变量。
+  # env: SELECTED_SKILLS_DIR
+  # selected_skills_path: "/path/to/selected-skills"
+
+blade:
+  # 已运行的 blade-agent server 地址。
+  # env: BLADE_BASE_URL
+  base_url: "http://localhost:8020"
+
+  # blade-agent web 界面创建长期 API Key(`sk-blade-v2-*`)。
+  # Octagon 用 blade_agent_kit.BladeAgentClient 调 REST + Socket.IO。
+  # env: BLADE_API_KEY
+  api_key: ""
+
+  # blade server 启动时的 SKILLS_PATH。Octagon 启动期通过
+  # `sync_blade_skills()` 把 envs/<env>/blade_skill/ 同步到 <skills_path>/octagon/<env>/。
+  # env: BLADE_SKILLS_PATH
+  skills_path: "/tmp/octagon/blade-skills"
+
+  # attempt 跑完是否保留 blade session(便于人工复现)。默认 cleanup。
+  keep_blade_session: false
+
+  # 四类 timeout 分开：task.timeout_seconds 是整个 attempt 总时限；这里分别是
+  # REST 单请求、无活动判定、Socket 重连宽限。Blade server 单轮 LLM 请求另由
+  # LLM_REQUEST_TIMEOUT_SECONDS（默认 300）控制。
+  request_timeout_seconds: 30
+  inactivity_timeout_seconds: 300
+  reconnect_timeout_seconds: 30
+  progress_poll_interval_seconds: 4
+
+research_features:
+  # Rollout: false (off) → 在隔离部署逐项 true (internal) → 验收后才改产品默认值。
+  # Schema presence alone does not enable a writer。回滚只把对应 flag 改回 false；
+  # 不删除 Experiment、RunGroup、derived payload 或 audit 数据，已有只读旧 Run 不受影响。
+  experiments: false
+  task_variants: false
+  run_groups: false
+  leader_events: false
+  robustness: false
+  profiles: false
+  auto_profile: false
+  insights: false
+  research_feedback: false
+  normalized_output: false
+  attack_coverage: false
+
+# Consortium Insights 使用独立生成通道，不继承 env judge 或 agent provider。
+# 未同时配置 base_url/model/API key 环境变量时保持 unavailable；feature flag
+# 仍须单独开启。禁止在 YAML 中填写 key 明文，api_key_env 只填写变量名。
+insights:
+  provider: openai_compatible  # openai_compatible（默认）| blade（可选）
+  # base_url: "https://example.invalid/v1"
+  # model: "provider/model-name"
+  api_key_env: INSIGHTS_API_KEY
+  timeout_seconds: 120
+  max_tokens: 4000
+  temperature: 0
+  # blade provider 需要专用、无环境工具副作用的生成 skill：
+  # blade_primary_skill_id: "octagon-insight-generator"
+  keep_blade_session: false
+
+# CC/Codex 的第三方模型 provider（blade 的模型列表走 /api/blade/models 实时查，
+# 不在这里配）。请求体里用 "<provider名>/<模型名>" 引用，如 "openrouter/glm-5.2"：
+# - claude-code：子进程注入 ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN（不是
+#   ANTHROPIC_API_KEY——CLI 用它发 x-api-key，很多内网网关只认
+#   Authorization: Bearer，两者是不同的 HTTP 认证协议，混用会被 401）；
+#   custom_headers 可选，原样转成 ANTHROPIC_CUSTOM_HEADERS（网关鉴权/记账
+#   需要的自定义头，如 "x-user-id: octagon"）。
+# - codex：单次调用 -c model_providers.* 覆盖，不改全局 ~/.codex/config.toml；
+#   要求上游支持 OpenAI Responses API（wire_api="responses"，Codex 新版本已不
+#   支持 "chat"）——blade llm-gateway 目前只有 /v1/messages 和
+#   /v1/chat/completions，没有 /v1/responses，接不了，除非部署额外的协议
+#   兼容代理（见 docs/codex-vllm-installation.md 的思路）。
+# api key 解析：api_key_env 指向的环境变量优先，未设时回落到 provider 的
+# api_key 字段（octagon.yaml 不进仓库，可直填；本 example 文件勿填真 key）。
+# 注意 provider 名不要与 blade gateway 的 source 名（如 upstream）重名。
+#
+# 示例：让 claude-code 走本机 49 的 blade llm-gateway，跟 blade-agent 用同一批模型
+# （same-model 对比时填 "blade-local/upstream/z-ai/glm-5.2" 这种串）：
+# model_providers:
+#   blade-local:
+#     kind: anthropic
+#     base_url: "http://127.0.0.1:30000"
+#     api_key_env: "BLADE_GATEWAY_API_KEY"   # 值同 blade.api_key，见下方
+#     custom_headers: "x-user-id: octagon"
+#   openrouter:
+#     kind: openai-chat        # openai-chat | anthropic | vllm-responses
+#     base_url: "https://openrouter.ai/api/v1"
+#     api_key_env: "OPENROUTER_API_KEY"
+#     wire_api: "chat"         # codex 用；anthropic 端点不涉及
+#
+# 可选 agent 字段：声明该 provider 前缀服务于哪个 agent。用于 same-model 页
+# 「OpenRouter 全量下拉列裸模型名 + 按选中 agent 自动拼前缀」——选 claude-code
+# 就给裸名拼 or-cc/ 前缀、选 codex 拼 or-codex/。不配则该下拉退回手动带前缀。
+#   or-cc:
+#     kind: anthropic-messages
+#     base_url: "https://openrouter.ai/api"
+#     api_key_env: "OPENROUTER_API_KEY"
+#     agent: claude-code
+#   or-codex:
+#     kind: openai-responses
+#     base_url: "https://openrouter.ai/api/v1"
+#     api_key_env: "OPENROUTER_API_KEY"
+#     agent: codex
+#
+# kimi-code / opencode / mimo-code 走 openai chat 协议的自定义 provider
+# （adapter 各自生成 config.toml / config.json 注入），base 需带 /v1。
+# 三者各配一份：`agent:` 一个 provider 只能绑一个 agent。
+#   or-kimi:
+#     kind: openai-chat-completions
+#     base_url: "https://openrouter.ai/api/v1"
+#     api_key_env: "OPENROUTER_API_KEY"
+#     agent: kimi-code
+#   or-opencode:
+#     kind: openai-chat-completions
+#     base_url: "https://openrouter.ai/api/v1"
+#     api_key_env: "OPENROUTER_API_KEY"
+#     agent: opencode
+#   or-mimo:
+#     kind: openai-chat-completions
+#     base_url: "https://openrouter.ai/api/v1"
+#     api_key_env: "OPENROUTER_API_KEY"
+#     agent: mimo-code
+#   # dsh 走 Python SDK（deepseek-harness-sdk），adapter 按 attempt 生成
+#   # 一份 cordis.yml 并把这里的 base_url/key 写进 pi-ai route。
+#   or-dsh:
+#     kind: openai-chat-completions
+#     base_url: "https://openrouter.ai/api/v1"
+#     api_key_env: "OPENROUTER_API_KEY"
+#     agent: dsh
+#
+# 模型选型提示（2026-07-27 在 49 实测）：kimi-code / opencode / mimo-code 三者
+# 搭配国产模型都正常——glm-5、kimi-k3、deepseek-v4-pro、qwen3.5-plus、
+# minimax-m3 逐个验过可用。**已知例外：mimo-code 打 openai/gpt-5.5 会被上游
+# 拒**（"The model produced invalid content"，aka.ms/model-error，即 OpenRouter
+# 路由到 Azure 后端时返回的错误）；同一模型 opencode/kimi 正常，换任一国产模型
+# 或 sonnet 后 mimo 也正常，故是 mimo×gpt-5.5 的上游兼容问题，与接入无关。
+
+# 前端 CC/Codex 模型下拉的建议候选（自由输入仍可用）。
+# model_suggestions:
+#   - "blade-local/upstream/z-ai/glm-5.2"
+#   - "openrouter/glm-5.2"
+#   - "opus"
+
+llm_judge:
+  # 所有 LLM-as-judge 共用，包括 PPT visual repair、GDPVal、PresentBench
+  # 官方 slide judge 和 prompt-authoring judge。全部通过 Blade session 运行，
+  # base_url/api_key 复用上面的 blade 配置。
+
+  # Blade 模型目录中的模型 ID；空值使用 Blade 默认模型。
+  # env override: LLM_JUDGE_MODEL
+  model: ""
+
+  timeout: 900            # env: LLM_JUDGE_TIMEOUT
+  keep_session: false     # env: LLM_JUDGE_KEEP_SESSION
+
+# Run 级成本核算。
+#
+# 回答的问题：一次 run 内 N 个 session 加上评分，最终从上游扣了多少钱。
+# 做法是每次 run 动态创建一把 OpenRouter 临时 key，run 内全部 agent session
+# 与 judge 共用它，结束后读累计 usage 做差值——不建逐请求账本。
+#
+# **Management Key 只能走环境变量，本文件不提供直填入口**：它能创建/禁用
+# 任意额度的 key，权限远高于普通 provider key，因此特意不参与
+# "yaml api_key → os.environ" 的桥接（那条路径会把值送进每个 agent 子进程）。
+#
+# 默认 enabled: false —— 不开启时行为与本功能不存在时完全一致。
+cost:
+  enabled: false
+  management_key_env: OPENROUTER_MANAGEMENT_KEY
+  base_url: "https://openrouter.ai/api/v1"
+  # 每次 run 的预算上限（USD）。超了上游直接拒绝，run 会中途失败——
+  # 观测一段时间后按实际分布调整。留空则只记账、不设闸门。
+  # 旧的 run 级一把 key 生命周期。默认 false。
+  # **与 per-attempt 互斥**：打开它会同时关掉 attempt/judge 生命周期，
+  # 这是回退开关不是叠加——两套并存会重复建 key，且旧审计的
+  # clear_credential(run_id) 会清掉正在用的 judge 凭据。
+  legacy_run_key_enabled: false
+  # 旧 run 级 key 的上限（仅 legacy_run_key_enabled=true 时生效）
+  run_key_limit_usd: 5.0
+  # per-attempt 生命周期：每把 key 各自的上限。
+  # 6 attempt + judge ≈ 上游总闸门 $7，与旧的 $5/run 同量级。
+  # **不要把它和 run_key_limit_usd 混用**——两条生命周期并存期间
+  # 各自有默认值，改一个会悄悄腰斩或放大另一个。
+  attempt_key_limit_usd: 1.0
+  judge_key_limit_usd: 1.0
+  # 清理失败的孤儿 key 靠它自动失效，必须显著大于最长 run 时长。
+  run_key_expiry_hours: 48
+  # 判稳：连续 stable_threshold 次读到同一累计 usage 才定稿。
+  # 超时不写 0，记录停在 settling 交给后台 settler 续算。
+  poll_interval_seconds: 5
+  stable_threshold: 3
+  settle_timeout_seconds: 300
+  background_scan_interval_seconds: 60
+  max_settle_attempts: 20
+  # 创建 run key 失败时：true=降级为共享 key 上界继续跑（默认，成本观测
+  # 不该阻断实验）；false=让 run 失败。
+  downgrade_on_key_failure: true
+  # 降级路径要观测的共享 key 的 hash（不是明文）。配了才能记 run 前后
+  # usage 差作为**上界**——该差值含其他机器/个人的流量，不可用于资金归因。
+  # shared_key_hash: "..."
