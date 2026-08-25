@@ -118,7 +118,7 @@ insights:
 #   custom_headers 可选，原样转成 ANTHROPIC_CUSTOM_HEADERS（网关鉴权/记账
 #   需要的自定义头，如 "x-user-id: octagon"）。
 # - codex：单次调用 -c model_providers.* 覆盖，不改全局 ~/.codex/config.toml；
-#   要求上游支持 OpenAI Responses API（wire_api="responses"，Codex 新版本已不
+#   要求上游支持 OpenAI Responses API（kind: openai-responses，Codex 新版本已不
 #   支持 "chat"）——blade llm-gateway 目前只有 /v1/messages 和
 #   /v1/chat/completions，没有 /v1/responses，接不了，除非部署额外的协议
 #   兼容代理（见 docs/codex-vllm-installation.md 的思路）。
@@ -130,15 +130,14 @@ insights:
 # （same-model 对比时填 "blade-local/upstream/z-ai/glm-5.2" 这种串）：
 # model_providers:
 #   blade-local:
-#     kind: anthropic
+#     kind: anthropic-messages
 #     base_url: "http://127.0.0.1:30000"
 #     api_key_env: "BLADE_GATEWAY_API_KEY"   # 值同 blade.api_key，见下方
 #     custom_headers: "x-user-id: octagon"
 #   openrouter:
-#     kind: openai-chat        # openai-chat | anthropic | vllm-responses
+#     kind: openai-chat-completions   # openai-chat-completions | anthropic-messages | openai-responses
 #     base_url: "https://openrouter.ai/api/v1"
 #     api_key_env: "OPENROUTER_API_KEY"
-#     wire_api: "chat"         # codex 用；anthropic 端点不涉及
 #
 # 可选 agent 字段：声明该 provider 前缀服务于哪个 agent。用于 same-model 页
 # 「OpenRouter 全量下拉列裸模型名 + 按选中 agent 自动拼前缀」——选 claude-code
