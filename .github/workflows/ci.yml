@@ -41,7 +41,10 @@ jobs:
 
       # 有测试就跑；tests/ 目录尚未建立时 pytest 退出码 5（no tests collected）
       # 视为通过，避免"还没有测试"把 CI 卡红。一旦加了测试即自动纳入门禁。
+      # GitHub Actions 默认 shell 带 -e，pytest 一返回非零就会在 code=$? 之前
+      # 终止脚本；这里显式用不带 -e 的 bash 才能处理退出码 5。
       - name: Pytest
+        shell: bash --noprofile --norc {0}
         run: |
           uv run pytest -q
           code=$?
