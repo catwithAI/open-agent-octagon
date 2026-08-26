@@ -8,6 +8,12 @@ side by side in one UI.
 
 > Octagon (the UFC cage) — agents compete on the same stage, differences laid bare.
 
+<p align="center">
+  <img src="docs/images/en-01-scores.png" alt="Run detail — 7 agents on the same task, scores side by side" width="100%">
+  <br>
+  <em>One run, seven agents on the same SWE-bench task — scores, cost, and behavior compared column by column.</em>
+</p>
+
 OpenAgentOctagon is a **comparison tool**, not a leaderboard. Its core output is
 "the visualized difference between several agents doing the same thing"; scoring is only
 a quantitative anchor for locating those differences. Each comparison captures three things:
@@ -41,6 +47,20 @@ it scans the `envs_path` directory and dynamically loads each scenario's
 ```
 
 The full contract for writing scenarios is in [docs/environments.md](docs/environments.md).
+
+---
+
+## Screenshots
+
+Every screenshot below is **one run** — the same SWE-bench task (`sphinx-class-property`) handed to
+seven agents (`blade-agent`, `claude-code`, `codex`, `kimi-code`, `opencode`, `mimo-code`, `dsh`) —
+read column by column.
+
+| | |
+|---|---|
+| **Tokens & cost + behavior diff** — per-agent token breakdown, cost, and a side-by-side read of proactive parameters, error recovery, and execution efficiency.<br><img src="docs/images/en-02-tokens-cost.png" alt="Tokens, cost and behavioral difference analysis"> | **Final artifacts** — the full output file tree per agent, aligned so you can spot which files each one touched.<br><img src="docs/images/en-03-artifacts.png" alt="Final artifacts file tree per agent"> |
+| **Step-by-step calls** — each agent's full tool-call sequence, business steps vs. helper commands marked.<br><img src="docs/images/en-05-steps.png" alt="Step-by-step tool calls"> | **Conversation flow** — planning, decision forks, and self-correction, laid out per agent.<br><img src="docs/images/en-06-conversation.png" alt="Conversation and reasoning flow"> |
+| **Wire timeline** — raw LLM-call timeline captured at the wire level (calls, spans, tokens per call).<br><img src="docs/images/en-07-wire.png" alt="Wire-level call timeline"> | |
 
 ---
 
@@ -147,6 +167,12 @@ MIT — see [LICENSE](LICENSE).
 
 > Octagon（八角笼，UFC 场地）—— 让 agent 同台较量，差异一目了然。
 
+<p align="center">
+  <img src="docs/images/01-scores.png" alt="运行详情 —— 7 个 agent 做同一任务，评分逐列对比" width="100%">
+  <br>
+  <em>一次运行、七个 agent 做同一个 SWE-bench 任务 —— 评分、成本、行为逐列对比。</em>
+</p>
+
 OpenAgentOctagon 是**对比分析工具**，不是打分排行榜。核心输出是「多个 agent 做同一件事的差异
 可视化」，评分只是帮助定位差异的量化锚点。每次对比采集三件事：
 
@@ -176,6 +202,20 @@ OpenAgentOctagon 是**对比分析工具**，不是打分排行榜。核心输�
 ```
 
 写场景的完整契约见 [docs/environments.md](docs/environments.md)。
+
+---
+
+## 产品截图
+
+下面每张图都是**同一次运行** —— 同一个 SWE-bench 任务（`sphinx-class-property`）分别交给七个
+agent（`blade-agent`、`claude-code`、`codex`、`kimi-code`、`opencode`、`mimo-code`、`dsh`）——
+逐列对比着看。
+
+| | |
+|---|---|
+| **令牌与成本 + 行为差异** —— 每个 agent 的令牌拆解、成本，以及主动参数决策、错误恢复、执行效率的并排解读。<br><img src="docs/images/02-tokens-cost.png" alt="令牌、成本与行为差异分析"> | **最终产物** —— 每个 agent 的完整产物文件树，对齐排列，一眼看出各自动过哪些文件。<br><img src="docs/images/03-artifacts.png" alt="每个 agent 的产物文件树"> |
+| **逐步调用** —— 每个 agent 的完整工具调用序列，区分「业务步骤」与「辅助命令」。<br><img src="docs/images/05-steps.png" alt="逐步工具调用"> | **对话流** —— 计划、决策分叉、自我修正，逐个 agent 铺开。<br><img src="docs/images/06-conversation.png" alt="对话与思考流"> |
+| **通信时序** —— 在通信层捕获的原始 LLM 调用时间轴（每次调用的次数、跨度、令牌）。<br><img src="docs/images/07-wire.png" alt="通信层调用时间轴"> | |
 
 ---
 
