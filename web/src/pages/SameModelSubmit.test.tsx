@@ -3,6 +3,7 @@ import { describe, it, expect, vi, afterEach } from "vitest";
 import { render, screen, waitFor, cleanup, fireEvent } from "@testing-library/react";
 import "@testing-library/jest-dom/vitest";
 import { MemoryRouter } from "react-router-dom";
+import { I18nProvider } from "../i18n";
 
 const { createRunMock } = vi.hoisted(() => ({
   createRunMock: vi.fn(async () => ({ run_id: "r1", task_id: "t", env_name: "e", agents: [], attempts: [] })),
@@ -46,19 +47,27 @@ afterEach(() => { cleanup(); vi.clearAllMocks(); });
 
 describe("SameModelSubmit capture_policy", () => {
   it("隐藏技术选项并默认以 full 进入请求体", async () => {
-    render(<MemoryRouter><SameModelSubmit /></MemoryRouter>);
+    render(
+      <I18nProvider>
+        <MemoryRouter><SameModelSubmit /></MemoryRouter>
+      </I18nProvider>,
+    );
     expect(screen.queryByText(/通信采集档/)).not.toBeInTheDocument();
     // 填模型 ID（否则 canSubmit=false 无法提交）。页面现有「模型 ID」与「搜索模型」
     // 两个输入，用精确 placeholder 前缀定位模型 ID 输入，避免宽泛正则命中多个。
-    const modelInput = screen.getByPlaceholderText(/^模型 ID/) as HTMLInputElement;
+    const modelInput = screen.getByPlaceholderText(/^(模型 ID|Model ID)/) as HTMLInputElement;
     fireEvent.change(modelInput, { target: { value: "up/glm" } });
     // 等待 env/task/provider-prefix 三个异步目录都加载完成后再提交；只等待静态标题
     // 会在全量并行测试下偶发点击到 disabled 按钮。
-    const submit = screen.getByRole("button", { name: /提交|开始|运行|submit/i });
+    const submit = screen.getByRole("button", { name: /提交|开始|运行|submit|run/i });
     await waitFor(() => expect(submit).toBeEnabled());
     fireEvent.click(submit);
     await waitFor(() => expect(createRunMock).toHaveBeenCalled());
-    const body = (createRunMock.mock.calls[0] as unknown[])[0] as { capture_policy?: string };
+    const body = (createRunMock.mock.calls[0] as unknown[])[0] as {
+      capture_policy?: string;
+      timeout_seconds?: number | null;
+    };
     expect(body.capture_policy).toBe("full");
+    expect(body.timeout_seconds).toBeNull();
   });
 });

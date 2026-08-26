@@ -63,6 +63,20 @@ from .models import AttemptModel, TERMINAL_ATTEMPT_STATUSES
 
 logger = logging.getLogger(__name__)
 
+# ``None`` is a real execution value meaning "no deadline".  Attempt creation
+# also needs an omitted state for legacy/direct callers that want to inherit the
+# source task timeout, so it cannot use None as the default sentinel.
+_INPUT_TIMEOUT_UNSET = object()
+
+
+def _resolve_input_timeout_seconds(
+    task_timeout_seconds: int | None,
+    input_timeout_seconds: int | None | object = _INPUT_TIMEOUT_UNSET,
+) -> int | None:
+    if input_timeout_seconds is _INPUT_TIMEOUT_UNSET:
+        return task_timeout_seconds
+    return input_timeout_seconds  # type: ignore[return-value]
+
 
 # ---------- create_attempt -----------------------------------------------
 
@@ -77,7 +91,7 @@ async def create_attempt(
     input_prompt: str | None = None,
     input_context: dict[str, Any] | None = None,
     input_constraints: dict[str, Any] | None = None,
-    input_timeout_seconds: int | None = None,
+    input_timeout_seconds: int | None | object = _INPUT_TIMEOUT_UNSET,
     variant_id: str | None = None,
     external_refs: dict[str, Any] | None = None,
 ) -> tuple[AttemptModel, str]:
@@ -118,7 +132,7 @@ def _create_attempt_sync(
     input_prompt: str | None = None,
     input_context: dict[str, Any] | None = None,
     input_constraints: dict[str, Any] | None = None,
-    input_timeout_seconds: int | None = None,
+    input_timeout_seconds: int | None | object = _INPUT_TIMEOUT_UNSET,
     variant_id: str | None = None,
     external_refs: dict[str, Any] | None = None,
 ) -> tuple[AttemptModel, str]:
@@ -149,7 +163,7 @@ def _create_attempt_sync(
         if input_constraints is None
         else input_constraints
     )
-    timeout_seconds = row[4] if input_timeout_seconds is None else input_timeout_seconds
+    timeout_seconds = _resolve_input_timeout_seconds(row[4], input_timeout_seconds)
     from .input_snapshots import insert_snapshot, prepare_snapshot
 
     snapshot = prepare_snapshot(

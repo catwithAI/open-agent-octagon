@@ -58,6 +58,11 @@ class NormalizedRunRequest:
     context: dict[str, Any] = field(default_factory=dict, repr=False)
     constraints: dict[str, Any] = field(default_factory=dict, repr=False)
     timeout_seconds: int | None = 1000
+    # ``timeout_seconds`` has three API states: omitted follows the selected
+    # task, an integer overrides it, and an explicit null disables the
+    # deadline.  Optional alone cannot retain omitted-vs-null after request
+    # normalization, so API callers set this field-presence bit.
+    timeout_seconds_explicit: bool = False
     agents: list[str] = field(default_factory=lambda: ["blade-agent"])
     compare_mode: str = "multi-agent"
     model: str | None = None
@@ -346,6 +351,18 @@ def _load_created_run(db_path: Path, run_id: str) -> CreatedRun | None:
 _create_locks: dict[str, asyncio.Lock] = {}
 
 
+def _resolve_timeout_seconds(
+    task_timeout_seconds: int | None,
+    request: NormalizedRunRequest,
+) -> int | None:
+    """Resolve omitted, explicit-value, and explicit-null timeout semantics."""
+    if request.timeout_seconds_explicit:
+        return request.timeout_seconds
+    if task_timeout_seconds is not None:
+        return task_timeout_seconds
+    return request.timeout_seconds
+
+
 async def create_run_plan(
     request: NormalizedRunRequest,
     *,
@@ -439,9 +456,8 @@ async def create_run_plan(
         constraints = (
             json.loads(row[2]) if row and row[2] else (request.constraints or {})
         )
-        timeout_seconds = (
-            row[3] if row and row[3] is not None else request.timeout_seconds
-        )
+        task_timeout_seconds = row[3] if row else None
+        timeout_seconds = _resolve_timeout_seconds(task_timeout_seconds, request)
         if input_override is not None:
             if request.task_id is None:
                 raise RunServiceError(
