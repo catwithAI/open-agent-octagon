@@ -1461,7 +1461,8 @@ def build_router() -> APIRouter:
         request: Request,
     ) -> dict[str, Any]:
         service_request = NormalizedRunRequest(
-            **body.model_dump(exclude={"agent"})
+            **body.model_dump(exclude={"agent"}),
+            timeout_seconds_explicit="timeout_seconds" in body.model_fields_set,
         )
         try:
             created = await create_run_plan(
