@@ -283,7 +283,15 @@ class OpencodeFamilyAdapter:
         # key 缺失时 CLI 只会在上游报 401，错误面目全非——这里 fail fast。
         if model_ref.provider is not None:
             provider = self.providers[model_ref.provider]
-            if provider.api_key_env and resolve_api_key(provider) is None:
+            # 判定必须走 resolve_agent_key（合并 cost 的 run/attempt 专属 key），
+            # 不能只看静态 resolve_api_key：开了 cost.enabled 且无静态
+            # OPENROUTER_API_KEY 时，key 只存在于动态 run key 里，裸
+            # resolve_api_key 会误判缺 key。与 kimi_code 一致。
+            _probe_key, _ = resolve_agent_key(
+                task.run_id, resolve_api_key(provider), task.attempt_id,
+                provider.base_url,
+            )
+            if provider.api_key_env and _probe_key is None:
                 return AdapterResult(
                     attempt_id=task.attempt_id,
                     status="auth_failed",
