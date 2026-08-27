@@ -9,6 +9,7 @@ import asyncio
 import json
 import logging
 import re
+import sys
 import shutil
 import sqlite3
 import time
@@ -932,12 +933,17 @@ def _mcp_server_specs(env: Any) -> tuple[McpServerSpec, ...]:
         raise ValueError(
             f"env {env.name} entrypoints.mcp.name 只允许字母、数字、下划线和连字符"
         )
-    project_root = Path(env.env_dir).resolve().parent.parent
+    # MCP commands are environment-local deployment artifacts.  Resolve their
+    # relative paths from the loaded environment directory rather than assuming
+    # every environment lives at <project-root>/envs/<name>.  This keeps copied,
+    # generated, and independently mounted bundles relocatable.
+    env_dir = Path(env.env_dir).resolve()
+    executable = sys.executable if command[0] in {"python", "python3"} else command[0]
     return (McpServerSpec(
         name=name,
-        command=command[0],
+        command=executable,
         args=tuple(command[1:]),
-        cwd=str(project_root),
+        cwd=str(env_dir),
     ),)
 
 
