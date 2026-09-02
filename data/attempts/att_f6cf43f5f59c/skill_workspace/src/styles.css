@@ -1,0 +1,71 @@
+/*
+ * OpenAI Response Comparator — styling.
+ *
+ * Per the spec, Tailwind is NOT installed as a dependency; the utility classes
+ * come from the Tailwind CDN script injected by frontend.py.  This file layers
+ * local customisation on top and doubles as the theme contract for the app.
+ *
+ * If the sandbox can't reach the CDN the app still renders fine — the rules
+ * below provide a neutral, readable fallback and all Streamlit widgets keep
+ * their default theming.
+ */
+
+/* Pull Tailwind in via the CDN. Script-injected by frontend.py, so this line
+   is documentation of intent rather than a second transport. */
+@import url("https://cdn.tailwindcss.com");
+
+/* ------------------------------------------------------------------ */
+/* App shell                                                            */
+/* ------------------------------------------------------------------ */
+.app-shell {
+  @apply mx-auto max-w-5xl px-4 py-6;
+}
+
+.app-title {
+  @apply text-3xl font-bold tracking-tight text-slate-900;
+}
+
+.app-subtitle {
+  @apply mt-1 text-sm text-slate-500;
+}
+
+.section-heading {
+  @apply mt-8 mb-3 text-lg font-semibold text-slate-800;
+}
+
+/* ------------------------------------------------------------------ */
+/* Conversation rows                                                    */
+/* ------------------------------------------------------------------ */
+.conversation-row {
+  @apply flex gap-3 rounded-xl border border-slate-200 bg-white p-3 shadow-sm;
+}
+
+.role-select {
+  @apply w-28;
+}
+
+/* ------------------------------------------------------------------ */
+/* Response cards                                                       */
+/* ------------------------------------------------------------------ */
+.response-card {
+  @apply my-2 rounded-xl border border-slate-200 bg-slate-50 p-3;
+}
+
+.response-card-expanded {
+  @apply border-indigo-300 bg-white;
+}
+
+.response-title {
+  @apply text-sm font-semibold text-indigo-700;
+}
+
+/* ------------------------------------------------------------------ */
+/* Fallback rules (used whenever the CDN is unreachable)                */
+/* ------------------------------------------------------------------ */
+.app-shell { max-width: 64rem; margin: 0 auto; padding: 1.5rem 1rem; }
+.app-title { font-size: 1.875rem; font-weight: 700; color: #0f172a; }
+.app-subtitle { margin-top: 0.25rem; font-size: 0.875rem; color: #64748b; }
+.section-heading { margin: 2rem 0 0.75rem; font-size: 1.125rem; font-weight: 600; color: #1e293b; }
+.conversation-row { display: flex; gap: 0.75rem; border: 1px solid #e2e8f0; border-radius: 0.75rem; background: #fff; padding: 0.75rem; box-shadow: 0 1px 2px rgba(0,0,0,.05); }
+.response-card { margin: 0.5rem 0; border: 1px solid #e2e8f0; border-radius: 0.75rem; background: #f8fafc; padding: 0.75rem; }
+.response-title { font-size: 0.875rem; font-weight: 600; color: #4338ca; }

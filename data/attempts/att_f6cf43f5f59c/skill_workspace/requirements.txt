@@ -1,0 +1,4 @@
+# Runtime dependencies for the OpenAI Response Comparator.
+# Tailwind is deliberately NOT listed: it is loaded from the CDN (see styles.css).
+streamlit>=1.40
+openai>=1.40
