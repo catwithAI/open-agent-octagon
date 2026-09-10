@@ -4,3 +4,10 @@
 # requirements-envs.generated.txt（不入库）。
 matplotlib
 numpy
+# 2026-09-10 代表任务集（agent-octagon-representative-envs）：agent 侧要编辑
+# XLSX / DOCX / PPTX / PDF，场景 meta.yaml 尚未声明，先在这里兜底。
+openpyxl
+python-docx
+python-pptx
+pymupdf
+pypdf

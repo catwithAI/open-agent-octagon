@@ -28,7 +28,14 @@ check dsh         "dsh-runtime"                                ls -l /opt/dsh/ru
 mods="$(grep -hv '^\s*#' "${here}/requirements-base.txt" "${here}/requirements-envs.txt" \
         | sed -E 's/[<>=!~ ].*//; s/#.*//; /^\s*$/d' | tr '\n' ' ')"
 for m in ${mods}; do
-  py="${m//-/_}"
+  # 发行名 → 导入名；没列的按 "-" → "_" 处理。
+  case "$(printf %s "${m}" | tr "A-Z" "a-z")" in
+    python-docx) py=docx ;;
+    python-pptx) py=pptx ;;
+    pillow) py=PIL ;;
+    pyyaml) py=yaml ;;
+    *) py="${m//-/_}" ;;
+  esac
   check "import ${m}" "ok" python3 -c "import ${py}; print('ok')"
 done
 run python3 -c "import mcp.server.fastmcp; print('ok')" >/dev/null && echo "ok   mcp.server.fastmcp"
