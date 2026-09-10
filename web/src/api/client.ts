@@ -611,6 +611,10 @@ export type AttemptSecurity = {
   by_category?: Record<string, number>;
   hitl: { counts?: Record<string, number>; auto_exec_rate?: number; decision_points_reached?: number };
   reaction: string | null;
+  // adapter 落盘的完整执行场合快照（security_meta.json）：sandbox_image /
+  // sandbox_id / agent_version / egress_policy / server_side_network /
+  // sandbox_shared 等，沙盒接入后才有。
+  meta?: Record<string, unknown>;
 };
 
 export type SecurityEvent = {

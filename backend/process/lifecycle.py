@@ -67,6 +67,16 @@ def kill_recorded_agent_process(data_path: Path | None, attempt_id: str) -> bool
     identity = read_agent_process(data_path, attempt_id)
     if identity is None:
         return False
+    if identity.kind == "docker":
+        from .docker_launcher import kill_container
+
+        killed = kill_container(identity.container_id or "")
+        if killed:
+            logger.warning(
+                "Stop：杀掉跨重启存活的沙盒容器 attempt=%s container=%s",
+                attempt_id, identity.container_id,
+            )
+        return killed
     for killer, target in (
         (os.killpg, identity.pgid),
         (os.kill, identity.pid),

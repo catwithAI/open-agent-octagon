@@ -436,6 +436,13 @@ async def _run_attempt_inner(
     # scoring_failed——那两个状态意味着"评分设施出问题"，会掩盖"agent 本来
     # 就因为超时/断流没完成"这个更准确的事实。
     scorable_despite_failure = adapter_status in _ADAPTER_SCORABLE_DESPITE_FAILURE
+    # 执行场合快照先落盘，再分终态：cli_error 等无评分终态也要留下
+    # 沙盒镜像 / 容器 id / agent 版本，否则失败的 attempt 看不出跑在哪里。
+    if adapter_result is not None:
+        _write_security_meta_file(
+            state.data_path, attempt_id,
+            dict(getattr(adapter_result, "security_meta", {}) or {}),
+        )
     no_score_fallback_status = adapter_status if scorable_despite_failure else None
 
     if adapter_status in _ADAPTER_TERMINAL_NO_SCORE:
@@ -633,6 +640,21 @@ async def _run_attempt_inner(
 # ---------- DB helpers ---------------------------------------------------
 
 
+SECURITY_META_FILENAME = "security_meta.json"
+
+
+def _write_security_meta_file(data_path: Path, attempt_id: str, security_meta: dict) -> None:
+    """adapter 的 security_meta 原样落到 attempt 目录；失败只记日志。"""
+    try:
+        target = Path(data_path) / "attempts" / attempt_id / SECURITY_META_FILENAME
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(
+            json.dumps(security_meta, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    except Exception:
+        logger.warning("无法写 %s attempt=%s", SECURITY_META_FILENAME, attempt_id, exc_info=True)
+
+
 def _write_security_columns_sync(
     db_path: Path,
     attempt_id: str,
@@ -743,6 +765,7 @@ def _finalize_no_score(
         "blade_service_unavailable",
         "capture_infrastructure_failed",
         "model_integrity_failed",
+        "sandbox_unavailable",
     }
     if status == "cancelled":
         failure_kind = "cancelled"

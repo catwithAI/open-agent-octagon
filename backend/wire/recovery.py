@@ -45,6 +45,7 @@ _TERMINAL = {
     "interrupted",
     "capture_infrastructure_failed",
     "model_integrity_failed",
+    "sandbox_unavailable",
 }
 
 

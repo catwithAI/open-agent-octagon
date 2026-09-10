@@ -2,10 +2,14 @@
 #
 # **边界：只装后端 API，不装 agent CLI，不含前端。**
 #
-# 各 agent CLI（claude / codex 等）是**被测对象**，不是运行时依赖。把它们打进
-# 镜像会改变「被测环境」的定义（换环境前后数据严格讲不可比），也会让镜像显著变大。
-# 因此 CLI 走 bind mount 从宿主机注入（见 docker-compose.yaml），镜像只负责
-# Python 后端本身——容器化解决的是资源隔离与自动重启，不动被测面。
+# 各 agent CLI（claude / codex 等）是**被测对象**，不是后端的运行时依赖，
+# 所以不进**本**镜像：本镜像解决的是后端进程的资源隔离与自动重启。
+# 被测环境本身由另一个镜像定义——docker/agent-runtime/Dockerfile 把全部可测
+# agent CLI 钉版本打进「agent 运行时镜像」，每个版本就是一个可锁定、可复现的
+# 被测环境（spec: docs/specs/260909-agent-sandbox）。沙盒关闭时 CLI 仍走
+# bind mount 从宿主机注入（见 docker-compose.yaml）。
+# 注意：沙盒模式要求后端跑在宿主机（同路径挂载 + docker CLI），容器化后端
+# 与沙盒模式当前不兼容，启动检查会报 sandbox_unavailable。
 #
 # 前端（web/）不在本镜像内：本镜像只提供 API（默认发行形态）。需要前端时在源码
 # 侧 `npm run dev` 或单独部署静态资源。
