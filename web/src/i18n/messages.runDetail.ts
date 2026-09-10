@@ -140,6 +140,7 @@ export const MESSAGES_RUN_DETAIL: Record<string, Message> = {
   "runDetail.status.chat_failed": { zh: "对话失败", en: "Chat failed" },
   "runDetail.status.auth_failed": { zh: "认证失败", en: "Auth failed" },
   "runDetail.status.model_integrity_failed": { zh: "模型完整性失败", en: "Model integrity failed" },
+  "runDetail.status.sandbox_unavailable": { zh: "沙盒不可用", en: "Sandbox unavailable" },
 
   // ---- tokens() summary ----
   "runDetail.tokens.input": { zh: "{n} 输入", en: "{n} in" },

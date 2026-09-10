@@ -1,0 +1,13 @@
+# 过渡期手工清单：现有场景 MCP 入口 / 工具用到、但场景 meta.yaml 尚未以
+# prerequisites.python 声明的第三方包。场景重设计补齐声明后逐条删掉。
+# 构建脚本另会把所有已加载场景的 prerequisites.python 合并进
+# requirements-envs.generated.txt（不入库）。
+matplotlib
+numpy
+# 2026-09-10 代表任务集（agent-octagon-representative-envs）：agent 侧要编辑
+# XLSX / DOCX / PPTX / PDF，场景 meta.yaml 尚未声明，先在这里兜底。
+openpyxl
+python-docx
+python-pptx
+pymupdf
+pypdf

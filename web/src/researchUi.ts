@@ -21,6 +21,7 @@ const STATUS_LABELS: Record<string, Bilingual> = {
   chat_failed: { zh: "对话失败", en: "Chat failed" },
   auth_failed: { zh: "认证失败", en: "Auth failed" },
   model_integrity_failed: { zh: "模型完整性失败", en: "Model integrity failed" },
+  sandbox_unavailable: { zh: "沙盒不可用", en: "Sandbox unavailable" },
   current: { zh: "当前版本", en: "Current" },
   stale: { zh: "已过期", en: "Stale" },
   not_generated: { zh: "尚未生成", en: "Not generated" },

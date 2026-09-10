@@ -26,6 +26,13 @@ from .config import Settings
 from .db import _iso_after, _now_iso, _open_sync, append_attempt_observation
 from .runner import run_attempt
 from .model_providers import parse_model_ref
+from .process.launcher import AgentLauncher, HostLauncher
+from .process.sandbox_preflight import (
+    ATTEMPT_STATUS_SANDBOX_UNAVAILABLE,
+    SandboxUnavailable,
+    check_sandbox,
+    require_sandbox_agent,
+)
 from .wire.lifecycle import (
     CapturePreparationError,
     WireCaptureSession,
@@ -156,6 +163,10 @@ def build_adapter(
 
         return FakeAgentAdapter()
 
+    # 本机 CLI agent 的进程启动层。沙盒（docker）接入后按 settings.sandbox
+    # 在这里换成 DockerLauncher；adapter 自身不感知执行场合。
+    launcher = _build_launcher(settings, agent_name)
+
     if agent_name == "blade-agent":
         blade = settings.blade
         # 模型名的 provider 前缀剥离只发生在 API 边界（api.py
@@ -183,6 +194,7 @@ def build_adapter(
         from .adapters.claude_code import ClaudeCodeAdapter
 
         return ClaudeCodeAdapter(
+            launcher=launcher,
             octagon_project_path=Path(".").resolve(),
             model=model or _DEFAULT_MODELS["claude-code"],
             providers=settings.model_providers,
@@ -192,6 +204,7 @@ def build_adapter(
         from .adapters.codex import CodexAdapter
 
         return CodexAdapter(
+            launcher=launcher,
             octagon_project_path=Path(".").resolve(),
             model=model or _DEFAULT_MODELS["codex"],
             providers=settings.model_providers,
@@ -201,6 +214,7 @@ def build_adapter(
         from .adapters.kimi_code import KimiCodeAdapter
 
         return KimiCodeAdapter(
+            launcher=launcher,
             octagon_project_path=Path(".").resolve(),
             model=model or _DEFAULT_MODELS["kimi-code"],
             providers=settings.model_providers,
@@ -210,6 +224,7 @@ def build_adapter(
         from .adapters.dsh import DshAdapter
 
         return DshAdapter(
+            launcher=launcher,
             octagon_project_path=Path(".").resolve(),
             model=model or _DEFAULT_MODELS["dsh"],
             providers=settings.model_providers,
@@ -221,12 +236,32 @@ def build_adapter(
 
         return OpencodeFamilyAdapter(
             agent_name=agent_name,
+            launcher=launcher,
             octagon_project_path=Path(".").resolve(),
             model=model or _DEFAULT_MODELS[agent_name],
             providers=settings.model_providers,
         )
 
     return None
+
+
+def _build_launcher(settings: Settings, agent_name: str) -> AgentLauncher:
+    """本机 CLI agent 的启动层：沙盒关闭 → 宿主机；开启 → docker，且必须可用。
+
+    沙盒开启但不可用时抛 SandboxUnavailable，由 dispatch 落 sandbox_unavailable
+    终态——绝不静默回落宿主机执行（spec D-07）。
+    """
+    if not settings.sandbox.enabled:
+        return HostLauncher()
+    state = runtime_state.get()
+    status = state.sandbox_status
+    if status is None:
+        status = check_sandbox(settings)
+        state.sandbox_status = status
+    image = require_sandbox_agent(status, agent_name)
+    from .process.docker_launcher import DockerLauncher
+
+    return DockerLauncher(settings=settings, image=image)
 
 
 class _BoundAdapter:
@@ -430,13 +465,30 @@ async def dispatch(
         )
         blade_enable_thinking = False
 
-    adapter = build_adapter(
-        agent_name,
-        settings,
-        model=model,
-        compare_mode=compare_mode,
-        blade_enable_thinking=blade_enable_thinking,
-    )
+    try:
+        adapter = build_adapter(
+            agent_name,
+            settings,
+            model=model,
+            compare_mode=compare_mode,
+            blade_enable_thinking=blade_enable_thinking,
+        )
+    except SandboxUnavailable as exc:
+        from .runner import _finalize_no_score
+        logger.error(
+            "dispatch: 沙盒不可用，attempt=%s agent=%s code=%s: %s",
+            attempt_id, agent_name, exc.error_code, exc,
+        )
+        _finalize_no_score(
+            db_path=state.db_path,
+            attempt_id=attempt_id,
+            status=ATTEMPT_STATUS_SANDBOX_UNAVAILABLE,
+            error_code=exc.error_code,
+            error_message=str(exc),
+            pass_threshold=int((getattr(env, "meta", {}) or {}).get("pass_threshold", 60)),
+        )
+        _refresh_run_status(state.db_path, attempt_id)
+        return
     if adapter is None:
         from .runner import _finalize_no_score
         logger.warning("dispatch: no adapter for agent %s, marking cli_not_found", agent_name)
@@ -450,6 +502,10 @@ async def dispatch(
         )
         _refresh_run_status(state.db_path, attempt_id)
         return
+    # 本机 agent 跑在 docker 沙盒里时：MCP 入口翻译成容器内命令、回连地址换成
+    # 容器可达地址、wire 的 MCP stdio tap 不适用（它用宿主机 python 包装 server）。
+    launcher = getattr(adapter, "launcher", None)
+    in_sandbox = getattr(launcher, "locus", "host") == "docker-sandbox"
     if iteration_policy is not None and not adapter.capabilities.iterative_session:
         from .runner import _finalize_no_score
 
@@ -528,6 +584,28 @@ async def dispatch(
     )
     try:
         mcp_servers = _mcp_server_specs(env)
+        if in_sandbox and mcp_servers:
+            from .process.docker_launcher import translate_mcp_specs
+
+            attempt_dir = state.data_path / "attempts" / attempt_id
+            mcp_servers = translate_mcp_specs(
+                mcp_servers, attempt_dir=attempt_dir,
+                workspace=attempt_dir / "skill_workspace",
+                env_dir=Path(env.env_dir),
+            )
+    except SandboxUnavailable as exc:
+        from .runner import _finalize_no_score
+        logger.error("dispatch: 沙盒 MCP 入口不可用 env=%s: %s", env_name, exc)
+        _finalize_no_score(
+            db_path=state.db_path,
+            attempt_id=attempt_id,
+            status="cli_error",
+            error_code=exc.error_code,
+            error_message=str(exc),
+            pass_threshold=int(env.meta.get("pass_threshold", 60)),
+        )
+        _refresh_run_status(state.db_path, attempt_id)
+        return
     except ValueError as exc:
         from .runner import _finalize_no_score
         logger.error("dispatch: invalid MCP entrypoint env=%s: %s", env_name, exc)
@@ -545,7 +623,7 @@ async def dispatch(
     wire_sources = _build_wire_sources(
         agent_name=agent_name, model=model, settings=settings, attempt_id=attempt_id,
         env_name=env_name, data_path=state.data_path,
-        mcp_server_names=tuple(server.name for server in mcp_servers),
+        mcp_server_names=() if in_sandbox else tuple(server.name for server in mcp_servers),
     )
     # capture_policy：run/task 请求的 policy 与 server maximum 求最严格交集。
     # 未指定时默认 metadata（只记 size/timing，不落 body）。
@@ -636,7 +714,10 @@ async def dispatch(
             env_name=env_name,
             env_skill_id=env.skill_id,
             env_token=env_token,
-            env_base_url=settings.octagon.public_base_url,
+            env_base_url=(
+                settings.sandbox.resolve_env_base_url(settings.octagon.public_base_url)
+                if in_sandbox else settings.octagon.public_base_url
+            ),
             notify_model_of_timeout=bool(
                 task_context.get("_octagon_notify_model_of_timeout", True)
             ),

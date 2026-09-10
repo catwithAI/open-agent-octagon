@@ -117,6 +117,56 @@ class BladeSection(BaseModel):
     progress_poll_interval_seconds: float = Field(default=4.0, gt=0)
 
 
+class SandboxLimits(BaseModel):
+    """单个 agent 容器的资源限额（docker run --memory/--cpus/--pids-limit）。"""
+
+    memory: str = "4g"
+    cpus: float = Field(default=2.0, gt=0)
+    pids: int = Field(default=1024, gt=0)
+
+
+class SandboxAgentOverride(BaseModel):
+    limits: SandboxLimits | None = None
+
+
+class SandboxSection(BaseModel):
+    """本机 CLI agent 的 docker 沙盒（spec: docs/specs/260909-agent-sandbox）。
+
+    `enabled: true` 是全局强制：六个本机 agent（claude-code / codex / kimi-code /
+    opencode / mimo-code / dsh）全部进容器，不按 agent 可选、不提供 run 级开关。
+    沙盒不可用（docker 不可达、镜像缺失、agent 不在镜像里）时 attempt 明确失败，
+    不回落宿主机执行。blade-agent / ssh-claude-code 不在此围栏内，只记录。
+    """
+
+    enabled: bool = False
+    # 完整 repo:tag。启动时 `docker image inspect` 取 digest 与 agent 版本标签。
+    image: str | None = None
+    # 容器内访问 Env Attempt Server 的地址。不填则按 public_base_url 的端口推导
+    # http://host.docker.internal:<port>。
+    env_base_url: str | None = None
+    limits: SandboxLimits = Field(default_factory=SandboxLimits)
+    # LLM 服务端执行的联网工具（claude-code WebSearch/WebFetch、codex web search）
+    # 不经容器，沙盒管不到。allow = 不裁剪只记录；deny = 经 CLI settings 禁用。
+    server_side_tools: Literal["allow", "deny"] = "allow"
+    # 按 agent 覆盖限额。不允许按 agent 换镜像。
+    agents: dict[str, SandboxAgentOverride] = Field(default_factory=dict)
+
+    def limits_for(self, agent_name: str) -> SandboxLimits:
+        override = self.agents.get(agent_name)
+        if override is not None and override.limits is not None:
+            return override.limits
+        return self.limits
+
+    def resolve_env_base_url(self, public_base_url: str) -> str:
+        if self.env_base_url:
+            return self.env_base_url
+        from urllib.parse import urlsplit
+
+        parts = urlsplit(public_base_url)
+        port = parts.port or (443 if parts.scheme == "https" else 80)
+        return f"{parts.scheme or 'http'}://host.docker.internal:{port}"
+
+
 class SameModelSection(BaseModel):
     """历史遗留：same-model 模式曾经把 blade-agent/claude-code 打到独立的
     远端机器（48），有自己的 API key / vLLM 部署。48 不再使用后，
@@ -233,6 +283,7 @@ class Settings(BaseModel):
     same_model: SameModelSection = Field(default_factory=SameModelSection)
     insights: InsightsSection = Field(default_factory=InsightsSection)
     cost: CostSection = Field(default_factory=CostSection)
+    sandbox: SandboxSection = Field(default_factory=SandboxSection)
     # CC/Codex 的第三方模型 provider（blade 的模型列表走 /api/blade/models 实时查，
     # 不在这里配）。api key 解析见 resolve_api_key：api_key_env 指向的环境变量
     # 优先，回落到 api_key 直填（octagon.yaml 已 gitignore）；load_settings 会把
@@ -298,6 +349,15 @@ def _apply_env_overrides(data: dict[str, Any]) -> dict[str, Any]:
     if v := os.environ.get("SAME_MODEL_BLADE_API_KEY"):
         same_model["blade_api_key"] = v
     data["same_model"] = same_model
+
+    sandbox = dict(data.get("sandbox") or {})
+    if v := os.environ.get("OCTAGON_SANDBOX_ENABLED"):
+        sandbox["enabled"] = v.strip().lower() in ("1", "true", "yes", "on")
+    if v := os.environ.get("OCTAGON_SANDBOX_IMAGE"):
+        sandbox["image"] = v
+    if v := os.environ.get("OCTAGON_SANDBOX_ENV_BASE_URL"):
+        sandbox["env_base_url"] = v
+    data["sandbox"] = sandbox
 
     insights = dict(data.get("insights") or {})
     if v := os.environ.get("INSIGHTS_PROVIDER"):

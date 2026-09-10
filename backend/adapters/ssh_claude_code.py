@@ -274,6 +274,8 @@ class SshClaudeCodeAdapter:
                 permission_mode="--dangerously-skip-permissions",
                 workspace_root=remote_dir,
                 sandbox_id=self.ssh_host,
+                # 远端主机直接跑 claude，不在本方案围栏内，如实记录。
+                extra={"sandbox": "none", "egress_policy": "unrestricted"},
             ),
         )
 

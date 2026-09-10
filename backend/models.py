@@ -119,6 +119,9 @@ AttemptStatus = Literal[
     # outbound LLM request used a model other than attempts.model.  This is a
     # platform comparison-integrity failure, never an agent-quality result.
     "model_integrity_failed",
+    # docker 沙盒不可用（镜像缺失 / agent 不在镜像 / docker 不可达）。沙盒是
+    # 全局强制的，这里是基础设施终态，不回落宿主机执行，不算 agent 质量结果。
+    "sandbox_unavailable",
     "input_snapshot_missing",
 ]
 

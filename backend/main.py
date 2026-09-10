@@ -114,6 +114,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             envs=app.state.envs,
             settings=cfg,
         )
+        # docker 沙盒启动检查：只记录状态，不阻断启动——失败时本机 agent 的
+        # attempt 会以 sandbox_unavailable 终态失败（不回落宿主机执行）。
+        from .process.sandbox_preflight import check_sandbox
+
+        sandbox_status = check_sandbox(cfg)
+        runtime_state.get().sandbox_status = sandbox_status
+        if sandbox_status.enabled:
+            if sandbox_status.ok:
+                logger.info("sandbox: 已启用 image=%s digest=%s agents=%s",
+                            sandbox_status.image.reference, sandbox_status.image.digest,
+                            ",".join(sandbox_status.image.agents))
+            else:
+                logger.error("sandbox: 已启用但不可用（%s）：%s——本机 agent 将全部失败",
+                             sandbox_status.error_code, sandbox_status.error_message)
         # 退出归因：启动即留痕，并为上一次「无遗言」的退出补写 crash 证据。
         # 必须在任何恢复逻辑之前——恢复本身可能失败，而事故记录不能因此丢失。
         from .platform_events import (

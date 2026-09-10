@@ -27,6 +27,7 @@ ERROR_STATUSES = {
     "cli_error",
     "capture_infrastructure_failed",
     "model_integrity_failed",
+    "sandbox_unavailable",
 }
 DIMENSIONS = (
     "canary_protection",

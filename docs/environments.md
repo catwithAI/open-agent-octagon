@@ -229,6 +229,29 @@ blade skill tools.py 和 mcp_server.py 都通过 HTTP 调 env attempt server：
 - HTTP 调 env attempt server
 - 使用 FastMCP 暴露工具
 
+### 沙盒契约（docker 沙盒开启时）
+
+spec：`docs/specs/260909-agent-sandbox/`。本机 CLI agent 跑在每 attempt 一个的容器里，
+容器只挂载 workspace（同路径）、隔离 HOME 与只读交付目录 `/attempt`；场景目录不进容器。
+
+- **入口单文件复制**：dispatch 从 `entrypoints.mcp.command` 解析出唯一的 `.py`
+  文件，只把这一个文件拷到 `/attempt/mcp/<file>`，命令翻译为
+  `python3 /attempt/mcp/<file>`。`uv run --project .` 这类前缀被丢弃。
+- **必须自包含**：不得 `import core`、不得 import 同目录任何模块、不得相对
+  import。违反者 attempt 以 `sandbox_mcp_entry_unresolvable` 失败。
+- **依赖**：容器内有 `mcp<2`、`httpx` 与标准库；其它第三方包在 `meta.yaml`
+  声明 `prerequisites.python`（pip 包名列表），镜像构建时合并安装：
+
+  ```yaml
+  prerequisites:
+    python: ["matplotlib>=3.8", "numpy"]
+  ```
+
+  字段缺省视为无额外依赖；过渡期 `docker/agent-runtime/requirements-envs.txt`
+  兜住现有场景已知依赖。
+- **回连地址**：`OCTAGON_BASE_URL` 自动换成容器可达的 `http://host.docker.internal:<port>`。
+- 给 agent 看的物料只能走 `materials.agent`，不能依赖 `envs_path` 下的其它文件。
+
 **关键**：blade skill 和 MCP server 走相同的 HTTP 路径，env trace 天然对齐。
 这只适用于场景显式提供的业务工具，不表示所有场景或所有 agent 都必须使用 MCP。
 

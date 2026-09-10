@@ -205,6 +205,25 @@ def _extract_binary_candidates(requires: list[Any]) -> list[list[str]]:
     return candidates
 
 
+def python_prerequisites(meta: dict[str, Any]) -> list[str]:
+    """meta.yaml `prerequisites.python`：场景 MCP 入口/工具需要的 pip 包清单。
+
+    沙盒镜像构建时合并所有场景的声明（docker/agent-runtime/collect_env_requirements.py）。
+    缺省视为无额外依赖；形状错误是结构性错误（ValueError → EnvLoadError）。
+    """
+    prereqs = meta.get("prerequisites")
+    if not isinstance(prereqs, dict):
+        return []
+    raw = prereqs.get("python")
+    if raw is None:
+        return []
+    if not isinstance(raw, list) or not all(
+        isinstance(x, str) and x.strip() for x in raw
+    ):
+        raise ValueError("prerequisites.python 必须是非空字符串列表")
+    return [x.strip() for x in raw]
+
+
 def check_prerequisites(meta: dict[str, Any]) -> list[str]:
     """对 meta.yaml 的可判定二进制依赖做 shutil.which() 存在性检查。
 
@@ -308,6 +327,10 @@ class EnvLoader:
         prereq_warnings = check_prerequisites(meta)
         for w in prereq_warnings:
             logger.warning("env prerequisite: %s", w)
+        try:
+            python_prerequisites(meta)
+        except ValueError as exc:
+            raise EnvLoadError(env_name, "meta", str(exc)) from exc
 
         load_error: EnvLoadError | None = None
         try:

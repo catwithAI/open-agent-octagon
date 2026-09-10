@@ -38,6 +38,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import hashlib
 import json
 import logging
@@ -67,6 +68,13 @@ from ..model_providers import (
     ModelRef,
     parse_model_ref,
     resolve_api_key,
+)
+from ..process.launcher import (
+    AgentLauncher,
+    AttemptSandbox,
+    AttemptSpec,
+    ExecSpec,
+    HostLauncher,
 )
 from .base import (
     AdapterCapabilities,
@@ -241,7 +249,22 @@ class _TurnSink:
                 self.usage = merge_usage(self.usage, usage_from_event(data["usage"]))
 
 
+# 镜像里的 runtime 路径（docker/agent-runtime/Dockerfile）。
+SANDBOX_RUNTIME_BIN = "/opt/dsh/runtime/dsh-runtime"
+
+
+def _launch_args_override(
+    sandbox: AttemptSandbox, *, cwd: str, env: dict[str, str],
+) -> list[str] | None:
+    if sandbox.locus != "docker-sandbox":
+        return None
+    return list(sandbox.build_exec_argv(
+        ExecSpec(argv=[SANDBOX_RUNTIME_BIN], cwd=cwd, env=env, turn_id="dsh-runtime"),
+    ))
+
+
 class DshAdapter:
+    agent_name = "dsh"
     capabilities = AdapterCapabilities(
         # dsh-bash-local / dsh-fs-local 是本机执行，且 SDK 路线下**没有**
         # approval/sandbox 插件（DSH_PERMISSION_MODE 只对 CLI profile 生效）。
@@ -259,7 +282,12 @@ class DshAdapter:
         model: str,
         octagon_project_path: Path,
         providers: dict[str, ModelProviderSection] | None = None,
+        launcher: AgentLauncher | None = None,
     ) -> None:
+        self.launcher: AgentLauncher = launcher or HostLauncher()
+        self.capabilities = dataclasses.replace(
+            type(self).capabilities, execution_locus=self.launcher.locus,
+        )
         self.model = model
         self.octagon_project_path = Path(octagon_project_path)
         self.providers = providers or {}
@@ -389,7 +417,8 @@ class DshAdapter:
         return rows
 
     def _build_cordis(
-        self, task: AdapterRunInput, model_ref: ModelRef, workspace: Path
+        self, task: AdapterRunInput, model_ref: ModelRef, workspace: Path,
+        *, sandbox: AttemptSandbox | None = None,
     ) -> tuple[list[dict[str, Any]], str | None, int]:
         """本次 attempt 的完整插件组合。
 
@@ -413,7 +442,11 @@ class DshAdapter:
             {
                 "id": "sessions",
                 "name": "@deepseek-ai/dsh-session-persistence-jsonl",
-                "config": {"root": str((workspace.parent / "dsh_sessions").resolve()),
+                "config": {"root": (
+                               sandbox.path(sandbox.host_home(workspace.parent) / "dsh_sessions")
+                               if sandbox is not None
+                               else str((workspace.parent / "dsh_sessions").resolve())
+                           ),
                            "compression": "none"},
             },
             {"id": "session-checkpoints",
@@ -466,15 +499,17 @@ class DshAdapter:
 
     def _write_cordis(
         self, task: AdapterRunInput, attempt_dir: Path, model_ref: ModelRef,
-        workspace: Path,
+        workspace: Path, *, sandbox: AttemptSandbox,
     ) -> tuple[Path, str | None, int]:
         """落 `dsh_cordis.yml`，返回 (路径, api_key, max_tokens)。
 
         顶层是 entry-list（`EntryOptions[]`），**不是** `- insert:` 补丁方言
         ——SDK 走 `boot(..., patches=undefined)`，写成 patch 形式会直接 boot 失败。
         """
-        rows, api_key, max_tokens = self._build_cordis(task, model_ref, workspace)
-        path = attempt_dir / "dsh_cordis.yml"
+        rows, api_key, max_tokens = self._build_cordis(
+            task, model_ref, workspace, sandbox=sandbox,
+        )
+        path = sandbox.host_ro(attempt_dir) / "dsh_cordis.yml"
         path.write_text(
             yaml.safe_dump(rows, allow_unicode=True, sort_keys=False),
             encoding="utf-8",
@@ -483,19 +518,24 @@ class DshAdapter:
 
     def _subprocess_env(
         self, task: AdapterRunInput, attempt_dir: Path, workspace: Path,
-        api_key: str | None,
+        api_key: str | None, *, sandbox: AttemptSandbox, cordis_path: Path,
     ) -> dict[str, str]:
         """runtime 子进程的环境。
 
         skill 隔离靠三样东西，这里给两样，第三样（工作区的空 `.git`）在
         `run()` 里建目录时放——少任何一样都会让 dsh 读到不该读的 skill。
         """
+        state_dir = sandbox.host_home(attempt_dir)
         env: dict[str, str] = {
-            "DSH_CWD": str(workspace.resolve()),
-            "DSH_SESSION_ROOT": str((attempt_dir / "dsh_sessions").resolve()),
+            "DSH_CWD": sandbox.path(workspace),
+            "DSH_SESSION_ROOT": sandbox.path(state_dir / "dsh_sessions"),
+            # SDK 也会按 cordis= 参数设这个变量，但那只作用于 docker 客户端进程；
+            # 容器拿到的是这里显式给的（经 build_exec_argv 翻成 -e）。
+            "DSH_CORDIS_CONFIG": sandbox.path(cordis_path),
             # 挡 rank 400 / 500 的 skill 发现根目录，同时隔离 shell env。
-            "DSH_HOME": str((attempt_dir / ".dsh").resolve()),
-            "DSH_AGENTS_HOME": str((attempt_dir / ".agents").resolve()),
+            "DSH_HOME": sandbox.path(state_dir / ".dsh"),
+            "DSH_AGENTS_HOME": sandbox.path(state_dir / ".agents"),
+            "HOME": sandbox.path(state_dir),
             # 遥测导出**无任何脱敏**（message text / tool args / workspace
             # paths 全带走），评测数据不能外流。
             "DSH_TELEMETRY_DISABLED": "1",
@@ -517,6 +557,26 @@ class DshAdapter:
         data_path: Path,
     ) -> AdapterResult:
         data_path = Path(data_path)
+        # attempt 级沙盒上下文包住整个 run：runtime 进程（整个 attempt 只起一次）
+        # 是对该容器的 docker exec；上下文退出先收掉容器，dispatch 才进 scoring。
+        # 超时硬杀路径上 SDK close() 只杀 docker 客户端，容器内 runtime 靠这里收。
+        attempt_spec = AttemptSpec(
+            attempt_id=task.attempt_id,
+            data_path=data_path,
+            agent_name=self.agent_name,
+            run_id=task.run_id,
+            workspace=data_path / "attempts" / task.attempt_id / "skill_workspace",
+        )
+        async with self.launcher.attempt(attempt_spec) as sandbox:
+            return await self._run_inner(task, env, data_path, sandbox)
+
+    async def _run_inner(
+        self,
+        task: AdapterRunInput,
+        env: Any,
+        data_path: Path,
+        sandbox: AttemptSandbox,
+    ) -> AdapterResult:
         attempt_dir = data_path / "attempts" / task.attempt_id
         attempt_dir.mkdir(parents=True, exist_ok=True)
         workspace = attempt_dir / "skill_workspace"
@@ -525,8 +585,11 @@ class DshAdapter:
         # 只设 DSH_HOME/DSH_AGENTS_HOME 挡不住 Octagon 仓库那批 .agents/skills
         # ——它们由 projectRoot（最近的 .git 祖先）推导。实测漏 40+ 个。
         (workspace / ".git").mkdir(exist_ok=True)
+        # runtime 的状态目录：宿主机执行在 attempt 根（历史行为），沙盒执行在
+        # 隔离 HOME（容器内 /home/agent）——runtime 只能看到三处挂载。
+        state_dir = sandbox.host_home(attempt_dir)
         for sub in (".dsh", ".agents", "dsh_sessions"):
-            (attempt_dir / sub).mkdir(exist_ok=True)
+            (state_dir / sub).mkdir(parents=True, exist_ok=True)
 
         events_path = attempt_dir / "events.jsonl"
         thinking_path = attempt_dir / "thinking.jsonl"
@@ -635,10 +698,11 @@ class DshAdapter:
             # （dsh 对重名是 plugin load 硬失败，所以我们提前拦），
             # 而 adapter 契约要求任何失败都包成 error_code，不得向上抛。
             cordis_path, api_key, max_tokens = self._write_cordis(
-                task, attempt_dir, model_ref, workspace
+                task, attempt_dir, model_ref, workspace, sandbox=sandbox,
             )
             subprocess_env = self._subprocess_env(
-                task, attempt_dir, workspace, api_key
+                task, attempt_dir, workspace, api_key,
+                sandbox=sandbox, cordis_path=cordis_path,
             )
         except ValueError as exc:
             message = str(exc)
@@ -700,11 +764,16 @@ class DshAdapter:
                 # 模型的上下文，且 adapter 不按 contextWindow 夹紧。
                 # 传 None 等于没传。
                 max_tokens=max_tokens,
-                cwd=str(workspace.resolve()),
+                cwd=sandbox.path(workspace),
                 runtime_cwd=str(attempt_dir.resolve()),
-                session_root=str((attempt_dir / "dsh_sessions").resolve()),
-                cordis=str(cordis_path.resolve()),
+                session_root=sandbox.path(sandbox.host_home(attempt_dir) / "dsh_sessions"),
+                cordis=sandbox.path(cordis_path),
                 env=subprocess_env,
+                # 沙盒：runtime 是对本 attempt 容器的 docker exec -i（stdio 透传）；
+                # 宿主机：None → SDK 默认的 runtime-bin。
+                launch_args_override=_launch_args_override(
+                    sandbox, cwd=sandbox.path(workspace), env=subprocess_env,
+                ),
                 # **必须给**：默认 None = 单次 JSON-RPC 请求永不超时
                 # （`client._request_raw` 在无 timeout 的 queue.get() 上死等）。
                 # initialize 卡住时 attempt 会挂到天荒地老——实测踩过：8 秒
@@ -854,6 +923,8 @@ class DshAdapter:
                 # 对齐的值会误导安全轴。
                 permission_mode="no-approval-plugin (sdk default)",
                 workspace_root=str(workspace.resolve()),
+                # cordis 显式不挂 web 插件，没有服务端联网工具。
+                extra={**sandbox.security_fields(), "server_side_network": "none"},
             ),
         )
 

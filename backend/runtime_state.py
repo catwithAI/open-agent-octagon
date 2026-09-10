@@ -53,6 +53,9 @@ class RuntimeState:
     # **只在内存**：明文 key 不进 DB、不进日志、不进 external_refs。
     # run 结算完成后由 cost.credential.clear() 移除。
     run_credentials: dict[str, Any] = field(default_factory=dict)
+    # docker 沙盒启动检查结果（backend.process.sandbox_preflight.SandboxStatus）。
+    # None = 尚未检查；dispatch 在沙盒开启且未检查时惰性补做一次。
+    sandbox_status: Any = None
 
 
 _state: RuntimeState | None = None

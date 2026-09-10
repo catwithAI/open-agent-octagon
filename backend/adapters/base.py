@@ -23,6 +23,7 @@ def build_security_meta(
     workspace_root: str | None,
     sandbox_image: str | None = None,
     sandbox_id: str | None = None,
+    extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """执行场合快照。各 adapter 在已知启动参数处直接填，不做事后推断。
 
@@ -39,6 +40,11 @@ def build_security_meta(
         meta["sandbox_image"] = sandbox_image
     if sandbox_id:
         meta["sandbox_id"] = sandbox_id
+    # 执行场合的附加字段（agent_version / egress_policy / server_side_network /
+    # sandbox_shared …），由 launcher 或 adapter 按实际启动参数提供。
+    for key, value in (extra or {}).items():
+        if value is not None and key not in meta:
+            meta[key] = value
     return meta
 
 
