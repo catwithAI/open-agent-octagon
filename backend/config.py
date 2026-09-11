@@ -24,6 +24,20 @@ logger = logging.getLogger(__name__)
 DEFAULT_CONFIG_PATH = Path("octagon.yaml")
 
 
+class OctagonEvalsSection(BaseModel):
+    """Connection to the standalone octagon-evals scoring service.
+
+    Disabled by default so an existing deployment keeps its environment-local
+    scorer until the evaluator service and its judge credentials are ready.
+    """
+
+    enabled: bool = False
+    base_url: str = "http://127.0.0.1:8030"
+    request_timeout_seconds: float = Field(default=30.0, gt=0, le=300)
+    max_evidence_bytes: int = Field(default=262_144, ge=16_384, le=8 * 1024 * 1024)
+    max_file_bytes: int = Field(default=32_768, ge=1_024, le=1 * 1024 * 1024)
+
+
 class OctagonSection(BaseModel):
     data_path: Path = Path("./data")
     envs_path: Path = Path("./envs")
@@ -279,6 +293,7 @@ class CostSection(BaseModel):
 
 class Settings(BaseModel):
     octagon: OctagonSection = Field(default_factory=OctagonSection)
+    octagon_evals: OctagonEvalsSection = Field(default_factory=OctagonEvalsSection)
     blade: BladeSection = Field(default_factory=BladeSection)
     same_model: SameModelSection = Field(default_factory=SameModelSection)
     insights: InsightsSection = Field(default_factory=InsightsSection)
@@ -359,6 +374,19 @@ def _apply_env_overrides(data: dict[str, Any]) -> dict[str, Any]:
         sandbox["env_base_url"] = v
     data["sandbox"] = sandbox
 
+    octagon_evals = dict(data.get("octagon_evals") or {})
+    if v := os.environ.get("OCTAGON_EVALS_ENABLED"):
+        octagon_evals["enabled"] = v.strip().lower() in ("1", "true", "yes", "on")
+    if v := os.environ.get("OCTAGON_EVALS_BASE_URL"):
+        octagon_evals["base_url"] = v
+    if v := os.environ.get("OCTAGON_EVALS_REQUEST_TIMEOUT_SECONDS"):
+        octagon_evals["request_timeout_seconds"] = v
+    if v := os.environ.get("OCTAGON_EVALS_MAX_EVIDENCE_BYTES"):
+        octagon_evals["max_evidence_bytes"] = v
+    if v := os.environ.get("OCTAGON_EVALS_MAX_FILE_BYTES"):
+        octagon_evals["max_file_bytes"] = v
+    data["octagon_evals"] = octagon_evals
+
     insights = dict(data.get("insights") or {})
     if v := os.environ.get("INSIGHTS_PROVIDER"):
         insights["provider"] = v
@@ -408,6 +436,11 @@ def _log_settings(settings: Settings) -> None:
             "research_max_attempts": settings.octagon.research_max_attempts,
             "research_capture_max_policy": settings.octagon.research_capture_max_policy,
             "research_launch_stagger_ms": settings.octagon.research_launch_stagger_ms,
+        },
+        "octagon_evals": {
+            "enabled": settings.octagon_evals.enabled,
+            "base_url": settings.octagon_evals.base_url,
+            "request_timeout_seconds": settings.octagon_evals.request_timeout_seconds,
         },
         "blade": {
             "base_url": settings.blade.base_url,

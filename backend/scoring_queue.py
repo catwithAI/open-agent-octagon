@@ -19,6 +19,7 @@ from typing import Any
 from . import runtime_state
 from .cost.credential import judge_credentials_active
 from .db import _iso_after, _now_iso, _open_sync
+from .evaluator import ScorerUnavailableError
 from .scoring_snapshot import (
     ScoringInputMismatchError,
     create_scoring_snapshot,
@@ -44,6 +45,11 @@ class ScoringDeadlineExceeded(RuntimeError):
 # `__octagon_scorer_version__` 声明自己的口径版本，避免一个 env 改评分方式却
 # 让所有其它 env 的版本一起漂移。
 SCORER_VERSION = "batch-judge-v2"
+OCTAGON_EVALS_SCORER_VERSION = "octagon-evals-agent-judge-v1"
+
+
+def _octagon_evals_enabled(settings: Any | None) -> bool:
+    return bool(getattr(getattr(settings, "octagon_evals", None), "enabled", False))
 
 
 def _scorer_version_for_env(env: Any | None) -> str:
@@ -80,12 +86,16 @@ def enqueue_scoring_job(
     )
     now = _now_iso()
     job_id = f"scj_{uuid.uuid4().hex[:16]}"
+    external_evals_enabled = _octagon_evals_enabled(getattr(state, "settings", None))
     config = {
         "adapter_status": adapter_status,
         "adapter_error_code": adapter_error_code,
         "adapter_error_message": adapter_error_message,
         "security_meta": security_meta,
         "snapshot_ref": snapshot.relative_path,
+        # Persist the selected backend with the durable job. Changing config
+        # while a job is queued must not silently change its scoring semantics.
+        "scoring_backend": "octagon-evals" if external_evals_enabled else "native",
     }
     refs = dict(stats.get("external_refs") or {})
     if adapter_status != "completed":
@@ -101,7 +111,11 @@ def enqueue_scoring_job(
             "SELECT env_name FROM attempts WHERE id=?", (attempt_id,)
         ).fetchone()
         env = state.envs.get(str(env_row[0])) if env_row else None
-        scorer_version = _scorer_version_for_env(env)
+        scorer_version = (
+            OCTAGON_EVALS_SCORER_VERSION
+            if _octagon_evals_enabled(getattr(state, "settings", None))
+            else _scorer_version_for_env(env)
+        )
         conn.execute(
             "UPDATE attempts SET status='scoring',execution_status=?,"
             "execution_ended_at=?,execution_error_code=?,execution_error_message=?,"
@@ -356,10 +370,7 @@ async def _execute_job(
             from .input_snapshots import resolve_attempt_input
             from .run_dispatch import _resolve_scorer, _refresh_run_status
             from .runner import _row_to_task_dict, _write_security_columns_sync
-            from .evaluator import ScorerUnavailableError, evaluate
-            scorer = _resolve_scorer(env)
-            if scorer is None:
-                raise ScorerUnavailableError(f"env {attempt['env_name']} missing scorer")
+            from .evaluator import evaluate
             frozen_input = resolve_attempt_input(
                 data_path=state.data_path,
                 db_path=state.db_path,
@@ -378,6 +389,70 @@ async def _execute_job(
                 expected_hash=input_hash,
                 job_id=job_id,
             )
+            task_dict = _row_to_task_dict(dict(task), frozen_input=frozen_input)
+            # Jobs written before the external backend was introduced have no
+            # scoring_backend field.  Their native scorer semantics are part of
+            # the persisted job history and must not change after deployment
+            # configuration is toggled.
+            scoring_backend = config.get("scoring_backend") or "native"
+            use_external_evals = scoring_backend == "octagon-evals"
+            if use_external_evals:
+                from .octagon_evals_client import (
+                    OctagonEvalsClient,
+                    OctagonEvalsConfig,
+                    make_scorer,
+                )
+
+                with _open_sync(state.db_path) as conn:
+                    conn.row_factory = sqlite3.Row
+                    run_row = conn.execute(
+                        "SELECT r.*, g.experiment_id FROM runs r "
+                        "LEFT JOIN run_group_cells c ON c.run_id=r.id "
+                        "LEFT JOIN run_groups g ON g.id=c.run_group_id "
+                        "WHERE r.id=? LIMIT 1",
+                        (attempt["run_id"],),
+                    ).fetchone()
+                experiment_id = (
+                    str(run_row["experiment_id"])
+                    if run_row and run_row["experiment_id"]
+                    else f"legacy-{attempt['run_id']}"
+                )
+                # agent-octagon's legacy run table does not persist a separate
+                # scenario object. Use the loaded environment identity/version
+                # as the stable scenario descriptor expected by octagon-evals.
+                scenario = {
+                    "id": attempt["env_name"],
+                    "version": (getattr(env, "meta", {}) or {}).get(
+                        "schema_version", 1
+                    ),
+                }
+                eval_settings = state.settings.octagon_evals
+                client = OctagonEvalsClient(
+                    OctagonEvalsConfig(
+                        base_url=eval_settings.base_url,
+                        request_timeout_seconds=eval_settings.request_timeout_seconds,
+                        max_evidence_bytes=eval_settings.max_evidence_bytes,
+                        max_file_bytes=eval_settings.max_file_bytes,
+                    )
+                )
+                scorer = make_scorer(
+                    client,
+                    experiment_id=experiment_id,
+                    # octagon-evals uses one AgentRun per attempt.  The local
+                    # run_id identifies the comparison group, so it cannot be
+                    # reused for multiple agents/models in that group.
+                    run_id=str(attempt["id"]),
+                    scenario=scenario,
+                    attempt=dict(attempt),
+                    attempt_root=scoring_data_path / "attempts" / attempt_id,
+                    snapshot_ref=snapshot_ref,
+                    input_hash=input_hash,
+                    env_meta=getattr(env, "meta", {}) or {},
+                )
+            else:
+                scorer = _resolve_scorer(env)
+                if scorer is None:
+                    raise ScorerUnavailableError(f"env {attempt['env_name']} missing scorer")
             # judge 成本：本 run 的评分共用一把 judge key，与 agent
             # 执行隔离——ppt-visual-repair 那类多模态 judge 可能与执行同量级，
             # 混进 agent 的账会污染性价比横向比较。
@@ -398,7 +473,7 @@ async def _execute_job(
                 _evaluate = asyncio.to_thread(
                     evaluate,
                     attempt_id=attempt_id,
-                    task=_row_to_task_dict(dict(task), frozen_input=frozen_input),
+                    task=task_dict,
                     env=env,
                     data_path=scoring_data_path,
                     scorer=scorer,
@@ -573,7 +648,7 @@ async def _execute_job(
                 status="failed",
                 code=(
                     "scorer_unavailable"
-                    if exc.__class__.__name__ == "ScorerUnavailableError"
+                    if isinstance(exc, ScorerUnavailableError)
                     else "scorer_exception"
                 ),
                 message=str(exc),

@@ -42,6 +42,12 @@ services:
       - OPENROUTER_MANAGEMENT_KEY=${OPENROUTER_MANAGEMENT_KEY:-}
       - OCTAGON_ENVS_PATH=/app/envs
       - SELECTED_SKILLS_DIR=${SELECTED_SKILLS_DIR:-}
+      # Optional standalone LLM-as-a-judge service. From inside this container,
+      # a host-side octagon-evals is reachable through host.docker.internal.
+      # On Linux, start octagon-evals with OCTAGON_EVALS_HOST=0.0.0.0 (or use
+      # a shared Docker network); its start.sh default is loopback-only.
+      - OCTAGON_EVALS_ENABLED=${OCTAGON_EVALS_ENABLED:-0}
+      - OCTAGON_EVALS_BASE_URL=${OCTAGON_EVALS_BASE_URL:-http://host.docker.internal:8030}
       # agent CLI 装在宿主机的各自目录里，必须补进 PATH——adapter 用
       # shutil.which 找 CLI，漏了直接 cli_not_found。按你的安装位置调整。
       - PATH=/app/.venv/bin:/host-cli/bin:/usr/local/bin:/usr/bin:/bin
