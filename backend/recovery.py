@@ -461,13 +461,20 @@ async def _recover_blade_attempt(
         iteration_turn_handler=iteration_handler,
     )
     scorer = _resolve_scorer(env)
-    if scorer is None:
+    external_evals_enabled = bool(
+        getattr(getattr(settings, "octagon_evals", None), "enabled", False)
+    )
+    if scorer is None and not external_evals_enabled:
         _mark_interrupted(
             row,
             code="recovery_scorer_missing",
             message=f"env scorer missing during restart recovery: {row['env_name']}",
         )
         return
+    # Deferred scoring only needs a callable for the compatibility signature;
+    # scoring_queue selects octagon-evals when that backend is enabled.
+    if scorer is None:
+        scorer = lambda **_kwargs: []
 
     session_id = str(refs["blade_session_id"])
     bound: Any
@@ -516,7 +523,12 @@ async def _recover_blade_attempt(
         bound = _RecoveryAdapter(
             adapter, task, None, session_id, state.data_path
         )
-    await run_attempt(adapter=bound, scorer=scorer)
+    await run_attempt(
+        adapter=bound,
+        scorer=scorer,
+        defer_scoring=True,
+        scoring_capacity=int(settings.octagon.max_active_scoring_jobs),
+    )
     _refresh_run_status(state.db_path, row["id"])
 
 

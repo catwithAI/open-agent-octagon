@@ -2,6 +2,13 @@
 # 复制为 octagon.yaml(已 gitignore)后填实际值。
 # 环境变量优先级高于本文件,见每个字段注释。
 
+# 独立评分服务：开启后 scoring queue 将冻结的 attempt 交给 octagon-evals，
+# 由其 agent_judge 负责 LLM-as-a-judge；Agent 运行时不依赖该服务。
+# octagon_evals:
+#   enabled: true
+#   base_url: "http://127.0.0.1:8030"
+#   request_timeout_seconds: 30
+
 octagon:
   # Octagon 数据目录:attempt trace / blade events / final_state / sqlite DB。
   # env: OCTAGON_DATA_PATH
