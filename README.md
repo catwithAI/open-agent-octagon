@@ -121,6 +121,42 @@ This is also the basis for CI.
 
 ---
 
+## Standalone scoring: octagon-evals LLM-as-a-judge
+
+The runtime and scoring paths are decoupled through the durable scoring queue. To route
+scoring to the standalone repository at `/home/yang/octagon-evals`, start its API first:
+
+```bash
+cd /home/yang/octagon-evals
+OCTAGON_EVALS_PORT=8030 \
+OCTAGON_JUDGE_ENDPOINT="https://your-llm-endpoint/v1/chat/completions" \
+OCTAGON_JUDGE_MODEL="your-judge-model" \
+OCTAGON_JUDGE_API_KEY="your-api-key" \
+./start.sh
+```
+
+Enable the bridge in `agent-octagon/octagon.yaml` (or use the equivalent environment
+variables):
+
+```yaml
+octagon_evals:
+  enabled: true
+  base_url: "http://127.0.0.1:8030"
+  request_timeout_seconds: 30
+```
+
+```bash
+export OCTAGON_EVALS_ENABLED=1
+export OCTAGON_EVALS_BASE_URL=http://127.0.0.1:8030
+```
+
+After an Agent finishes, Octagon sends its read-only scoring snapshot as an
+`EvaluationInput` to `octagon-evals`, creates `agent_judge` tasks from the environment
+`meta.yaml` dimensions, and submits bounded artifact, `final_state`, trace, and event
+evidence. Scoring failures never become a business score of zero; execution and scoring
+statuses remain separate. The switch is off by default, so deployments can migrate one
+environment at a time while the native `scorer.py` remains available.
+
 ## Docker
 
 ```bash
@@ -274,6 +310,42 @@ uv run uvicorn backend.main:create_app --factory --host 0.0.0.0 --port 8100
 都自带 fake agent 的确定性产物。这也是 CI 的基础。
 
 ---
+
+## 独立评分：octagon-evals LLM-as-a-judge
+
+运行时与打分已经通过持久化 scoring queue 解耦。要把评分切换到家目录中的独立
+`/home/yang/octagon-evals` 服务，先启动评分服务：
+
+```bash
+cd /home/yang/octagon-evals
+OCTAGON_EVALS_PORT=8030 \
+OCTAGON_JUDGE_ENDPOINT="https://your-llm-endpoint/v1/chat/completions" \
+OCTAGON_JUDGE_MODEL="your-judge-model" \
+OCTAGON_JUDGE_API_KEY="your-api-key" \
+./start.sh
+```
+
+再在 `agent-octagon/octagon.yaml` 中启用桥接：
+
+```yaml
+octagon_evals:
+  enabled: true
+  base_url: "http://127.0.0.1:8030"
+  request_timeout_seconds: 30
+```
+
+或：
+
+```bash
+export OCTAGON_EVALS_ENABLED=1
+export OCTAGON_EVALS_BASE_URL=http://127.0.0.1:8030
+```
+
+Agent 执行结束后，Octagon 会把只读 scoring snapshot 作为 `EvaluationInput` 交给
+`octagon-evals`，按环境 `meta.yaml` 的 dimensions 创建 `agent_judge` 任务，并把
+受限大小的 artifact、`final_state`、trace 和 events 作为 evidence 提交。评分失败不会
+写入业务 0 分；执行状态和评分状态仍分别保留。该开关默认关闭，关闭时继续使用环境自带
+`scorer.py`，便于逐环境迁移。
 
 ## 容器化
 
