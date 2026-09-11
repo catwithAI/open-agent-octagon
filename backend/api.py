@@ -656,8 +656,22 @@ def _get_attempt_detail_sync(db_path: Path, attempt_id: str) -> dict[str, Any] |
         # 采集覆盖：event_count=0 要配着这个读——通道为 none 说明
         # 这次压根没采到工具调用，不能当"零违规"用。
         "coverage": json.loads(detail.pop("security_coverage_json", None) or "{}"),
+        # adapter 落盘的完整执行场合快照（沙盒镜像 digest / 容器 id / agent 版本 /
+        # egress_policy / server_side_network / sandbox_shared …）。
+        "meta": _read_security_meta(db_path.parent, attempt_id),
     }
     return detail
+
+
+def _read_security_meta(data_path: Path, attempt_id: str) -> dict[str, Any]:
+    try:
+        return json.loads(
+            (Path(data_path) / "attempts" / attempt_id / "security_meta.json").read_text(
+                encoding="utf-8"
+            )
+        )
+    except (OSError, json.JSONDecodeError):
+        return {}
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:

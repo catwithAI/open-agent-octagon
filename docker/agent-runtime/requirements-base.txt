@@ -1,0 +1,4 @@
+# 场景 MCP 入口（mcp_server.py）的最小依赖。mcp 钉 <2：场景用的是
+# mcp.server.fastmcp，2.x 已移除该模块（2026-09-09 POC 实测）。
+mcp<2
+httpx

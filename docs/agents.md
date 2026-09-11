@@ -577,3 +577,30 @@ blade-agent / claude-code 都在本机跑"的统一策略，`SshClaudeCodeAdapte
 
 如需重新启用，需要在 `run_dispatch.build_adapter()` 中显式恢复选用逻辑，并确认
 目标远端机器可用。
+
+
+## docker 沙盒（本机 CLI agent 共用）
+
+spec：`docs/specs/260909-agent-sandbox/`。`sandbox.enabled: true` 时 claude-code /
+codex / kimi-code / opencode / mimo-code / dsh 六个本机 agent 全部跑在
+`docker/agent-runtime` 镜像的容器里（一 attempt 一容器，每轮 `docker exec`），
+不按 agent 可选；沙盒不可用时 attempt 以 `sandbox_unavailable` 终态失败，不回落宿主机。
+
+adapter 不感知执行场合：进程启动统一经 `backend/process/launcher.py` 的
+`AgentLauncher.attempt()` / `AttemptSandbox.exec()`；路径与回连地址经
+`sandbox.path()` / `sandbox.translate_url()` 翻译，HOME 与只读交付目录经
+`sandbox.host_home()` / `sandbox.host_ro()` 取。宿主机实现全是恒等，
+所以 `sandbox.enabled: false` 时行为与沙盒接入前逐字节一致。
+
+| agent | 容器内 HOME / 状态 | 配置交付 | 服务端联网工具 |
+|---|---|---|---|
+| claude-code | `/home/agent/.claude`（CLAUDE_CONFIG_DIR） | `/attempt/mcp_config.json` | WebSearch/WebFetch，`server_side_tools: deny` 时经 settings 禁用 |
+| codex | `/home/agent`（CODEX_HOME），`-o` 落隔离 HOME | `-c mcp_servers.*` argv | web search，deny 时 `-c web_search="disabled"`（待实测） |
+| kimi-code | `/home/agent`（KIMI_CODE_HOME），mcp.json 在其下 | 同左 | 未核实，记 unknown |
+| opencode / mimo-code | `/home/agent` + XDG_* | `/attempt/<cli>_config.json` | 未核实，记 unknown |
+| dsh | `/home/agent`（DSH_HOME / DSH_AGENTS_HOME / dsh_sessions） | `/attempt/dsh_cordis.yml` | 无（cordis 不挂 web 插件） |
+
+执行场合快照落 `attempts/<id>/security_meta.json`（镜像 digest、容器 id、agent 版本、
+`egress_policy`、`server_side_network`），容器记录落 `sandbox_container.json`。
+blade-agent / ssh-claude-code 不在围栏内，只在 `security_meta` 记录
+（`sandbox_shared: true` / `sandbox: none`）。

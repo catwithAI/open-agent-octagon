@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import logging
 import os
@@ -49,7 +50,13 @@ from ..model_providers import (
     parse_model_ref,
     resolve_api_key,
 )
-from ..process.runtime import agent_process
+from ..process.launcher import (
+    AgentLauncher,
+    AttemptSandbox,
+    AttemptSpec,
+    ExecSpec,
+    HostLauncher,
+)
 from .base import (
     AdapterCapabilities,
     AdapterResult,
@@ -80,6 +87,7 @@ def _toml_escape(value: str) -> str:
 
 class KimiCodeAdapter:
     # 能力静态声明：见 AdapterCapabilities docstring。
+    agent_name = "kimi-code"
     capabilities = AdapterCapabilities(
         execution_locus="host",
         network_required="public_internet",
@@ -93,7 +101,14 @@ class KimiCodeAdapter:
         model: str,
         octagon_project_path: str | Path = ".",
         providers: dict[str, ModelProviderSection] | None = None,
+        launcher: AgentLauncher | None = None,
     ) -> None:
+        # 进程启动层：缺省宿主机执行；沙盒模式由 build_adapter 注入 DockerLauncher。
+        # execution_locus 随 launcher 取值，类常量只是静态声明。
+        self.launcher: AgentLauncher = launcher or HostLauncher()
+        self.capabilities = dataclasses.replace(
+            type(self).capabilities, execution_locus=self.launcher.locus,
+        )
         self.model = model
         self.octagon_project_path = str(Path(octagon_project_path).resolve())
         self.providers = providers or {}
@@ -147,7 +162,7 @@ class KimiCodeAdapter:
         return "\n".join(lines)
 
     def _write_mcp_config(
-        self, task: AdapterRunInput, kimi_home: Path
+        self, task: AdapterRunInput, kimi_home: Path, *, sandbox: AttemptSandbox | None = None,
     ) -> Path | None:
         """MCP 声明写进 `$KIMI_CODE_HOME/mcp.json`（dialect 同 CC 的 mcpServers）。
 
@@ -165,7 +180,10 @@ class KimiCodeAdapter:
                 "env": {
                     "OCTAGON_ATTEMPT_ID": task.attempt_id,
                     "OCTAGON_ENV_TOKEN": task.env_token,
-                    "OCTAGON_BASE_URL": task.env_base_url,
+                    "OCTAGON_BASE_URL": (
+                        sandbox.translate_url(task.env_base_url)
+                        if sandbox is not None else task.env_base_url
+                    ),
                 },
             }
             if spec.cwd:
@@ -199,6 +217,25 @@ class KimiCodeAdapter:
         data_path: Path,
     ) -> AdapterResult:
         data_path = Path(data_path)
+        # attempt 级沙盒上下文包住整个 run：多轮 conversation 的每一轮都在同一
+        # 容器里 exec；上下文退出（含异常）先收掉容器，dispatch 才进 scoring。
+        attempt_spec = AttemptSpec(
+            attempt_id=task.attempt_id,
+            data_path=data_path,
+            agent_name=self.agent_name,
+            run_id=task.run_id,
+            workspace=data_path / "attempts" / task.attempt_id / "skill_workspace",
+        )
+        async with self.launcher.attempt(attempt_spec) as sandbox:
+            return await self._run_inner(task, env, data_path, sandbox)
+
+    async def _run_inner(
+        self,
+        task: AdapterRunInput,
+        env: Any,
+        data_path: Path,
+        sandbox: AttemptSandbox,
+    ) -> AdapterResult:
         attempt_dir = data_path / "attempts" / task.attempt_id
         attempt_dir.mkdir(parents=True, exist_ok=True)
         # agent 工作区：与 CC/codex/blade 同构，产物落这里。
@@ -207,7 +244,7 @@ class KimiCodeAdapter:
         events_path = attempt_dir / "events.jsonl"
         thinking_path = attempt_dir / "thinking.jsonl"
 
-        cli_path = shutil.which("kimi")
+        cli_path = sandbox.resolve_cli("kimi")
         if not cli_path:
             return AdapterResult(
                 attempt_id=task.attempt_id,
@@ -242,12 +279,12 @@ class KimiCodeAdapter:
             base_url = resolve_agent_base_url(task.run_id, provider.base_url, task.attempt_id)
             # wire 消费点：injection 覆盖本次 provider base URL。
             if task.wire_injection.enabled and task.wire_injection.llm_base_url:
-                base_url = task.wire_injection.llm_base_url
+                base_url = sandbox.translate_url(task.wire_injection.llm_base_url)
 
         # 本地状态隔离：KIMI_CODE_HOME 指向 attempt 内的干净目录，kimi 不读宿主机
         # ~/.kimi-code 的全局 provider 凭据 / skills / sessions / 记忆，
         # 排除私人配置污染；Kimi Code 内建能力不在这里禁用。
-        kimi_home = attempt_dir / ".kimi-iso-home"
+        kimi_home = sandbox.host_home(attempt_dir / ".kimi-iso-home")
         kimi_home.mkdir(parents=True, exist_ok=True)
         # 无命名 provider 时不写 config.toml：让 CLI 用它自己已登录的 provider
         # 与 default_model（此时 self.model 原样作为别名传给 -m）。
@@ -256,7 +293,7 @@ class KimiCodeAdapter:
                 self._render_config_toml(model_ref, base_url or "", api_key),
                 encoding="utf-8",
             )
-        self._write_mcp_config(task, kimi_home)
+        self._write_mcp_config(task, kimi_home, sandbox=sandbox)
 
         prompt = self._render_prompt(task)
         cli_model = (
@@ -322,8 +359,8 @@ class KimiCodeAdapter:
 
         subprocess_env = {
             **os.environ,
-            "KIMI_CODE_HOME": str(kimi_home.resolve()),
-            "HOME": str(kimi_home.resolve()),
+            "KIMI_CODE_HOME": sandbox.path(kimi_home),
+            "HOME": sandbox.path(kimi_home),
             # 评测期间禁用自动升级：跑到一半换 CLI 版本会让同批次不可比。
             "KIMI_CLI_NO_AUTO_UPDATE": "1",
             "KIMI_CODE_NO_AUTO_UPDATE": "1",
@@ -332,7 +369,7 @@ class KimiCodeAdapter:
             subprocess_env.update({
                 "OCTAGON_ATTEMPT_ID": task.attempt_id,
                 "OCTAGON_ENV_TOKEN": task.env_token,
-                "OCTAGON_BASE_URL": task.env_base_url,
+                "OCTAGON_BASE_URL": sandbox.translate_url(task.env_base_url),
             })
         # wire injection 消费点：provider/MCP 已写进配置文件，这里合并 process_env
         # 与自定义头。
@@ -460,13 +497,12 @@ class KimiCodeAdapter:
                             if msg and not error_message:
                                 error_message = msg[:500]
 
-                async with agent_process(
+                async with sandbox.exec(ExecSpec(
                     argv=_build_cmd(turn, is_first=is_first),
-                    data_path=data_path,
-                    attempt_id=task.attempt_id,
                     cwd=str(workspace),
                     env=subprocess_env,
-                ) as proc:
+                    turn_id=getattr(turn, "turn_id", None),
+                )) as proc:
                     turn_proc = proc
                     try:
                         await asyncio.wait_for(_consume(), timeout=deadline.remaining())
@@ -597,6 +633,8 @@ class KimiCodeAdapter:
                 # print 模式本身即非交互自动执行（--auto 与 -p 互斥，见模块 docstring）。
                 permission_mode="print-mode(-p)",
                 workspace_root=str(workspace.resolve()),
+                # kimi 是否有服务端联网工具未核实，如实记 unknown。
+                extra={**sandbox.security_fields(), "server_side_network": "unknown"},
             ),
         )
 

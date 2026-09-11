@@ -249,3 +249,28 @@ cost:
   # 降级路径要观测的共享 key 的 hash（不是明文）。配了才能记 run 前后
   # usage 差作为**上界**——该差值含其他机器/个人的流量，不可用于资金归因。
   # shared_key_hash: "..."
+
+# ---- docker 沙盒（spec: docs/specs/260909-agent-sandbox）----
+# 本机 CLI agent（claude-code / codex / kimi-code / opencode / mimo-code / dsh）
+# 每个 attempt 一个容器：只挂载 workspace（同路径）、隔离 HOME 与只读物料，
+# 场景答案、其他 attempt、后端数据对 agent 物理不可见。网络不限制。
+# enabled 是全局强制：开启后六个本机 agent 全部进容器，不按 agent 可选；
+# 沙盒不可用时 attempt 以 sandbox_unavailable 失败，不回落宿主机执行。
+# blade-agent / ssh-claude-code 不在此围栏内，只在 security_meta 记录。
+# 后端必须跑在宿主机上并能执行 docker CLI。
+sandbox:
+  enabled: false
+  # 完整 repo:tag。本地开发 `make sandbox-image` 出 octagon-agent-runtime:dev；
+  # 正式版本由 CI（.github/workflows/sandbox-image.yml）推阿里云。
+  image: "octagon-agent-runtime:dev"
+  # 容器内访问 Env Attempt Server 的地址；不填则按 public_base_url 的端口推导
+  # http://host.docker.internal:<port>。后端需监听 0.0.0.0。
+  env_base_url: null
+  # 每个容器的限额（docker --memory/--cpus/--pids-limit）
+  limits: {memory: "4g", cpus: 2.0, pids: 1024}
+  # LLM 服务端执行的联网工具（claude-code WebSearch/WebFetch、codex web search）
+  # 不经容器。allow = 不裁剪只记录（默认）；deny = 经 CLI settings 禁用。
+  server_side_tools: allow
+  # 按 agent 覆盖限额；不允许按 agent 换镜像。
+  agents: {}
+  #   claude-code: {limits: {memory: "6g"}}

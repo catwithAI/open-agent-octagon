@@ -1,0 +1,414 @@
+"""DockerLauncher：argv / 挂载 / env 翻译 / MCP 入口翻译（不依赖 docker），
+以及一组真 docker 集成测试（无 docker 时 skip）。"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import shutil
+import subprocess
+import sys
+import textwrap
+import uuid
+from pathlib import Path
+
+import pytest
+
+from backend.adapters.base import McpServerSpec
+from backend.config import Settings
+from backend.process.docker_launcher import (
+    CONTAINER_RECORD_FILENAME,
+    HOME_MOUNT,
+    RO_MOUNT,
+    DockerLauncher,
+    check_mcp_entry_self_contained,
+    container_is_running,
+    sweep_sandbox_containers,
+    translate_loopback_url,
+    translate_mcp_specs,
+)
+from backend.process.identity import agent_process_is_alive, read_agent_process
+from backend.process.launcher import AttemptSpec, ExecSpec
+from backend.process.lifecycle import kill_recorded_agent_process
+from backend.process.sandbox_preflight import (
+    SandboxImageInfo,
+    SandboxUnavailable,
+    check_sandbox,
+    require_sandbox_agent,
+)
+
+FAKE_IMAGE = SandboxImageInfo(
+    reference="octagon-agent-runtime:test",
+    image_id="sha256:abc",
+    digest="repo@sha256:abc",
+    agents=("claude-code", "codex"),
+    versions={"claude-code": "2.1.245", "codex": "0.149.1"},
+)
+
+
+def _settings(**sandbox) -> Settings:
+    return Settings.model_validate({"sandbox": {"enabled": True, "image": FAKE_IMAGE.reference, **sandbox}})
+
+
+def _spec(tmp_path: Path, attempt_id: str = "att-1", agent: str = "claude-code") -> AttemptSpec:
+    return AttemptSpec(
+        attempt_id=attempt_id, data_path=tmp_path, agent_name=agent, run_id="run-1",
+        workspace=tmp_path / "attempts" / attempt_id / "skill_workspace",
+    )
+
+
+# ---------------------------------------------------------------------------
+# 纯函数
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "url,expected",
+    [
+        ("http://127.0.0.1:8100", "http://host.docker.internal:8100"),
+        ("http://localhost:8100/internal/wire-proxy/a/b", "http://host.docker.internal:8100/internal/wire-proxy/a/b"),
+        ("http://0.0.0.0:18100", "http://host.docker.internal:18100"),
+        ("https://openrouter.ai/api/v1", "https://openrouter.ai/api/v1"),
+        ("http://192.168.1.2:8100", "http://192.168.1.2:8100"),
+    ],
+)
+def test_translate_loopback_url(url: str, expected: str) -> None:
+    assert translate_loopback_url(url) == expected
+
+
+def test_build_run_argv_has_whitelist_mounts_limits_and_labels(tmp_path: Path) -> None:
+    launcher = DockerLauncher(settings=_settings(agents={"claude-code": {"limits": {"memory": "6g"}}}), image=FAKE_IMAGE)
+    spec = _spec(tmp_path)
+    ws = spec.workspace
+    from backend.process.docker_launcher import _Mount
+
+    mounts = (_Mount(ws, str(ws)), _Mount(tmp_path / "h", HOME_MOUNT), _Mount(tmp_path / "r", RO_MOUNT, readonly=True))
+    argv = launcher.build_run_argv(spec, mounts=mounts, limits=launcher._limits_for("claude-code"), workspace=ws)
+    s = " ".join(argv)
+    assert argv[:3] == ("docker", "run", "-d")
+    assert "--name octagon-agent-att-1" in s
+    assert "--label octagon.attempt_id=att-1" in s and "--label octagon.run_id=run-1" in s
+    assert "--memory 6g --memory-swap 6g" in s and "--cpus 2.0" in s and "--pids-limit 1024" in s
+    assert "--cap-drop ALL" in s and "--security-opt no-new-privileges" in s
+    assert f"-v {ws}:{ws}" in s                      # 同路径
+    assert f"-v {tmp_path / 'h'}:{HOME_MOUNT}" in s
+    assert f"-v {tmp_path / 'r'}:{RO_MOUNT}:ro" in s
+    assert argv[-3:] == (FAKE_IMAGE.reference, "sleep", "infinity")
+    # 只有三处挂载
+    assert s.count(" -v ") == 3
+    assert "--add-host host.docker.internal:host-gateway" in s
+    if os.getuid() != 0:
+        assert f"--user {os.getuid()}:{os.getgid()}" in s
+
+
+def _sandbox(tmp_path: Path, **sandbox_cfg):
+    from backend.process.docker_launcher import DockerAttemptSandbox, _Mount
+
+    launcher = DockerLauncher(settings=_settings(**sandbox_cfg), image=FAKE_IMAGE)
+    spec = _spec(tmp_path)
+    ws = spec.workspace
+    home = tmp_path / "attempts" / "att-1" / "sandbox_home"
+    ro = tmp_path / "attempts" / "att-1" / "sandbox_ro"
+    for d in (ws, home, ro):
+        d.mkdir(parents=True, exist_ok=True)
+    mounts = (_Mount(ws.resolve(), str(ws.resolve())), _Mount(home.resolve(), HOME_MOUNT), _Mount(ro.resolve(), RO_MOUNT, readonly=True))
+    return DockerAttemptSandbox(
+        launcher=launcher, spec=spec, container_id="ctr123", workspace=ws, home=home, ro=ro,
+        mounts=mounts, limits=launcher._limits_for("claude-code"),
+    )
+
+
+def test_exec_argv_only_passes_adapter_set_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HOST_SECRET", "s3cr3t")
+    monkeypatch.setenv("LANG", "C.UTF-8")
+    monkeypatch.setenv("http_proxy", "http://127.0.0.1:7890")
+    sb = _sandbox(tmp_path)
+    env = {**os.environ, "ANTHROPIC_AUTH_TOKEN": "tok", "CLAUDE_CONFIG_DIR": "/home/agent/.claude",
+           "HOME": "/home/agent", "PATH": "/host/bin"}
+    argv = sb.build_exec_argv(ExecSpec(argv=["claude", "-p", "hi"], cwd=str(sb.workspace), env=env))
+    s = " ".join(argv)
+    assert argv[:3] == ("docker", "exec", "-i")
+    assert f"-w {sb.workspace}" in s
+    assert "-e ANTHROPIC_AUTH_TOKEN=tok" in s and "-e CLAUDE_CONFIG_DIR=/home/agent/.claude" in s
+    assert "HOST_SECRET" not in s                         # 宿主机环境不透传
+    assert "-e PATH=" not in s                            # 镜像 PATH
+    assert "-e LANG=C.UTF-8" in s                         # 无害直通
+    assert "-e http_proxy=http://host.docker.internal:7890" in s
+    assert argv[-3:] == ("claude", "-p", "hi")
+    assert argv[argv.index("ctr123") - 1] != "-e"
+
+
+def test_exec_cwd_is_resolved_to_absolute(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """octagon.yaml 默认 data_path ./data：相对 cwd 必须解析成绝对路径（docker exec 要求）。"""
+    monkeypatch.chdir(tmp_path)
+    sb = _sandbox(tmp_path)
+    rel = os.path.relpath(sb.workspace, tmp_path)
+    argv = sb.build_exec_argv(ExecSpec(argv=["x"], cwd=rel, env={}))
+    assert argv[argv.index("-w") + 1] == str(sb.workspace.resolve())
+
+
+def test_path_translation_is_whitelist(tmp_path: Path) -> None:
+    sb = _sandbox(tmp_path)
+    assert sb.path(sb.workspace / "a.txt") == f"{sb.workspace.resolve()}/a.txt"
+    assert sb.path(sb.home / ".claude") == f"{HOME_MOUNT}/.claude"
+    assert sb.path(sb.ro / "mcp_config.json") == f"{RO_MOUNT}/mcp_config.json"
+    assert sb.host_home(tmp_path / "x") == sb.home
+    assert sb.host_ro(tmp_path / "x") == sb.ro
+    assert sb.resolve_cli("claude") == "claude"
+    with pytest.raises(SandboxUnavailable):
+        sb.path(tmp_path / "attempts" / "att-1" / "events.jsonl")
+    fields = sb.security_fields()
+    assert fields["sandbox_image"] == FAKE_IMAGE.digest and fields["sandbox_id"] == "ctr123"
+    assert fields["agent_version"] == "2.1.245" and fields["egress_policy"] == "unrestricted"
+
+
+def test_translate_mcp_specs_copies_single_file(tmp_path: Path) -> None:
+    project = tmp_path / "proj"
+    env_dir = project / "envs" / "demo"
+    env_dir.mkdir(parents=True)
+    (env_dir / "mcp_server.py").write_text("import httpx\nfrom mcp.server.fastmcp import FastMCP\n")
+    (env_dir / "scorer.py").write_text("SECRET = 1\n")
+    (env_dir / "core.py").write_text("x = 1\n")
+    spec = McpServerSpec(name="octagon-demo", command="uv",
+                         args=("run", "--project", ".", "python", "envs/demo/mcp_server.py"),
+                         cwd=str(project))
+    attempt_dir = tmp_path / "attempts" / "att-1"
+    out = translate_mcp_specs((spec,), attempt_dir=attempt_dir, workspace=attempt_dir / "skill_workspace")
+    assert len(out) == 1
+    assert out[0].command == "python3" and out[0].args == (f"{RO_MOUNT}/mcp/mcp_server.py",)
+    assert out[0].cwd == str(attempt_dir / "skill_workspace")
+    copied = list((attempt_dir / "sandbox_ro" / "mcp").iterdir())
+    assert [p.name for p in copied] == ["mcp_server.py"]          # 只有那一个文件
+
+
+def test_translate_mcp_specs_resolves_external_envs_path(tmp_path: Path) -> None:
+    """command 写的是项目根视角的 envs/<env>/x.py，而 envs_path 在仓库外。"""
+    env_dir = tmp_path / "external-envs" / "demo"
+    env_dir.mkdir(parents=True)
+    (env_dir / "mcp_server.py").write_text("import httpx\n")
+    project = tmp_path / "proj"
+    project.mkdir()
+    spec = McpServerSpec(name="d", command="uv", args=("run", "python", "envs/demo/mcp_server.py"), cwd=str(project))
+    out = translate_mcp_specs((spec,), attempt_dir=tmp_path / "a", workspace=tmp_path / "a" / "w", env_dir=env_dir)
+    assert out[0].args == (f"{RO_MOUNT}/mcp/mcp_server.py",)
+    assert (tmp_path / "a" / "sandbox_ro" / "mcp" / "mcp_server.py").exists()
+
+
+def test_translate_mcp_specs_rejects_sibling_import(tmp_path: Path) -> None:
+    env_dir = tmp_path / "envs" / "demo"
+    env_dir.mkdir(parents=True)
+    (env_dir / "core.py").write_text("x = 1\n")
+    (env_dir / "mcp_server.py").write_text("from core import x\n")
+    assert check_mcp_entry_self_contained(env_dir / "mcp_server.py")
+    spec = McpServerSpec(name="d", command="python", args=("envs/demo/mcp_server.py",), cwd=str(tmp_path))
+    with pytest.raises(SandboxUnavailable) as exc:
+        translate_mcp_specs((spec,), attempt_dir=tmp_path / "a", workspace=tmp_path / "a" / "w")
+    assert exc.value.error_code == "sandbox_mcp_entry_unresolvable"
+
+    spec2 = McpServerSpec(name="d", command="uv", args=("run", "something"), cwd=str(tmp_path))
+    with pytest.raises(SandboxUnavailable):
+        translate_mcp_specs((spec2,), attempt_dir=tmp_path / "b", workspace=tmp_path / "b" / "w")
+
+
+def test_require_sandbox_agent_failure_codes() -> None:
+    from backend.process.sandbox_preflight import SandboxStatus
+
+    ok = SandboxStatus(enabled=True, ok=True, image=FAKE_IMAGE)
+    assert require_sandbox_agent(ok, "codex") is FAKE_IMAGE
+    with pytest.raises(SandboxUnavailable) as e:
+        require_sandbox_agent(ok, "dsh")
+    assert e.value.error_code == "sandbox_agent_missing"
+    with pytest.raises(SandboxUnavailable) as e:
+        require_sandbox_agent(SandboxStatus(enabled=True, ok=False, error_code="sandbox_image_missing", error_message="x"), "codex")
+    assert e.value.error_code == "sandbox_image_missing"
+    with pytest.raises(SandboxUnavailable):
+        require_sandbox_agent(SandboxStatus(enabled=False, ok=True), "codex")
+
+
+def test_check_sandbox_without_docker_cli(tmp_path: Path) -> None:
+    status = check_sandbox(_settings(), docker=str(tmp_path / "no-such-docker"))
+    assert not status.ok and status.error_code == "sandbox_unavailable"
+    assert check_sandbox(Settings()).enabled is False
+
+
+def test_identity_roundtrip_docker(tmp_path: Path) -> None:
+    from backend.process.identity import record_sandbox_container
+
+    record_sandbox_container(tmp_path, "att-1", "ctr-xyz")
+    ident = read_agent_process(tmp_path, "att-1")
+    assert ident is not None and ident.kind == "docker" and ident.container_id == "ctr-xyz"
+    payload = json.loads((tmp_path / "attempts" / "att-1" / "agent_process.json").read_text())
+    assert payload == {"kind": "docker", "container_id": "ctr-xyz", "recorded_at": ident.recorded_at}
+
+
+# ---------------------------------------------------------------------------
+# docker 集成（无 docker / 拉不到基础镜像时 skip）
+# ---------------------------------------------------------------------------
+
+_BASE = "python:3.12-slim"
+
+
+def _docker_ok() -> bool:
+    if shutil.which("docker") is None:
+        return False
+    try:
+        subprocess.run(["docker", "image", "inspect", _BASE], capture_output=True, timeout=20, check=True)
+        return True
+    except Exception:
+        return False
+
+
+needs_docker = pytest.mark.skipif(not _docker_ok(), reason=f"需要 docker 与本地镜像 {_BASE}")
+
+
+def _real_launcher(tmp_path: Path) -> DockerLauncher:
+    image = SandboxImageInfo(reference=_BASE, image_id="x", digest=_BASE, agents=("claude-code",), versions={})
+    settings = Settings.model_validate({"sandbox": {"enabled": True, "image": _BASE, "limits": {"memory": "512m", "cpus": 1.0, "pids": 256}}})
+    return DockerLauncher(settings=settings, image=image)
+
+
+@needs_docker
+@pytest.mark.asyncio
+async def test_docker_attempt_visibility_lifecycle_and_record(tmp_path: Path) -> None:
+    attempt_id = f"att-{uuid.uuid4().hex[:8]}"
+    data = tmp_path / "data"
+    # 作弊面：场景答案、兄弟 attempt、DB 都在宿主机 data 旁边
+    (tmp_path / "envs" / "demo").mkdir(parents=True)
+    (tmp_path / "envs" / "demo" / "scorer.py").write_text("SECRET\n")
+    (data / "attempts" / "other" / "skill_workspace").mkdir(parents=True)
+    (data / "octagon.db").write_text("db\n")
+    spec = AttemptSpec(attempt_id=attempt_id, data_path=data, agent_name="claude-code", run_id="r",
+                       workspace=data / "attempts" / attempt_id / "skill_workspace")
+    launcher = _real_launcher(tmp_path)
+    probe = textwrap.dedent(
+        """
+        import json, os, subprocess, pathlib
+        out = {
+          "cwd": os.getcwd(),
+          "home": os.environ.get("HOME"),
+          "x": os.environ.get("OCT_X"),
+          "leak": os.environ.get("HOST_ONLY"),
+          "scorer": subprocess.run(["sh","-c","find / -name scorer.py 2>/dev/null"], capture_output=True, text=True).stdout,
+          "db": os.path.exists("%s"),
+          "sibling": os.path.exists("%s"),
+          "ro_list": sorted(os.listdir("/attempt")),
+        }
+        pathlib.Path("out.txt").write_text("written")
+        try:
+            pathlib.Path("/attempt/x").write_text("x"); out["ro_write"] = "allowed"
+        except OSError as e: out["ro_write"] = "denied"
+        try:
+            pathlib.Path("/etc/x").write_text("x"); out["etc_write"] = "allowed"
+        except OSError as e: out["etc_write"] = "denied"
+        pathlib.Path(os.environ["HOME"], "state.txt").write_text("s")
+        print(json.dumps(out))
+        """ % (data / "octagon.db", data / "attempts" / "other")
+    )
+    os.environ["HOST_ONLY"] = "leak"
+    try:
+        async with launcher.attempt(spec) as sb:
+            container_id = sb.container_id
+            assert container_is_running(container_id)
+            (sb.ro / "prompt.md").write_text("hello")
+            # 跨重启身份：agent_process.json 记的是容器
+            assert agent_process_is_alive(data, attempt_id)
+            results = []
+            for turn in ("t1", "t2"):
+                async with sb.exec(ExecSpec(argv=["python3", "-c", probe], cwd=str(sb.workspace),
+                                            env={**os.environ, "OCT_X": turn}, turn_id=turn)) as proc:
+                    out = await proc.stdout.read()
+                    await proc.wait()
+                    assert proc.returncode == 0, (await proc.stderr.read()).decode()
+                results.append(json.loads(out))
+            assert container_is_running(container_id)          # 两轮之间容器活着
+    finally:
+        os.environ.pop("HOST_ONLY", None)
+
+    for r in results:
+        assert Path(r["cwd"]) == sb.workspace.resolve()
+        assert r["home"] == HOME_MOUNT and r["leak"] is None
+        assert r["scorer"].strip() == "" and r["db"] is False and r["sibling"] is False
+        assert r["ro_list"] == ["mcp", "prompt.md"]
+        assert r["ro_write"] == "denied" and r["etc_write"] == "denied"
+    assert results[0]["x"] == "t1" and results[1]["x"] == "t2"
+    assert (sb.workspace / "out.txt").read_text() == "written"
+    assert (sb.home / "state.txt").exists()                     # HOME 状态留在宿主机侧
+    # 退出后：容器已杀并删除、记录落盘
+    assert not container_is_running(container_id)
+    assert not agent_process_is_alive(data, attempt_id)
+    rec = json.loads((data / "attempts" / attempt_id / CONTAINER_RECORD_FILENAME).read_text())
+    assert rec["container_id"] == container_id and [e["turn_id"] for e in rec["execs"]] == ["t1", "t2"]
+    assert all(e["exit_code"] == 0 for e in rec["execs"])
+    assert rec["limits"] == {"memory": "512m", "cpus": 1.0, "pids": 256}
+
+
+@needs_docker
+@pytest.mark.asyncio
+async def test_docker_exec_timeout_kills_whole_container(tmp_path: Path) -> None:
+    attempt_id = f"att-{uuid.uuid4().hex[:8]}"
+    data = tmp_path / "data"
+    spec = AttemptSpec(attempt_id=attempt_id, data_path=data, agent_name="claude-code",
+                       workspace=data / "attempts" / attempt_id / "skill_workspace")
+    launcher = _real_launcher(tmp_path)
+    async with launcher.attempt(spec) as sb:
+        async with sb.exec(ExecSpec(argv=["sleep", "60"], cwd=str(sb.workspace))) as proc:
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=1)
+            except asyncio.TimeoutError:
+                pass
+        # exec 上下文退出即杀整容器
+        assert proc.returncode is not None
+        assert not container_is_running(sb.container_id)
+    assert not container_is_running(sb.container_id)
+
+
+@needs_docker
+@pytest.mark.asyncio
+async def test_docker_recorded_container_kill_and_sweep(tmp_path: Path) -> None:
+    """模拟后端崩溃：attempt() 没退出就丢了句柄——按落盘身份杀、按标签扫。"""
+    attempt_id = f"att-{uuid.uuid4().hex[:8]}"
+    data = tmp_path / "data"
+    spec = AttemptSpec(attempt_id=attempt_id, data_path=data, agent_name="claude-code",
+                       workspace=data / "attempts" / attempt_id / "skill_workspace")
+    launcher = _real_launcher(tmp_path)
+    cm = launcher.attempt(spec)
+    sb = await cm.__aenter__()
+    try:
+        assert kill_recorded_agent_process(data, attempt_id) is True
+        assert not container_is_running(sb.container_id)
+        swept = sweep_sandbox_containers(is_attempt_active=lambda _a: False)
+        assert swept["containers_removed"] >= 1
+        assert subprocess.run(["docker", "inspect", sb.container_id], capture_output=True).returncode != 0
+    finally:
+        await cm.__aexit__(None, None, None)
+
+
+# ---------------------------------------------------------------------------
+# dsh：runtime 走 docker exec -i，宿主机走 SDK 默认
+# ---------------------------------------------------------------------------
+
+
+def test_dsh_launch_args_override(tmp_path: Path) -> None:
+    from backend.adapters.dsh import SANDBOX_RUNTIME_BIN, _launch_args_override
+    from backend.process.launcher import HostAttemptSandbox
+
+    env = {"DSH_CWD": "/w", "DSH_SESSION_ROOT": "/home/agent/dsh_sessions",
+           "DSH_CORDIS_CONFIG": "/attempt/dsh_cordis.yml", "DEEPSEEK_API_KEY": "k"}
+    assert _launch_args_override(HostAttemptSandbox(_spec(tmp_path)), cwd="/w", env=env) is None
+    sb = _sandbox(tmp_path)
+    argv = _launch_args_override(sb, cwd=str(sb.workspace), env=env)
+    assert argv[:3] == ["docker", "exec", "-i"] and argv[-1] == SANDBOX_RUNTIME_BIN
+    s = " ".join(argv)
+    for k, v in env.items():
+        assert f"-e {k}={v}" in s
+    assert "ctr123" in argv
+
+
+def test_dsh_adapter_locus_follows_launcher(tmp_path: Path) -> None:
+    from backend.adapters.dsh import DshAdapter
+
+    launcher = DockerLauncher(settings=_settings(), image=FAKE_IMAGE)
+    adapter = DshAdapter(model="p/m", octagon_project_path=tmp_path, launcher=launcher)
+    assert adapter.capabilities.execution_locus == "docker-sandbox"
+    assert DshAdapter(model="p/m", octagon_project_path=tmp_path).capabilities.execution_locus == "host"

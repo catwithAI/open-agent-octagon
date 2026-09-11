@@ -95,6 +95,7 @@ def diagnose_attempt(
         "auth_failed", "cli_not_found", "server_unreachable",
         "provider_quota_exhausted", "blade_service_unavailable",
         "capture_infrastructure_failed", "session_socket_overflow",
+        "sandbox_unavailable",
     } or error_code in {
         "adapter_crashed", "cli_launch_error", "network_error", "quota_exhausted",
         "upstream_error", "upstream_rate_limited", "upstream_unavailable",

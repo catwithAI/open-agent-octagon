@@ -30,12 +30,25 @@ class ProcessIdentity:
     boot_id: str | None = None
     recorded_at: str | None = None
     boot_id_corrupt: bool = False
+    # kind=docker：agent 跑在 attempt 专属容器里，判活/杀以 container_id 为准，
+    # pid 无意义（记 0）。kind=process 时磁盘结构与历史完全一致（不写 kind）。
+    kind: str = "process"
+    container_id: str | None = None
 
     @classmethod
     def from_payload(cls, data: object) -> ProcessIdentity | None:
         """从落盘 JSON 构造；无法使用的记录返回 ``None``。"""
         if not isinstance(data, dict):
             return None
+        if data.get("kind") == "docker":
+            container_id = data.get("container_id")
+            if not isinstance(container_id, str) or not container_id:
+                return None
+            recorded = data.get("recorded_at")
+            return cls(
+                pid=0, kind="docker", container_id=container_id,
+                recorded_at=recorded if isinstance(recorded, str) else None,
+            )
         pid = data.get("pid")
         if not isinstance(pid, int) or pid <= 0:
             return None
@@ -63,6 +76,12 @@ class ProcessIdentity:
 
     def to_payload(self) -> dict[str, Any]:
         """返回与既有 ``agent_process.json`` 完全相同的磁盘结构。"""
+        if self.kind == "docker":
+            return {
+                "kind": "docker",
+                "container_id": self.container_id,
+                "recorded_at": self.recorded_at,
+            }
         return {
             "pid": self.pid,
             "pgid": self.pgid,
@@ -107,6 +126,25 @@ def record_agent_process(
         )
     except Exception:
         logger.warning("无法记录 agent 进程信息 attempt=%s", attempt_id, exc_info=True)
+
+
+def record_sandbox_container(
+    data_path: Path | None, attempt_id: str, container_id: str
+) -> None:
+    """沙盒模式：把容器 id 落到同一份 agent_process.json；失败不得阻断执行。"""
+    if data_path is None:
+        return
+    identity = ProcessIdentity(
+        pid=0, kind="docker", container_id=container_id, recorded_at=_utc_now_iso(),
+    )
+    try:
+        target = Path(data_path) / "attempts" / attempt_id / "agent_process.json"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(
+            json.dumps(identity.to_payload(), ensure_ascii=False), encoding="utf-8"
+        )
+    except Exception:
+        logger.warning("无法记录沙盒容器信息 attempt=%s", attempt_id, exc_info=True)
 
 
 def _machine_boot_id() -> str | None:
@@ -157,6 +195,10 @@ def agent_process_is_alive(data_path: Path | None, attempt_id: str) -> bool:
     identity = read_agent_process(data_path, attempt_id)
     if identity is None:
         return False
+    if identity.kind == "docker":
+        from .docker_launcher import container_is_running
+
+        return container_is_running(identity.container_id or "")
     match identity.boot_match(_machine_boot_id()):
         case BootMatch.DIFFERENT:
             return False

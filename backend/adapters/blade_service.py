@@ -387,6 +387,14 @@ class AdapterEnv:
         return self.primary_skill_id or self.skill_id
 
 
+# blade 沙盒的执行场合附加字段（两处 security_meta 共用）。
+BLADE_SANDBOX_SECURITY_EXTRA = {
+    "sandbox_shared": True,
+    "sandbox_managed_by": "blade-server",
+    "egress_policy": "unrestricted",
+}
+
+
 class BladeServiceAdapter:
     # 能力静态声明：blade-agent server 是本机/局域网内已运行的固定
     # 服务（TCP 可达即可），不是公网 API——network_required 取 local_service
@@ -1418,6 +1426,10 @@ class BladeServiceAdapter:
                 permission_mode="sandbox",
                 workspace_root=None,
                 sandbox_id=blade_session_id,
+                # blade 沙盒由 blade server 管理：每个 blade 用户一个长驻容器，
+                # session 之间共享 /root，公网开放。如实记录，不伪装成本方案的
+                # per-attempt 沙盒（spec 260909-agent-sandbox 需求 7）。
+                extra=BLADE_SANDBOX_SECURITY_EXTRA,
             ),
         )
 
@@ -2385,6 +2397,7 @@ class BladeServiceAdapter:
                 permission_mode="sandbox",
                 workspace_root=None,
                 sandbox_id=session_id,
+                extra=BLADE_SANDBOX_SECURITY_EXTRA,
             ),
         )
 

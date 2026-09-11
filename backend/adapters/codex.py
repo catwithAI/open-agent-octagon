@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import logging
 import os
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from ..conversation.deadline import (
     ERROR_BUDGET_EXHAUSTED_BETWEEN_TURNS,
@@ -32,7 +33,13 @@ from ..model_providers import (
     resolve_api_key,
 )
 from ..wire.injection import WireInjection
-from ..process.runtime import agent_process
+from ..process.launcher import (
+    AgentLauncher,
+    AttemptSandbox,
+    AttemptSpec,
+    ExecSpec,
+    HostLauncher,
+)
 from .base import (
     AdapterCapabilities,
     AdapterResult,
@@ -52,6 +59,7 @@ logger = logging.getLogger(__name__)
 
 class CodexAdapter:
     # 能力静态声明：见 AdapterCapabilities docstring。
+    agent_name = "codex"
     capabilities = AdapterCapabilities(
         execution_locus="host",
         network_required="public_internet",
@@ -67,7 +75,14 @@ class CodexAdapter:
         model: str = "gpt-5.5",
         octagon_project_path: str | Path = ".",
         providers: dict[str, ModelProviderSection] | None = None,
+        launcher: AgentLauncher | None = None,
     ) -> None:
+        # 进程启动层：缺省宿主机执行；沙盒模式由 build_adapter 注入 DockerLauncher。
+        # execution_locus 随 launcher 取值，类常量只是静态声明。
+        self.launcher: AgentLauncher = launcher or HostLauncher()
+        self.capabilities = dataclasses.replace(
+            type(self).capabilities, execution_locus=self.launcher.locus,
+        )
         self.model = model
         self.octagon_project_path = str(Path(octagon_project_path).resolve())
         self.providers = providers or {}
@@ -91,6 +106,7 @@ class CodexAdapter:
         injection: WireInjection,
         run_id: str | None = None,
         attempt_id: str | None = None,
+        translate_url: Callable[[str], str] | None = None,
     ) -> list[str]:
         """provider 前缀模型 → -c 单次覆盖注入命名 provider，不碰全局 config.toml。
 
@@ -118,6 +134,9 @@ class CodexAdapter:
             # wire 未接管时，run 专属 key 的 base_url 优先（与 key 同源）。
             else resolve_agent_base_url(run_id, p.base_url, attempt_id)
         )
+        if translate_url is not None:
+            # 沙盒：wire 反代挂在宿主机 127.0.0.1，容器内要走 host.docker.internal。
+            base_url = translate_url(base_url)
         args = [
             "-c", f'model_providers.{name}.name="{name}"',
             "-c", f'model_providers.{name}.base_url="{base_url}"',
@@ -149,6 +168,25 @@ class CodexAdapter:
         data_path: Path,
     ) -> AdapterResult:
         data_path = Path(data_path)
+        # attempt 级沙盒上下文包住整个 run：多轮 conversation 的每一轮都在同一
+        # 容器里 exec；上下文退出（含异常）先收掉容器，dispatch 才进 scoring。
+        attempt_spec = AttemptSpec(
+            attempt_id=task.attempt_id,
+            data_path=data_path,
+            agent_name=self.agent_name,
+            run_id=task.run_id,
+            workspace=data_path / "attempts" / task.attempt_id / "skill_workspace",
+        )
+        async with self.launcher.attempt(attempt_spec) as sandbox:
+            return await self._run_inner(task, env, data_path, sandbox)
+
+    async def _run_inner(
+        self,
+        task: AdapterRunInput,
+        env: Any,
+        data_path: Path,
+        sandbox: AttemptSandbox,
+    ) -> AdapterResult:
         attempt_dir = data_path / "attempts" / task.attempt_id
         attempt_dir.mkdir(parents=True, exist_ok=True)
         # agent 工作区（design：skill_workspace 是 agent 的唯一世界边界）。
@@ -159,9 +197,10 @@ class CodexAdapter:
         workspace.mkdir(parents=True, exist_ok=True)
         events_path = attempt_dir / "events.jsonl"
         thinking_path = attempt_dir / "thinking.jsonl"
-        final_message_path = attempt_dir / "codex_final.txt"
+        # -o 的落点必须是 agent 进程可写的路径：宿主机就是 attempt 根，沙盒是隔离 HOME。
+        final_message_path = sandbox.host_home(attempt_dir) / "codex_final.txt"
 
-        cli_path = shutil.which("codex")
+        cli_path = sandbox.resolve_cli("codex")
         if not cli_path:
             return AdapterResult(
                 attempt_id=task.attempt_id,
@@ -176,7 +215,8 @@ class CodexAdapter:
         # 返回明确 terminal 而非让 ValueError 冒成 adapter_crashed。
         try:
             provider_args = self._provider_cli_args(
-                model_ref, task.wire_injection, task.run_id, task.attempt_id
+                model_ref, task.wire_injection, task.run_id, task.attempt_id,
+                translate_url=sandbox.translate_url,
             )
         except ValueError as exc:
             return AdapterResult(
@@ -239,8 +279,11 @@ class CodexAdapter:
                 *provider_args,
             ]
             if with_workspace:
-                args += ["-C", str(workspace.resolve())]
-            args += ["-o", str(final_message_path.resolve())]
+                args += ["-C", sandbox.path(workspace)]
+            args += ["-o", sandbox.path(final_message_path)]
+            if sandbox.server_side_tools == "deny":
+                # 服务端 web search 不经容器；deny 时经 config 关掉（待实测 key）。
+                args += ["-c", 'web_search="disabled"']
             for spec in task.mcp_servers:
                 mcp_command, mcp_args = self._mcp_command_and_args(task, spec)
                 args += [
@@ -284,7 +327,7 @@ class CodexAdapter:
             ]
 
         if task.mcp_servers:
-            self._write_mcp_config_snapshot(task, attempt_dir)
+            self._write_mcp_config_snapshot(task, attempt_dir, sandbox=sandbox)
 
         events_count = 0
         thinking_count = 0
@@ -304,11 +347,11 @@ class CodexAdapter:
         # 宿主机 ~/.codex 的全局 config.toml（32KB）/skills/plugins/memories/history，
         # 而在干净目录里从零建配置，排除同事私人配置污染；不禁用 Codex 内建能力。实测：
         # 空 CODEX_HOME 下 codex 新建自己的 memories/state sqlite，不读宿主机全局态。
-        iso_codex_home = attempt_dir / ".codex-iso-home"
+        iso_codex_home = sandbox.host_home(attempt_dir / ".codex-iso-home")
         iso_codex_home.mkdir(parents=True, exist_ok=True)
         subprocess_env = {
             **os.environ,
-            "CODEX_HOME": str(iso_codex_home.resolve()),
+            "CODEX_HOME": sandbox.path(iso_codex_home),
         }
         # Codex 的 MCP 配置经 argv 传入，secret 不可写进 -c；仅场景确实提供 MCP
         # 时才让 stdio child 从父进程环境继承 attempt 凭据。
@@ -316,7 +359,7 @@ class CodexAdapter:
             subprocess_env.update({
                 "OCTAGON_ATTEMPT_ID": task.attempt_id,
                 "OCTAGON_ENV_TOKEN": task.env_token,
-                "OCTAGON_BASE_URL": task.env_base_url,
+                "OCTAGON_BASE_URL": sandbox.translate_url(task.env_base_url),
             })
         if model_ref.provider is not None:
             provider = self.providers[model_ref.provider]
@@ -479,13 +522,12 @@ class CodexAdapter:
                                 else max(current, candidate)
                             )
 
-                async with agent_process(
+                async with sandbox.exec(ExecSpec(
                     argv=_build_cmd(turn, is_first=is_first),
-                    data_path=data_path,
-                    attempt_id=task.attempt_id,
                     cwd=str(workspace),
                     env=subprocess_env,
-                ) as proc:
+                    turn_id=getattr(turn, "turn_id", None),
+                )) as proc:
                     turn_proc = proc
                     try:
                         await asyncio.wait_for(
@@ -742,6 +784,12 @@ class CodexAdapter:
                 execution_locus=self.capabilities.execution_locus,
                 permission_mode="--dangerously-bypass-approvals-and-sandbox",
                 workspace_root=str(workspace.resolve()),
+                extra={
+                    **sandbox.security_fields(),
+                    "server_side_network": (
+                        "disabled" if sandbox.server_side_tools == "deny" else "available"
+                    ),
+                },
             ),
         )
 
@@ -756,7 +804,7 @@ class CodexAdapter:
         return command, args
 
     def _write_mcp_config_snapshot(
-        self, task: AdapterRunInput, attempt_dir: Path
+        self, task: AdapterRunInput, attempt_dir: Path, *, sandbox: AttemptSandbox | None = None,
     ) -> None:
         servers: dict[str, Any] = {}
         for spec in task.mcp_servers:
@@ -767,7 +815,10 @@ class CodexAdapter:
                 "env": {
                     "OCTAGON_ATTEMPT_ID": task.attempt_id,
                     "OCTAGON_ENV_TOKEN": task.env_token,
-                    "OCTAGON_BASE_URL": task.env_base_url,
+                    "OCTAGON_BASE_URL": (
+                        sandbox.translate_url(task.env_base_url)
+                        if sandbox is not None else task.env_base_url
+                    ),
                 },
             }
             if spec.cwd:

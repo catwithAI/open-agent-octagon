@@ -29,6 +29,7 @@ import logging
 import sqlite3
 from pathlib import Path
 
+from . import runtime_state
 from .convergence import cancel_attempt_tasks, converge_attempts
 from .db import _now_iso, _open_sync
 
@@ -130,7 +131,45 @@ def sweep_once(db_path: Path, *, grace_seconds: int = DEFAULT_GRACE_SECONDS) -> 
         logger.warning(
             "sweeper 收敛：execution=%d scoring=%d", swept_execution, swept_scoring
         )
-    return {"execution": swept_execution, "scoring": swept_scoring}
+    result = {"execution": swept_execution, "scoring": swept_scoring}
+    result.update(_sweep_sandbox_containers(db_path))
+    return result
+
+
+def _attempt_is_active(db_path: Path, attempt_id: str) -> bool:
+    from .models import NON_TERMINAL_ATTEMPT_STATUSES
+
+    with _open_sync(db_path) as conn:
+        row = conn.execute(
+            "SELECT status FROM attempts WHERE id=?", (attempt_id,)
+        ).fetchone()
+    return row is not None and row[0] in NON_TERMINAL_ATTEMPT_STATUSES
+
+
+def _sweep_sandbox_containers(db_path: Path) -> dict[str, int]:
+    """docker 沙盒开启时回收孤儿容器：已退出的 rm；attempt 已终态却还在跑的 kill。
+
+    后端崩溃时 attempt() 上下文没机会退出，容器会留下来——这里是兜底。
+    """
+    try:
+        settings = runtime_state.get().settings
+    except Exception:  # noqa: BLE001 —— 测试直接调 sweep_once 时可能未 bind
+        return {}
+    if settings is None or not getattr(settings, "sandbox", None) or not settings.sandbox.enabled:
+        return {}
+    try:
+        from .process.docker_launcher import sweep_sandbox_containers
+
+        swept = sweep_sandbox_containers(
+            is_attempt_active=lambda attempt_id: _attempt_is_active(db_path, attempt_id),
+        )
+    except Exception:
+        logger.exception("sweeper 回收沙盒容器失败（继续）")
+        return {}
+    if swept.get("containers_killed") or swept.get("containers_removed"):
+        logger.warning("sweeper 沙盒容器：killed=%d removed=%d",
+                       swept["containers_killed"], swept["containers_removed"])
+    return swept
 
 
 async def run_deadline_sweeper(

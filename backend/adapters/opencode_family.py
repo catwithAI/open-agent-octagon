@@ -23,6 +23,7 @@ env_prefix / agent_name），其余共用。
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import logging
 import os
@@ -52,7 +53,13 @@ from ..model_providers import (
     parse_model_ref,
     resolve_api_key,
 )
-from ..process.runtime import agent_process
+from ..process.launcher import (
+    AgentLauncher,
+    AttemptSandbox,
+    AttemptSpec,
+    ExecSpec,
+    HostLauncher,
+)
 from .base import (
     AdapterCapabilities,
     AdapterResult,
@@ -123,10 +130,18 @@ class OpencodeFamilyAdapter:
         model: str,
         octagon_project_path: str | Path = ".",
         providers: dict[str, ModelProviderSection] | None = None,
+        launcher: AgentLauncher | None = None,
     ) -> None:
+        # 进程启动层：缺省宿主机执行；沙盒模式由 build_adapter 注入 DockerLauncher。
+        # execution_locus 随 launcher 取值，类常量只是静态声明。
+        self.launcher: AgentLauncher = launcher or HostLauncher()
+        self.capabilities = dataclasses.replace(
+            type(self).capabilities, execution_locus=self.launcher.locus,
+        )
         if agent_name not in FAMILY_PROFILES:
             raise ValueError(f"未知的 opencode 系 agent: {agent_name!r}")
         self.profile = FAMILY_PROFILES[agent_name]
+        self.agent_name = self.profile.agent_name
         self.model = model
         self.octagon_project_path = str(Path(octagon_project_path).resolve())
         self.providers = providers or {}
@@ -177,6 +192,7 @@ class OpencodeFamilyAdapter:
         task: AdapterRunInput,
         attempt_dir: Path,
         model_ref: ModelRef,
+        sandbox: AttemptSandbox | None = None,
     ) -> tuple[Path, str | None]:
         """生成本次 attempt 专用的配置文件，返回 (路径, api_key)。
 
@@ -200,7 +216,10 @@ class OpencodeFamilyAdapter:
             headers: dict[str, str] = {}
             if task.wire_injection.enabled:
                 if task.wire_injection.llm_base_url:
-                    base_url = task.wire_injection.llm_base_url
+                    base_url = (
+                        sandbox.translate_url(task.wire_injection.llm_base_url)
+                        if sandbox is not None else task.wire_injection.llm_base_url
+                    )
                 headers.update(task.wire_injection.llm_headers)
                 # capture token 走独立头（不占 Authorization——那被 provider
                 # auth 占用且反代会剥）。缺了它反代直接 401 capture token
@@ -229,13 +248,18 @@ class OpencodeFamilyAdapter:
                     "environment": {
                         "OCTAGON_ATTEMPT_ID": task.attempt_id,
                         "OCTAGON_ENV_TOKEN": task.env_token,
-                        "OCTAGON_BASE_URL": task.env_base_url,
+                        "OCTAGON_BASE_URL": (
+                            sandbox.translate_url(task.env_base_url)
+                            if sandbox is not None else task.env_base_url
+                        ),
                     },
                 }
                 mcp[spec.name] = entry
             config["mcp"] = mcp
 
-        path = attempt_dir / f"{self.profile.executable}_config.json"
+        # 配置文件必须在 agent 进程可读的位置：宿主机是 attempt 根，沙盒是只读交付目录。
+        base_dir = sandbox.host_ro(attempt_dir) if sandbox is not None else attempt_dir
+        path = base_dir / f"{self.profile.executable}_config.json"
         path.write_text(
             json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8"
         )
@@ -262,6 +286,25 @@ class OpencodeFamilyAdapter:
         data_path: Path,
     ) -> AdapterResult:
         data_path = Path(data_path)
+        # attempt 级沙盒上下文包住整个 run：多轮 conversation 的每一轮都在同一
+        # 容器里 exec；上下文退出（含异常）先收掉容器，dispatch 才进 scoring。
+        attempt_spec = AttemptSpec(
+            attempt_id=task.attempt_id,
+            data_path=data_path,
+            agent_name=self.agent_name,
+            run_id=task.run_id,
+            workspace=data_path / "attempts" / task.attempt_id / "skill_workspace",
+        )
+        async with self.launcher.attempt(attempt_spec) as sandbox:
+            return await self._run_inner(task, env, data_path, sandbox)
+
+    async def _run_inner(
+        self,
+        task: AdapterRunInput,
+        env: Any,
+        data_path: Path,
+        sandbox: AttemptSandbox,
+    ) -> AdapterResult:
         attempt_dir = data_path / "attempts" / task.attempt_id
         attempt_dir.mkdir(parents=True, exist_ok=True)
         # agent 工作区：与 CC/codex/blade 同构，产物落这里，attempt 根目录留给框架。
@@ -270,7 +313,7 @@ class OpencodeFamilyAdapter:
         events_path = attempt_dir / "events.jsonl"
         thinking_path = attempt_dir / "thinking.jsonl"
 
-        cli_path = shutil.which(self.profile.executable)
+        cli_path = sandbox.resolve_cli(self.profile.executable)
         if not cli_path:
             return AdapterResult(
                 attempt_id=task.attempt_id,
@@ -303,7 +346,7 @@ class OpencodeFamilyAdapter:
                     ),
                 )
 
-        config_path, _api_key = self._write_config(task, attempt_dir, model_ref)
+        config_path, _api_key = self._write_config(task, attempt_dir, model_ref, sandbox=sandbox)
         prompt = self._render_prompt(task)
 
         # argv 里引用模型时必须带 provider id 前缀；无命名 provider 时原样透传
@@ -382,18 +425,18 @@ class OpencodeFamilyAdapter:
         # 本地状态隔离：config/data 目录指向 attempt 内的干净目录，CLI 不读宿主机
         # 全局配置（provider 凭据、skills、plugins、session 历史），排除私人配置
         # 污染结果；CLI 产品内建能力不在这里禁用。
-        iso_home = attempt_dir / f".{self.profile.executable}-iso-home"
+        iso_home = sandbox.host_home(attempt_dir / f".{self.profile.executable}-iso-home")
         iso_config_dir = iso_home / "config"
         iso_config_dir.mkdir(parents=True, exist_ok=True)
         subprocess_env = {
             **os.environ,
-            "HOME": str(iso_home.resolve()),
-            "XDG_CONFIG_HOME": str((iso_home / ".config").resolve()),
-            "XDG_DATA_HOME": str((iso_home / ".local" / "share").resolve()),
-            "XDG_CACHE_HOME": str((iso_home / ".cache").resolve()),
-            "XDG_STATE_HOME": str((iso_home / ".local" / "state").resolve()),
-            self.profile.config_env: str(config_path.resolve()),
-            self.profile.config_dir_env: str(iso_config_dir.resolve()),
+            "HOME": sandbox.path(iso_home),
+            "XDG_CONFIG_HOME": sandbox.path(iso_home / ".config"),
+            "XDG_DATA_HOME": sandbox.path(iso_home / ".local" / "share"),
+            "XDG_CACHE_HOME": sandbox.path(iso_home / ".cache"),
+            "XDG_STATE_HOME": sandbox.path(iso_home / ".local" / "state"),
+            self.profile.config_env: sandbox.path(config_path),
+            self.profile.config_dir_env: sandbox.path(iso_config_dir),
             # 评测期间禁用自动升级：跑到一半换 CLI 版本会让同批次不可比。
             f"{self.profile.env_prefix}_DISABLE_AUTOUPDATE": "1",
         }
@@ -401,7 +444,7 @@ class OpencodeFamilyAdapter:
             subprocess_env.update({
                 "OCTAGON_ATTEMPT_ID": task.attempt_id,
                 "OCTAGON_ENV_TOKEN": task.env_token,
-                "OCTAGON_BASE_URL": task.env_base_url,
+                "OCTAGON_BASE_URL": sandbox.translate_url(task.env_base_url),
             })
         # wire injection 消费点：provider/MCP 已写进 config，这里合并 process_env。
         if task.wire_injection.enabled:
@@ -534,13 +577,12 @@ class OpencodeFamilyAdapter:
                                     else max(current, candidate)
                                 )
 
-                async with agent_process(
+                async with sandbox.exec(ExecSpec(
                     argv=_build_cmd(turn, is_first=is_first),
-                    data_path=data_path,
-                    attempt_id=task.attempt_id,
                     cwd=str(workspace),
                     env=subprocess_env,
-                ) as proc:
+                    turn_id=getattr(turn, "turn_id", None),
+                )) as proc:
                     turn_proc = proc
                     try:
                         await asyncio.wait_for(_consume(), timeout=deadline.remaining())
@@ -666,6 +708,8 @@ class OpencodeFamilyAdapter:
                 execution_locus=self.capabilities.execution_locus,
                 permission_mode=self.profile.auto_approve_flag,
                 workspace_root=str(workspace.resolve()),
+                # opencode 系是否有服务端联网工具未核实，如实记 unknown。
+                extra={**sandbox.security_fields(), "server_side_network": "unknown"},
             ),
         )
 

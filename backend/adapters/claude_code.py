@@ -15,6 +15,7 @@ stdout stream-json 格式（调研确认）：
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import logging
 import os
@@ -39,7 +40,13 @@ from ..model_providers import (
     parse_model_ref,
     resolve_api_key,
 )
-from ..process.runtime import agent_process
+from ..process.launcher import (
+    AgentLauncher,
+    AttemptSandbox,
+    AttemptSpec,
+    ExecSpec,
+    HostLauncher,
+)
 from .base import (
     AdapterCapabilities,
     AdapterResult,
@@ -88,6 +95,7 @@ def _clear_stale_cc_session(iso_home: Path, session_id: str) -> None:
 class ClaudeCodeAdapter:
     # 能力静态声明：execution_locus 是 build_security_meta 的
     # 权威取值来源；network_required/system_requires 只声明不消费。
+    agent_name = "claude-code"
     capabilities = AdapterCapabilities(
         execution_locus="host",
         network_required="public_internet",
@@ -104,7 +112,14 @@ class ClaudeCodeAdapter:
         max_budget_usd: float = 5.0,
         octagon_project_path: str | Path = ".",
         providers: dict[str, ModelProviderSection] | None = None,
+        launcher: AgentLauncher | None = None,
     ) -> None:
+        # 进程启动层：缺省宿主机执行；沙盒模式由 build_adapter 注入 DockerLauncher。
+        # execution_locus 随 launcher 取值，类常量只是静态声明。
+        self.launcher: AgentLauncher = launcher or HostLauncher()
+        self.capabilities = dataclasses.replace(
+            type(self).capabilities, execution_locus=self.launcher.locus,
+        )
         self.model = model
         self.max_budget_usd = max_budget_usd
         self.octagon_project_path = str(Path(octagon_project_path).resolve())
@@ -127,6 +142,25 @@ class ClaudeCodeAdapter:
         data_path: Path,
     ) -> AdapterResult:
         data_path = Path(data_path)
+        # attempt 级沙盒上下文包住整个 run：多轮 conversation 的每一轮都在同一
+        # 容器里 exec；上下文退出（含异常）先收掉容器，dispatch 才进 scoring。
+        attempt_spec = AttemptSpec(
+            attempt_id=task.attempt_id,
+            data_path=data_path,
+            agent_name=self.agent_name,
+            run_id=task.run_id,
+            workspace=data_path / "attempts" / task.attempt_id / "skill_workspace",
+        )
+        async with self.launcher.attempt(attempt_spec) as sandbox:
+            return await self._run_inner(task, env, data_path, sandbox)
+
+    async def _run_inner(
+        self,
+        task: AdapterRunInput,
+        env: Any,
+        data_path: Path,
+        sandbox: AttemptSandbox,
+    ) -> AdapterResult:
         attempt_dir = data_path / "attempts" / task.attempt_id
         attempt_dir.mkdir(parents=True, exist_ok=True)
         # agent 工作区（design：skill_workspace 是 agent 的唯一世界边界）。
@@ -138,7 +172,7 @@ class ClaudeCodeAdapter:
         events_path = attempt_dir / "events.jsonl"
         thinking_path = attempt_dir / "thinking.jsonl"
 
-        cli_path = shutil.which("claude")
+        cli_path = sandbox.resolve_cli("claude")
         if not cli_path:
             return AdapterResult(
                 attempt_id=task.attempt_id,
@@ -147,7 +181,11 @@ class ClaudeCodeAdapter:
                 error_message="claude CLI not found in PATH",
             )
 
-        mcp_config_path = self._write_mcp_config(task, attempt_dir)
+        # mcp_config 落到只读交付目录：宿主机执行就是 attempt 根（与历史一致），
+        # 沙盒执行是 sandbox_ro/（容器内 /attempt），路径经 sandbox.path 翻译。
+        mcp_config_path = self._write_mcp_config(
+            task, sandbox.host_ro(attempt_dir), sandbox=sandbox,
+        )
         prompt = self._render_prompt(task, attempt_dir)
         # 时间预算（测单位时间能力上限）走 CC 原生 --append-system-prompt，
         # 语义是"框架级约束"而非任务本身；None（不限时）返回 None，不注入。
@@ -170,10 +208,16 @@ class ClaudeCodeAdapter:
         # CC 就不会读宿主机 ~/.claude 的全局 skill/plugin/MCP/记忆/CLAUDE.md/settings
         # 避免同事私人配置污染结果。每个 attempt 一个独立目录，互不干扰；
         # Claude Code 产品内建的原生能力不在这里禁用。
-        iso_home = attempt_dir / ".cc-iso-home"
+        iso_home = sandbox.host_home(attempt_dir / ".cc-iso-home")
         (iso_home / ".claude").mkdir(parents=True, exist_ok=True)
-        subprocess_env["CLAUDE_CONFIG_DIR"] = str((iso_home / ".claude").resolve())
-        subprocess_env["HOME"] = str(iso_home.resolve())
+        subprocess_env["CLAUDE_CONFIG_DIR"] = sandbox.path(iso_home / ".claude")
+        subprocess_env["HOME"] = sandbox.path(iso_home)
+        # 服务端工具（WebSearch / WebFetch 在 Anthropic 侧执行，沙盒管不到）：
+        # sandbox.server_side_tools=deny 时经 settings 禁用；两态都记进 security_meta。
+        server_side_network = "available"
+        if sandbox.server_side_tools == "deny":
+            _write_server_side_tools_deny(iso_home / ".claude")
+            server_side_network = "disabled"
         if model_ref.provider is not None:
             provider = self.providers[model_ref.provider]
             subprocess_env["ANTHROPIC_BASE_URL"] = resolve_agent_base_url(
@@ -217,7 +261,9 @@ class ClaudeCodeAdapter:
         if wi.enabled:
             subprocess_env.update(wi.process_env)
             if wi.llm_base_url:
-                subprocess_env["ANTHROPIC_BASE_URL"] = wi.llm_base_url
+                subprocess_env["ANTHROPIC_BASE_URL"] = sandbox.translate_url(
+                    wi.llm_base_url
+                )
             extra_headers = dict(wi.llm_headers) if wi.llm_headers else {}
             # capture token：必须进**真实 HTTP 请求头**——CLI 不会
             # 自动把 env var 转成 header，只有 ANTHROPIC_CUSTOM_HEADERS 里的头才会
@@ -281,7 +327,7 @@ class ClaudeCodeAdapter:
             # 隔离 HOME 只去掉同事本机的私人配置；不禁用 Claude Code 的 WebSearch、
             # Task、skills 等原生能力。场景提供 MCP 时才追加对应配置。
             if mcp_config_path is not None:
-                cmd += ["--mcp-config", str(mcp_config_path.resolve())]
+                cmd += ["--mcp-config", sandbox.path(mcp_config_path)]
             # 时间预算是 attempt 级框架约束，只在首轮注入——后续轮重复宣称
             # "本任务限时 X" 会误导 agent（与 blade 侧同一原则）。
             if budget_notice and is_first:
@@ -436,13 +482,12 @@ class ClaudeCodeAdapter:
                                     (turn_base.get(field) or 0) + value
                                 )
 
-                async with agent_process(
+                async with sandbox.exec(ExecSpec(
                     argv=_build_cmd(turn, is_first=is_first),
-                    data_path=data_path,
-                    attempt_id=task.attempt_id,
                     cwd=str(workspace),
                     env=subprocess_env,
-                ) as proc:
+                    turn_id=getattr(turn, "turn_id", None),
+                )) as proc:
                     turn_proc = proc
                     try:
                         await asyncio.wait_for(
@@ -689,11 +734,15 @@ class ClaudeCodeAdapter:
                 execution_locus=self.capabilities.execution_locus,
                 permission_mode="--dangerously-skip-permissions",
                 workspace_root=str(workspace.resolve()),
+                extra={
+                    **sandbox.security_fields(),
+                    "server_side_network": server_side_network,
+                },
             ),
         )
 
     def _write_mcp_config(
-        self, task: AdapterRunInput, attempt_dir: Path
+        self, task: AdapterRunInput, attempt_dir: Path, *, sandbox: AttemptSandbox | None = None,
     ) -> Path | None:
         if not task.mcp_servers:
             return None
@@ -711,7 +760,10 @@ class ClaudeCodeAdapter:
                 "env": {
                     "OCTAGON_ATTEMPT_ID": task.attempt_id,
                     "OCTAGON_ENV_TOKEN": task.env_token,
-                    "OCTAGON_BASE_URL": task.env_base_url,
+                    "OCTAGON_BASE_URL": (
+                        sandbox.translate_url(task.env_base_url)
+                        if sandbox is not None else task.env_base_url
+                    ),
                 },
             }
             if spec.cwd:
@@ -770,6 +822,24 @@ def _merge_custom_headers(existing: str | None, extra: dict[str, str]) -> str:
             values[key] = (values[key][0], value)
         # 其余同名：静态值保留
     return "\n".join(f"{n}: {v}" for n, v in (values[k] for k in ordered))
+
+
+def _write_server_side_tools_deny(config_dir: Path) -> None:
+    """sandbox.server_side_tools=deny：在隔离 CLAUDE_CONFIG_DIR 的 settings.json
+    里禁掉服务端联网工具。隔离目录是 attempt 专属，不碰宿主机 ~/.claude。"""
+    config_dir.mkdir(parents=True, exist_ok=True)
+    path = config_dir / "settings.json"
+    try:
+        current = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    except (OSError, json.JSONDecodeError):
+        current = {}
+    permissions = current.setdefault("permissions", {})
+    deny = list(permissions.get("deny") or [])
+    for tool in ("WebSearch", "WebFetch"):
+        if tool not in deny:
+            deny.append(tool)
+    permissions["deny"] = deny
+    path.write_text(json.dumps(current, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
 def _classify_outcome(

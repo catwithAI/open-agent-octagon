@@ -1255,6 +1255,7 @@ const STATUS_LABEL_KEYS: Record<string, string> = {
   session_create_failed: "runDetail.status.session_create_failed", cli_not_found: "runDetail.status.cli_not_found",
   cli_error: "runDetail.status.cli_error", chat_failed: "runDetail.status.chat_failed", auth_failed: "runDetail.status.auth_failed",
   model_integrity_failed: "runDetail.status.model_integrity_failed",
+  sandbox_unavailable: "runDetail.status.sandbox_unavailable",
 };
 function statusLabel(t: TFn, status: string): string {
   const key = STATUS_LABEL_KEYS[status];
@@ -2977,16 +2978,26 @@ function scoreColor(score: number | null | undefined): string {
 }
 
 // 执行场合标签：仅展示不计分。沙盒 vs 宿主机+bypass 一目了然，但不影响任何分数。
-function LocusTag({ locus, permissionMode }: { locus: string | null; permissionMode: string | null }) {
+function LocusTag({ locus, permissionMode, meta }: { locus: string | null; permissionMode: string | null; meta?: Record<string, unknown> }) {
   const { t } = useI18n();
   const sandboxed = locus === "docker-sandbox";
+  // blade 沙盒由 blade server 管理、session 间共享，不与本方案的 per-attempt 沙盒同等看待。
+  const shared = Boolean(meta?.sandbox_shared);
   const bypass = permissionMode?.includes("dangerously") ?? false;
   const label = sandboxed
-    ? "🟢 sandbox"
+    ? (shared ? "🟡 sandbox (shared)" : "🟢 sandbox")
     : locus === "remote-host"
       ? `🟠 remote${bypass ? "+bypass" : ""}`
       : `🔴 host${bypass ? "+bypass" : ""}`;
-  return <span className="locus-tag" title={t("runDetail.locus.title", { locus: locus ?? "unknown", mode: permissionMode ?? "-" })}>{label}</span>;
+  const extra = [
+    meta?.sandbox_image ? `image: ${String(meta.sandbox_image)}` : null,
+    meta?.agent_version ? `agent: ${String(meta.agent_version)}` : null,
+    meta?.egress_policy ? `egress: ${String(meta.egress_policy)}` : null,
+    meta?.server_side_network ? `server-side tools: ${String(meta.server_side_network)}` : null,
+    meta?.sandbox_managed_by ? `managed by: ${String(meta.sandbox_managed_by)}` : null,
+  ].filter(Boolean).join(" · ");
+  const title = t("runDetail.locus.title", { locus: locus ?? "unknown", mode: permissionMode ?? "-" }) + (extra ? `\n${extra}` : "");
+  return <span className="locus-tag" title={title}>{label}</span>;
 }
 
 const SEVERITY_COLOR: Record<string, string> = {
@@ -3034,7 +3045,7 @@ function SecuritySummaryRow({ security, runId, attemptId }: { security: AttemptS
   return (
     <div className="security-summary">
       <div className="security-summary-line">
-        <LocusTag locus={security.execution_locus} permissionMode={security.permission_mode} />
+        <LocusTag locus={security.execution_locus} permissionMode={security.permission_mode} meta={security.meta} />
         {hasEvents ? (
           <span className="clickable" onClick={toggle} style={{ color: SEVERITY_COLOR[security.max_severity ?? "low"] }}>
             ⚠ {t("runDetail.security.dangerCount", { n: security.event_count, max: security.max_severity ? t("runDetail.security.maxSeverity", { sev: SEVERITY_LABELS[security.max_severity] ? t(SEVERITY_LABELS[security.max_severity]) : security.max_severity }) : "" })} {open ? "▾" : "▸"}

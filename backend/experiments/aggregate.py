@@ -19,6 +19,7 @@ INFRASTRUCTURE_STATUSES = frozenset(
         "capture_infrastructure_failed",
         "model_integrity_failed",
         "blade_service_unavailable",
+        "sandbox_unavailable",
     }
 )
 SCORED_STATUSES = frozenset({"completed", "gave_up"})
