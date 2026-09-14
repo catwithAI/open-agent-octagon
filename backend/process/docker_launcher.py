@@ -47,6 +47,8 @@ SANDBOX_HOME_DIRNAME = "sandbox_home"
 RO_MOUNT = "/attempt"
 HOME_MOUNT = "/home/agent"
 MCP_SUBDIR = "mcp"
+LOGS_MOUNT = "/logs"
+TMP_MOUNT = "/tmp"
 CONTAINER_NAME_PREFIX = "octagon-agent-"
 LABEL_ATTEMPT = "octagon.attempt_id"
 LABEL_RUN = "octagon.run_id"
@@ -175,22 +177,53 @@ class DockerAttemptSandbox:
             "sandbox_id": self.container_id,
             "sandbox_image_reference": self.image.reference,
             "agent_version": self.image.version_of(self.spec.agent_name),
-            "egress_policy": "unrestricted",
+            "egress_policy": (
+                "none" if self._launcher.network_mode == "none" else "unrestricted"
+            ),
+            "network_mode": self._launcher.network_mode or "bridge",
         }
 
     # ---- 每轮进程 ------------------------------------------------------------
 
     def build_exec_argv(self, spec: ExecSpec) -> tuple[str, ...]:
-        # data_path 可能是相对路径（octagon.yaml 默认 ./data），adapter 传来的 cwd
-        # 也就是相对的；docker exec 要求绝对路径，且同路径挂载用的是 resolve() 后的值。
-        argv: list[str] = [self._launcher.docker, "exec", "-i", "-w", str(Path(spec.cwd).resolve())]
-        for key, value in self._container_env(spec.env).items():
+        # Most adapters pass the host workspace path. dsh passes the result of
+        # sandbox.path() already, so accept both forms without double-mapping.
+        cwd = str(spec.cwd)
+        # Prefer host-path matching before container-path matching. The Harbor
+        # /tmp mount overlaps the host's usual /tmp prefix; checking container
+        # prefixes first would mistake /tmp/<attempt>/skill_workspace for the
+        # already-translated container path /tmp and make docker exec chdir to a
+        # host-only path.
+        host_path = Path(cwd)
+        is_host_path = False
+        if host_path.is_absolute():
+            resolved = host_path.resolve()
+            for mount in self.mounts:
+                try:
+                    resolved.relative_to(mount.host.resolve())
+                except ValueError:
+                    continue
+                is_host_path = True
+                break
+        if is_host_path:
+            cwd = self.path(cwd)
+        elif not any(
+            cwd == mount.container or cwd.startswith(mount.container.rstrip("/") + "/")
+            for mount in self.mounts
+        ):
+            cwd = self.path(cwd)
+        argv: list[str] = [self._launcher.docker, "exec", "-i", "-w", cwd]
+        for key, value in self._container_env(
+            spec.env, explicit_env_keys=spec.explicit_env_keys,
+        ).items():
             argv += ["-e", f"{key}={value}"]
         argv.append(self.container_id)
         argv.extend(spec.argv)
         return tuple(argv)
 
-    def _container_env(self, env: Mapping[str, str]) -> dict[str, str]:
+    def _container_env(
+        self, env: Mapping[str, str], *, explicit_env_keys: frozenset[str] = frozenset(),
+    ) -> dict[str, str]:
         host = os.environ
         out: dict[str, str] = {}
         for key, value in env.items():
@@ -200,7 +233,10 @@ class DockerAttemptSandbox:
                 out[key] = translate_loopback_url(value) if key in _PROXY_ENV else value
                 continue
             # 只带 adapter 显式设置 / 改写的变量，宿主机原样的环境不透传。
-            if key in host and host[key] == value:
+            # ``docker exec`` 不继承宿主机环境，因此 adapter 明确注入的
+            # credential 即使与宿主机同值也必须保留；否则 provider 会在
+            # 容器内退回默认端点并以 401 失败。
+            if key in host and host[key] == value and key not in explicit_env_keys:
                 continue
             out[key] = value
         out.setdefault("HOME", HOME_MOUNT)
@@ -255,11 +291,29 @@ class DockerLauncher:
         settings: Any,
         image: SandboxImageInfo,
         docker: str = "docker",
+        workspace_container: str | None = None,
+        network_mode: str | None = None,
+        limits_override: dict[str, Any] | None = None,
+        pull_policy: str | None = None,
+        logs_host: Path | None = None,
+        tmp_host: Path | None = None,
     ) -> None:
         self.settings = settings
         self.image = image
         self.docker = docker
         self.server_side_tools: str = settings.sandbox.server_side_tools
+        # Normal Octagon attempts preserve the historical same-path mount. A
+        # Harbor task image may require /app or /workspace instead; keeping the
+        # host path in AttemptSpec while translating only at the Docker boundary
+        # lets the adapter stay task-runtime agnostic.
+        self.workspace_container = workspace_container
+        self.network_mode = network_mode
+        self.limits_override = dict(limits_override or {})
+        if pull_policy not in {None, "always", "missing", "never"}:
+            raise ValueError(f"unsupported Docker pull policy: {pull_policy!r}")
+        self.pull_policy = pull_policy
+        self.logs_host = Path(logs_host).resolve() if logs_host is not None else None
+        self.tmp_host = Path(tmp_host).resolve() if tmp_host is not None else None
 
     # ---- docker 子进程 --------------------------------------------------------
 
@@ -287,11 +341,13 @@ class DockerLauncher:
 
     def _limits_for(self, agent_name: str) -> dict[str, Any]:
         lim = self.settings.sandbox.limits_for(agent_name)
-        return {"memory": lim.memory, "cpus": lim.cpus, "pids": lim.pids}
+        out = {"memory": lim.memory, "cpus": lim.cpus, "pids": lim.pids}
+        out.update(self.limits_override)
+        return out
 
     def build_run_argv(
         self, spec: AttemptSpec, *, mounts: tuple[_Mount, ...], limits: dict[str, Any],
-        workspace: Path,
+        workspace: Path, workspace_container: str | None = None,
     ) -> tuple[str, ...]:
         argv: list[str] = [
             self.docker, "run", "-d",
@@ -305,9 +361,13 @@ class DockerLauncher:
             "--pids-limit", str(limits["pids"]),
             "--cap-drop", "ALL",
             "--security-opt", "no-new-privileges",
-            "-w", str(workspace),
+            "-w", str(workspace_container or workspace),
             "-e", f"HOME={HOME_MOUNT}",
         ]
+        if self.network_mode:
+            argv += ["--network", self.network_mode]
+        if self.pull_policy:
+            argv += ["--pull", self.pull_policy]
         # host-gateway：Linux 必需；Docker Desktop（mac）自带该域名，再加一次无害。
         argv += ["--add-host", f"{HOST_GATEWAY}:host-gateway"]
         # 非 root：宿主机后端进程的 uid/gid。Linux 上这决定 workspace 产物属主；
@@ -326,21 +386,35 @@ class DockerLauncher:
         workspace = Path(spec.workspace) if spec.workspace else attempt_dir / "skill_workspace"
         home = attempt_dir / SANDBOX_HOME_DIRNAME
         ro = attempt_dir / SANDBOX_RO_DIRNAME
-        for d in (workspace, home, ro / MCP_SUBDIR):
+        directories = [workspace, home, ro / MCP_SUBDIR]
+        if self.logs_host is not None:
+            directories.append(self.logs_host)
+        if self.tmp_host is not None:
+            directories.append(self.tmp_host)
+        for d in directories:
             d.mkdir(parents=True, exist_ok=True)
         workspace = workspace.resolve()
-        mounts = (
-            _Mount(workspace, str(workspace)),
+        workspace_container = self.workspace_container or str(workspace)
+        mount_list = [
+            _Mount(workspace, workspace_container),
             _Mount(home.resolve(), HOME_MOUNT),
             _Mount(ro.resolve(), RO_MOUNT, readonly=True),
-        )
+        ]
+        if self.logs_host is not None:
+            mount_list.append(_Mount(self.logs_host, LOGS_MOUNT))
+        if self.tmp_host is not None:
+            mount_list.append(_Mount(self.tmp_host, TMP_MOUNT))
+        mounts = tuple(mount_list)
         limits = self._limits_for(spec.agent_name)
         name = container_name_for(spec.attempt_id)
         # 同一 attempt 重跑（失败重试、恢复）会撞上上次残留的同名容器：它只可能
         # 属于本 attempt，清掉是安全的。
         await self._run(["rm", "-f", name], check=False)
         try:
-            run_argv = self.build_run_argv(spec, mounts=mounts, limits=limits, workspace=workspace)
+            run_argv = self.build_run_argv(
+                spec, mounts=mounts, limits=limits, workspace=workspace,
+                workspace_container=workspace_container,
+            )
             out = await self._run(list(run_argv[1:]), timeout=120)  # [0] 是 docker 本身
         except Exception as exc:  # noqa: BLE001
             raise SandboxUnavailable("sandbox_unavailable", f"docker run 失败：{exc}") from exc
@@ -381,7 +455,10 @@ class DockerLauncher:
                 {"host": str(m.host), "container": m.container, "readonly": m.readonly}
                 for m in sandbox.mounts
             ],
-            "egress_policy": "unrestricted",
+            "egress_policy": (
+                "none" if self.network_mode == "none" else "unrestricted"
+            ),
+            "network_mode": self.network_mode or "bridge",
             "server_side_tools": sandbox.server_side_tools,
             "execs": [
                 {"turn_id": e.turn_id, "started_at": e.started_at,

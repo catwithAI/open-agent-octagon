@@ -353,6 +353,11 @@ class CodexAdapter:
             **os.environ,
             "CODEX_HOME": sandbox.path(iso_codex_home),
         }
+        # Track credentials intentionally injected by this adapter. The Docker
+        # launcher filters the inherited host environment for isolation, but a
+        # provider key must still cross the docker exec boundary even when it
+        # equals the backend's environment value.
+        explicit_env_keys: set[str] = set()
         # Codex 的 MCP 配置经 argv 传入，secret 不可写进 -c；仅场景确实提供 MCP
         # 时才让 stdio child 从父进程环境继承 attempt 凭据。
         if task.mcp_servers:
@@ -384,6 +389,7 @@ class CodexAdapter:
                 )
             if provider.api_key_env and api_key:
                 subprocess_env[provider.api_key_env] = api_key
+                explicit_env_keys.add(provider.api_key_env)
         # wire injection 消费点：provider/MCP -c 参数已在 cmd 构造时应用，
         # 这里最后合并 process_env（表 Codex 行）。
         if task.wire_injection.enabled:
@@ -526,6 +532,7 @@ class CodexAdapter:
                     argv=_build_cmd(turn, is_first=is_first),
                     cwd=str(workspace),
                     env=subprocess_env,
+                    explicit_env_keys=frozenset(explicit_env_keys),
                     turn_id=getattr(turn, "turn_id", None),
                 )) as proc:
                     turn_proc = proc

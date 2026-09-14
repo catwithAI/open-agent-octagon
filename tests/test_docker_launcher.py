@@ -139,6 +139,21 @@ def test_exec_argv_only_passes_adapter_set_env(tmp_path: Path, monkeypatch: pyte
     assert argv[argv.index("ctr123") - 1] != "-e"
 
 
+def test_exec_explicit_env_key_is_forwarded_even_when_equal_to_host(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENROUTER_API_KEY", "same-secret")
+    monkeypatch.setenv("HOST_ONLY", "same")
+    sb = _sandbox(tmp_path)
+    argv = sb.build_exec_argv(ExecSpec(
+        argv=["codex"], cwd=str(sb.workspace),
+        env={"OPENROUTER_API_KEY": "same-secret", "HOST_ONLY": "same"},
+        explicit_env_keys=frozenset({"OPENROUTER_API_KEY"}),
+    ))
+    assert "-e OPENROUTER_API_KEY=same-secret" in " ".join(argv)
+    assert "HOST_ONLY" not in " ".join(argv)
+
+
 def test_exec_cwd_is_resolved_to_absolute(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """octagon.yaml 默认 data_path ./data：相对 cwd 必须解析成绝对路径（docker exec 要求）。"""
     monkeypatch.chdir(tmp_path)

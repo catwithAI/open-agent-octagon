@@ -26,6 +26,22 @@ from backend.process.launcher import (
 )
 
 
+def test_codex_default_model_keeps_configured_provider_route() -> None:
+    from types import SimpleNamespace
+    from backend.model_providers import ModelProviderSection
+    from backend.run_dispatch import _default_model_for_agent
+
+    settings = SimpleNamespace(model_providers={
+        "or-codex": ModelProviderSection(
+            kind="openai-responses",
+            base_url="https://openrouter.ai/api/v1",
+            api_key_env="OPENROUTER_API_KEY",
+            agent="codex",
+        ),
+    })
+    assert _default_model_for_agent("codex", settings) == "or-codex/gpt-5.5"
+
+
 def _attempt_spec(tmp_path: Path, attempt_id: str = "att-1") -> AttemptSpec:
     return AttemptSpec(
         attempt_id=attempt_id,
