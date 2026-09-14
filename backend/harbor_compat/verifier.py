@@ -1,8 +1,9 @@
 """Harbor verifier execution and reward normalization.
 
-The verifier is intentionally a separate Docker invocation. It receives a
-frozen copy of the agent workspace plus an attempt-local `/logs` directory; it
-never receives the Octagon backend checkout or the agent's HOME.
+The verifier is intentionally a separate Docker invocation. It receives only
+manifest-declared artifact mounts plus attempt-local verifier `/logs` and `/tmp`
+directories; it never receives the full agent workspace, Octagon backend
+checkout, or the agent's HOME.
 """
 
 from __future__ import annotations
@@ -164,15 +165,23 @@ def _safe_virtual_path(value: str, field: str) -> PurePosixPath:
 
 
 def _reject_symlinks(root: Path) -> None:
-    for path in root.rglob("*"):
-        if path.is_symlink():
-            raise HarborVerifierError(f"symlink in artifact source: {path}")
+    # Check the source itself as well as descendants.  ``Path.rglob`` does not
+    # yield ``root``; without this guard a declared symlink file could be
+    # followed by ``copy2`` and escape the artifact boundary.
+    if root.is_symlink():
+        raise HarborVerifierError(f"symlink in artifact source: {root}")
+    if root.is_dir():
+        for path in root.rglob("*"):
+            if path.is_symlink():
+                raise HarborVerifierError(f"symlink in artifact source: {path}")
 
 
 def _copy_entry(source: Path, destination: Path) -> None:
-    if not source.exists():
+    if not source.exists() and not source.is_symlink():
         raise HarborVerifierError(f"declared Harbor artifact is missing: {source}")
     _reject_symlinks(source)
+    if destination.is_symlink():
+        raise HarborVerifierError(f"symlink in artifact destination: {destination}")
     if destination.exists():
         if destination.is_dir() and not destination.is_symlink():
             shutil.rmtree(destination)

@@ -196,6 +196,31 @@ def test_harbor_artifact_materialization_excludes_unlisted_workspace_files(tmp_p
     assert all("secret.txt" not in str(item) for item in mounts)
 
 
+def test_harbor_artifact_root_symlink_is_rejected(tmp_path):
+    from backend.harbor_compat.verifier import HarborVerifierError, materialize_artifacts
+
+    task_context = _task_context()
+    task_context["_harbor"] = dict(
+        task_context["_harbor"], artifacts=["/app/result.json"]
+    )
+    task = HarborTaskSpec.from_context(task_context)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    real = tmp_path / "real-result.json"
+    real.write_text("{}", encoding="utf-8")
+    (workspace / "result.json").symlink_to(real)
+
+    with pytest.raises(HarborVerifierError, match="symlink"):
+        materialize_artifacts(
+            spec=task,
+            workspace=workspace,
+            attempt_dir=tmp_path / "attempt",
+            submission_dir=tmp_path / "submission",
+            logs_dir=tmp_path / "logs",
+            tmp_dir=tmp_path / "tmp",
+        )
+
+
 def test_verifier_resource_and_artifact_argv_are_explicit(tmp_path):
     from backend.harbor_compat.verifier import build_verifier_argv
 
