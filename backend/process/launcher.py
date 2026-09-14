@@ -49,6 +49,14 @@ class ExecSpec:
     cwd: str
     env: Mapping[str, str] = field(default_factory=dict)
     turn_id: str | None = None
+    # adapter 显式注入、**必须**进容器的变量名。
+    #
+    # 沙盒的 env 过滤按「值与宿主机相同 → 视为宿主机原样环境，不透传」来判定
+    # provenance。当 adapter 注入的值恰好就是从同名宿主机变量解析来的
+    # （典型：provider 的 `api_key_env` 指向 OPENROUTER_API_KEY，adapter 解析后
+    # 又以同名写回），这个启发式会把凭据当成"宿主机泄漏"丢掉，容器里的 CLI
+    # 于是报变量缺失。adapter 用这个字段声明所有权，压过值比较。
+    env_keep: frozenset[str] = field(default_factory=frozenset)
 
 
 class AttemptSandbox(Protocol):

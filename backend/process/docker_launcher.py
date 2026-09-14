@@ -27,7 +27,7 @@ import os
 import re
 import shutil
 import subprocess
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Iterable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -184,13 +184,15 @@ class DockerAttemptSandbox:
         # data_path 可能是相对路径（octagon.yaml 默认 ./data），adapter 传来的 cwd
         # 也就是相对的；docker exec 要求绝对路径，且同路径挂载用的是 resolve() 后的值。
         argv: list[str] = [self._launcher.docker, "exec", "-i", "-w", str(Path(spec.cwd).resolve())]
-        for key, value in self._container_env(spec.env).items():
+        for key, value in self._container_env(spec.env, keep=spec.env_keep).items():
             argv += ["-e", f"{key}={value}"]
         argv.append(self.container_id)
         argv.extend(spec.argv)
         return tuple(argv)
 
-    def _container_env(self, env: Mapping[str, str]) -> dict[str, str]:
+    def _container_env(
+        self, env: Mapping[str, str], keep: frozenset[str] = frozenset()
+    ) -> dict[str, str]:
         host = os.environ
         out: dict[str, str] = {}
         for key, value in env.items():
@@ -200,7 +202,10 @@ class DockerAttemptSandbox:
                 out[key] = translate_loopback_url(value) if key in _PROXY_ENV else value
                 continue
             # 只带 adapter 显式设置 / 改写的变量，宿主机原样的环境不透传。
-            if key in host and host[key] == value:
+            # `keep` 是 adapter 的所有权声明，压过这条值比较的启发式——注入值
+            # 与宿主机同名变量相同（provider api_key_env 解析后原名写回）时，
+            # 光看值区分不出「adapter 注入」与「宿主机泄漏」。
+            if key not in keep and key in host and host[key] == value:
                 continue
             out[key] = value
         out.setdefault("HOME", HOME_MOUNT)
@@ -533,13 +538,23 @@ def list_sandbox_containers(*, docker: str = "docker") -> list[dict[str, str]]:
 
 def sweep_sandbox_containers(
     *, is_attempt_active: Any, docker: str = "docker",
+    only_attempts: Iterable[str] | None = None,
 ) -> dict[str, int]:
     """清理孤儿容器：已退出的一律 rm；仍在跑但 attempt 已不活跃的 kill + rm。
 
     `is_attempt_active(attempt_id) -> bool` 由调用方按 DB 状态提供。
+
+    作用域是**整台机器上所有带 octagon 标签的容器**——生产清理正需要如此
+    （后端崩溃后没人记得孤儿的 id）。但这也让它成为一把没有保险的枪：传
+    `lambda _: False` 就会连正在跑的 attempt 一起杀掉并 `rm -f`，连已退出容器
+    的现场也一并删掉。`only_attempts` 给调用方一个显式白名单，把作用域收回到
+    自己创建的 attempt 上；测试必须用它，否则会打死同机上真实运行的 run。
     """
+    scope = None if only_attempts is None else set(only_attempts)
     removed = killed = 0
     for row in list_sandbox_containers(docker=docker):
+        if scope is not None and row["attempt_id"] not in scope:
+            continue
         if row["state"] == "running":
             if is_attempt_active(row["attempt_id"]):
                 continue

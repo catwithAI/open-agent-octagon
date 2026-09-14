@@ -377,7 +377,11 @@ async def test_docker_recorded_container_kill_and_sweep(tmp_path: Path) -> None:
     try:
         assert kill_recorded_agent_process(data, attempt_id) is True
         assert not container_is_running(sb.container_id)
-        swept = sweep_sandbox_containers(is_attempt_active=lambda _a: False)
+        # only_attempts 必须传：不限作用域的 sweep 会把同机上真实运行的
+        # attempt 容器一起 kill + rm（实测打死过一次 7-agent run）。
+        swept = sweep_sandbox_containers(
+            is_attempt_active=lambda _a: False, only_attempts=[attempt_id],
+        )
         assert swept["containers_removed"] >= 1
         assert subprocess.run(["docker", "inspect", sb.container_id], capture_output=True).returncode != 0
     finally:
