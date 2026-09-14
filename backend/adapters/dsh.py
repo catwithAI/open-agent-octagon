@@ -43,6 +43,7 @@ import hashlib
 import json
 import logging
 import re
+import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -102,7 +103,7 @@ PROVIDER_ROUTE = "octagon"
 API_KEY_ENV = "OCTAGON_DSH_API_KEY"
 
 #: 上游拿不到显式配置时的输出上限。**不能不给**（见模块 docstring）。
-DEFAULT_MAX_TOKENS = 8192
+DEFAULT_MAX_TOKENS = 32768  # 2026-09-14: 8192 被 deepseek-v4-flash 单步长 reasoning 撞穿（turn end reason max-tokens → cli_error）
 DEFAULT_CONTEXT_WINDOW = 200_000
 
 #: 单次 JSON-RPC 请求超时（initialize / session_prompt / shutdown）。
@@ -308,7 +309,8 @@ class DshAdapter:
     # ---------- 配置生成 ----------
 
     def _llm_row(
-        self, task: AdapterRunInput, model_ref: ModelRef
+        self, task: AdapterRunInput, model_ref: ModelRef,
+        *, sandbox: AttemptSandbox | None = None,
     ) -> tuple[dict[str, Any], str | None, int]:
         """pi-ai 的 llm 插件行，返回 (row, api_key, max_tokens)。
 
@@ -339,6 +341,14 @@ class DshAdapter:
             # 占用且反代会剥），缺了它反代直接 401。
             if task.wire_injection.capture_token:
                 headers["X-Octagon-Capture-Token"] = task.wire_injection.capture_token
+
+        # cordis.yml 是**给容器内的 runtime 读的**，里面的 URL 必须是容器视角。
+        # wire proxy 的地址以 127.0.0.1 的形态生成（octagon.public_base_url），
+        # 原样写进去的话 runtime 会去容器自己的 loopback 上找 8100，那儿什么都
+        # 没有——症状是 SDK 起手就 "Connection error. (code=TRANSPORT)"，看不出
+        # 跟 URL 有关。其余几家 adapter 都在写配置前翻译过，这里漏了。
+        if sandbox is not None and base_url:
+            base_url = sandbox.translate_url(base_url)
 
         # hand-declared route：pi-ai catalog 里没有 `octagon`，所以
         # api + baseURL + 非空 models 三者必填。
@@ -426,7 +436,7 @@ class DshAdapter:
         文件工具、todo、subagent、压缩都要显式挂——SDK 默认组合都没有。
         显式**不挂** web 插件（其余六家无内建搜索）与 approval/telemetry。
         """
-        llm_row, api_key, max_tokens = self._llm_row(task, model_ref)
+        llm_row, api_key, max_tokens = self._llm_row(task, model_ref, sandbox=sandbox)
         rows: list[dict[str, Any]] = [
             # 删了就没法通信。
             {"id": "sdk-jsonrpc-server", "name": "@deepseek-ai/dsh-sdk-jsonrpc-server"},
@@ -588,6 +598,14 @@ class DshAdapter:
         # runtime 的状态目录：宿主机执行在 attempt 根（历史行为），沙盒执行在
         # 隔离 HOME（容器内 /home/agent）——runtime 只能看到三处挂载。
         state_dir = sandbox.host_home(attempt_dir)
+        # 会话持久化目录**每次 run() 从零开始**。session_id 只由 attempt_id 决定
+        # （见下），而 run_dispatch._BoundAdapter 的重试拿同一个 task 再调一次
+        # run()——上一次留下的 session.jsonl 会让 runtime 以
+        # "already has a persisted log on disk that does not match this live
+        # session (id collision)" 直接拒绝启动，于是**每一次重试都必然失败**，
+        # 并把首次失败的真实原因盖掉。这个目录在 attempt 私有的 state_dir 下，
+        # 清空不影响任何别的 attempt。
+        shutil.rmtree(state_dir / "dsh_sessions", ignore_errors=True)
         for sub in (".dsh", ".agents", "dsh_sessions"):
             (state_dir / sub).mkdir(parents=True, exist_ok=True)
 

@@ -23,7 +23,9 @@ from pathlib import Path
 # 依赖、缓存、构建产物、版本库元数据——都不是交付给用户的东西。
 ARTIFACT_SKIP_DIRS = frozenset({
     # 依赖树
-    "node_modules", ".venv", "venv", "vendor",
+    # 2026-09-14：去掉 "vendor"——django 等仓库把第三方 JS 放在源码树的
+    # vendor/ 下，跳过会让评分快照缺基线文件、repository_discipline 全员扣分。
+    "node_modules", ".venv", "venv",
     # 语言/工具缓存
     "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache",
     ".cache", ".gradle", ".tox",

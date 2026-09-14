@@ -154,6 +154,45 @@ _BLADE_SKILL_RUN_RE = re.compile(
 # 产物」口径不一致。
 _ARTIFACT_SKIP_DIRS = ARTIFACT_SKIP_DIRS
 _ARTIFACT_MAX_FILES = 500
+
+# 从 events.jsonl 里抠出 agent 用 Edit/Write 类工具写过的 workspace 相对路径。
+# 事件里的工具参数可能是原始 JSON，也可能是被再次 JSON 转义的字符串
+# （recovered messages），所以两种写法都匹配。只认 file_path / path 两个键。
+_EDIT_PATH_PATTERNS = [
+    re.compile(r'\\"(?:file_path|path)\\":\s*\\"([^\\"]+)\\"'),
+    re.compile(r'"(?:file_path|path)":\s*"([^"]+)"'),
+]
+_EDIT_TOOL_MARKERS = ("Edit", "Write", "write_file", "edit_file", "MultiEdit", "create_file")
+
+
+def _agent_edited_paths(attempt_dir: Path) -> list[str]:
+    """agent 在远端 workspace 里写过的文件（相对路径），用于产物回收优先拉取。
+
+    2026-09-14 复盘：django 仓库 6000+ 文件，BFS 回收 500 个就截断，
+    agent 改的 django/utils/numberformat.py 根本轮不到，本地 workspace
+    停在基线 → functional 0 分，而 agent 其实已改完并跑绿测试。
+    """
+    events_path = attempt_dir / "events.jsonl"
+    if not events_path.is_file():
+        return []
+    found: list[str] = []
+    seen: set[str] = set()
+    try:
+        for line in events_path.read_text(encoding="utf-8", errors="replace").splitlines():
+            if not any(marker in line for marker in _EDIT_TOOL_MARKERS):
+                continue
+            for pattern in _EDIT_PATH_PATTERNS:
+                for match in pattern.finditer(line):
+                    raw = match.group(1).strip()
+                    if not raw or raw.startswith("/") or ".." in raw.split("/"):
+                        continue
+                    rel = raw[2:] if raw.startswith("./") else raw
+                    if rel and rel not in seen:
+                        seen.add(rel)
+                        found.append(rel)
+    except OSError:
+        return found
+    return found
 _ARTIFACT_MAX_DEPTH = 5
 
 # blade 主循环的 loop_name；fork 出的子 agent 形如 "agent:<8hex>"。
@@ -313,7 +352,11 @@ def _session_create_error_detail(exc: Exception, entry: dict[str, Any]) -> str:
             body = response.text
         except Exception:  # pragma: no cover - defensive for SDK response wrappers
             body = ""
-    parts = [str(exc), f"blade_entry={json.dumps(entry, ensure_ascii=False)}"]
+    # 有一类异常 `str()` 是空的（httpx 的超时类尤其常见），只拼 str(exc) 会得到
+    # 一条以 "; " 开头、什么都没说的错误——排查时连"是超时还是被拒"都分不出。
+    # 异常类名永远非空，兜底用它。
+    summary = str(exc) or f"{type(exc).__module__}.{type(exc).__qualname__}"
+    parts = [summary, f"blade_entry={json.dumps(entry, ensure_ascii=False)}"]
     if status_code is not None:
         parts.append(f"status_code={status_code}")
     if body:
@@ -2644,6 +2687,53 @@ class BladeServiceAdapter:
         errors: list[str] = []
         truncated = False
 
+        # 0) 先拉 agent 明确写过的文件，不占 BFS 配额——它们才是 scorer 真正
+        #    要看的改动；BFS 配额只是兜底"能拉的都拉"。
+        priority_downloaded: list[str] = []
+        priority_source: dict[str, str] = {}
+        # software_factory：agent 的 cwd 是项目工作区（/root/projects/<id>），
+        # 而 session 文件接口的 "." 指向另一份带基线物料的目录——两边都有
+        # repo/…，但只有前者有 agent 的改动。先按项目工作区绝对路径拉，
+        # 拉不到再退回相对路径。
+        project_ws = ""
+        recovery_path = attempt_dir / "recovery.json"
+        if recovery_path.is_file():
+            try:
+                project_ws = str(
+                    json.loads(recovery_path.read_text(encoding="utf-8")).get(
+                        "blade_project_workspace"
+                    ) or ""
+                ).rstrip("/")
+            except Exception:
+                project_ws = ""
+        for rel in _agent_edited_paths(attempt_dir):
+            target = download_root / rel
+            candidates = [rel]
+            if project_ws:
+                candidates.insert(0, f"{project_ws}/{rel}")
+            content = None
+            last_exc: Exception | None = None
+            for candidate in candidates:
+                try:
+                    content = await client.download_file(session_id, candidate)
+                except Exception as exc:
+                    last_exc = exc
+                    continue
+                priority_source[rel] = candidate
+                break
+            if content is None:
+                errors.append(f"priority download {rel}: {last_exc}")
+                continue
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(content)
+            except OSError as exc:
+                errors.append(f"write {rel}: {exc}")
+                continue
+            priority_downloaded.append(rel)
+            downloaded.append(rel)
+        priority_set = set(priority_downloaded)
+
         queue: list[tuple[str, int]] = [(".", 0)]
         seen_files = 0
         while queue:
@@ -2671,6 +2761,8 @@ class BladeServiceAdapter:
                     break
                 listing.append({"path": rel})
                 target = download_root / rel
+                if rel in priority_set:
+                    continue
                 if (
                     staging_dir is None
                     and
@@ -2698,6 +2790,8 @@ class BladeServiceAdapter:
 
         result = {
             "downloaded": downloaded,
+            "priority_downloaded": priority_downloaded,
+            "priority_source": priority_source,
             "skipped_existing": skipped_existing,
             "total_listed": len(listing),
             "errors": errors,

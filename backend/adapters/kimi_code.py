@@ -3,7 +3,9 @@
 实测契约（2026-07-27，49 机器 kimi-code 0.29.1）——与 agent-arena 的 AgentSpec
 声明有出入，以下以实机为准：
 
-- print 模式：`kimi -p <prompt> --output-format stream-json -m <model>`。
+- print 模式：`kimi -p <prompt> --print --output-format stream-json -m <model>`。
+  0.29/0.38 的 `-p` 隐含 print 模式；**沙盒镜像里的 1.50 拆开了**——`-p` 只给
+  prompt，`--output-format` 单独要求 print UI。`--print` 两版都接受，统一显式传。
 - 事件流是**每行一个 `{"role":..., "content":...}`**，不是 CC/codex 那种带
   `type` 的结构化事件：
       {"role":"assistant","content":"PONG"}
@@ -130,7 +132,8 @@ class KimiCodeAdapter:
     # ---------- 配置生成 ----------
 
     def _render_config_toml(
-        self, model_ref: ModelRef, base_url: str, api_key: str | None
+        self, model_ref: ModelRef, base_url: str, api_key: str | None,
+        custom_headers: dict[str, str] | None = None,
     ) -> str:
         """生成 attempt 专用 config.toml。
 
@@ -143,12 +146,21 @@ class KimiCodeAdapter:
             "",
             f"[providers.{_PROVIDER_ID}]",
             # openai-compatible 协议；kimi 的 catalog 导入对 OpenRouter 也是猜
-            # 成 "openai"，实测可用。
-            'type = "openai"',
+            # 成 "openai"，0.38 可用；**沙盒镜像的 1.50 把它改名成 "openai_legacy"**
+            # （chat completions 协议），旧值直接被 pydantic 拒。
+            'type = "openai_legacy"',
             f'base_url = "{_toml_escape(base_url)}"',
         ]
         if api_key:
             lines.append(f'api_key = "{_toml_escape(api_key)}"')
+        if custom_headers:
+            # kimi 1.50 不再读 KIMI_CODE_CUSTOM_HEADERS 环境变量，自定义头改由
+            # provider 配置的 custom_headers 表承载（透传给 OpenAILegacy 的
+            # default_headers）。wire 反代要求的 X-Octagon-Capture-Token 必须
+            # 从这里进，否则每次 LLM 调用都被 401 "capture token required"。
+            lines += ["", f"[providers.{_PROVIDER_ID}.custom_headers]"]
+            for name, value in custom_headers.items():
+                lines.append(f'"{_toml_escape(name)}" = "{_toml_escape(value)}"')
         lines += [
             "",
             f'[models."{_toml_escape(model_key)}"]',
@@ -156,7 +168,8 @@ class KimiCodeAdapter:
             f'model = "{_toml_escape(model_ref.model)}"',
             f"max_context_size = {_DEFAULT_MAX_CONTEXT}",
             f"max_output_size = {_DEFAULT_MAX_OUTPUT}",
-            'capabilities = [ "tool_use" ]',
+            # 1.50 的 capabilities 只认 image_in/video_in/thinking/always_thinking，
+            # tool_use 不再是合法值（工具调用是默认能力）；留空即可。
             "",
         ]
         return "\n".join(lines)
@@ -288,9 +301,29 @@ class KimiCodeAdapter:
         kimi_home.mkdir(parents=True, exist_ok=True)
         # 无命名 provider 时不写 config.toml：让 CLI 用它自己已登录的 provider
         # 与 default_model（此时 self.model 原样作为别名传给 -m）。
+        #
+        # 写出的路径必须再用 `--config-file` 显式指给 CLI：0.29/0.38 从
+        # `$KIMI_CODE_HOME/config.toml` 读，**1.50 改成了 `$HOME/.kimi/config.toml`**，
+        # 并在启动时在那儿生成一份 `default_model = ""` 的默认配置。只写旧位置的
+        # 话新版读不到 provider/模型注册，agent 起手就是 "LLM not set"。显式传
+        # 路径两版都认，也不再依赖任何发现规则。
+        # wire 自定义头（含 capture token）要先算出来写进 provider 配置；
+        # 下面的 KIMI_CODE_CUSTOM_HEADERS 环境变量只对 0.38 生效，保留兼容。
+        wire_headers: dict[str, str] = {}
+        if task.wire_injection.enabled:
+            wire_headers.update(task.wire_injection.llm_headers)
+            if task.wire_injection.capture_token:
+                wire_headers["X-Octagon-Capture-Token"] = (
+                    task.wire_injection.capture_token
+                )
+        config_path: Path | None = None
         if model_ref.provider is not None:
-            (kimi_home / "config.toml").write_text(
-                self._render_config_toml(model_ref, base_url or "", api_key),
+            config_path = kimi_home / "config.toml"
+            config_path.write_text(
+                self._render_config_toml(
+                    model_ref, base_url or "", api_key,
+                    custom_headers=wire_headers or None,
+                ),
                 encoding="utf-8",
             )
         self._write_mcp_config(task, kimi_home, sandbox=sandbox)
@@ -332,6 +365,8 @@ class KimiCodeAdapter:
             """
             turn_prompt = render_turn_prompt(task, turn, base_prompt=prompt)
             args = [cli_path]
+            if config_path is not None:
+                args += ["--config-file", sandbox.path(config_path)]
             if not is_first:
                 if not session_id:
                     raise RuntimeError(
@@ -341,6 +376,11 @@ class KimiCodeAdapter:
                 args += ["-r", session_id]
             args += [
                 "-p", turn_prompt,
+                # kimi ≥ 1.50：`-p` 只提供 prompt，不再隐含 print 模式，而
+                # `--output-format` 明确要求 print UI（缺了它 CLI 直接以
+                # "Output format is only supported for print UI" 退出）。
+                # 旧版 0.38 里 `-p` 兼作 print 开关，显式传也接受。
+                "--print",
                 "--output-format", "stream-json",
                 "-m", cli_model,
             ]
