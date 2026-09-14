@@ -17,7 +17,9 @@ def _env(env_dir: Path, command=None):
                     "enabled": True,
                     "transport": "stdio",
                     "name": "octagon-generated-relocatable-env-v1",
-                    "command": command or ["python", "mcp_server.py"],
+                    "command": (
+                ["python", "mcp_server.py"] if command is None else command
+            ),
                 }
             }
         },

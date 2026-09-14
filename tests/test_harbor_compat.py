@@ -13,15 +13,13 @@ from backend.process.launcher import AttemptSpec
 
 
 ROOT = Path(__file__).resolve().parents[1]
-ENV = ROOT.parent / "agent-octagon-envs" / "harbor-index"
+FIXTURE = ROOT / "tests" / "fixtures" / "harbor_index_task.json"
 
 
 def _task_context() -> dict:
     import json
 
-    task = json.loads(
-        (ENV / "tasks" / "harbor-index-algotune-optimize-lti-sim.json").read_text()
-    )
+    task = json.loads(FIXTURE.read_text(encoding="utf-8"))
     return task["context"]
 
 
