@@ -77,16 +77,19 @@ result = await run_attempt(
 
 For the current five-task pilot, `finalize()` performs:
 
-1. Freeze an immutable workspace snapshot and copy the public `/logs/artifacts`
-   tree into verifier input.
-2. Start the exact verifier image with `--pull never` and the expected artifact
-   paths; never mount the agent image's `/tests` or `/solution` files.
+1. Materialize and hash only the artifacts declared by the Harbor manifest;
+   unlisted workspace files are not sent to the verifier. `/logs` and `/tmp`
+   declarations are copied only at their declared paths.
+2. Start the exact verifier image with `--pull never` and read-only artifact
+   mounts; never mount the agent image's `/tests` or `/solution` files.
 3. Capture verifier stdout/stderr, exit code, reward files, image digests, and
    the submission hash under `attempts/<id>/harbor/`.
 4. Write `result.json` before the scoring queue runs.
 
-`verifier.collect` hooks and sidecar lifecycle are intentionally not enabled
-until a task manifest carries their complete commands and health-check policy.
+Tasks with `environment_mode` other than `separate`, `execution_mode` other
+than `single_step`, or any `verifier.collect` hook are rejected fail-closed.
+Sidecar lifecycle is likewise not enabled until a task manifest carries its
+complete commands and health-check policy.
 
 Recommended attempt artifact layout:
 

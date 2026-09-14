@@ -1,6 +1,6 @@
 # GDPval prepaid amortization runtrace provenance audit
 
-日期：2026-09-02  
+日期：2026-09-02
 状态：已找到候选真实 runtrace；尚未将其直接纳入正式 capability pilot。
 
 ## 1. 结论

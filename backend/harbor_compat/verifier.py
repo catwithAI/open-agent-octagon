@@ -14,7 +14,7 @@ import logging
 import os
 import shutil
 import time
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from ..process.sandbox_preflight import SandboxUnavailable
@@ -55,6 +55,17 @@ def _resource_args(resources: dict[str, Any]) -> tuple[str, ...]:
         if memory_mb <= 0:
             raise HarborVerifierError("verifier memory_mb must be positive")
         args += ["--memory", f"{memory_mb}m"]
+    if "storage_mb" in resources:
+        try:
+            storage_mb = int(resources["storage_mb"])
+        except (TypeError, ValueError) as exc:
+            raise HarborVerifierError("invalid verifier storage_mb") from exc
+        if storage_mb <= 0:
+            raise HarborVerifierError("verifier storage_mb must be positive")
+        # Docker only enforces this option when the configured storage driver
+        # supports per-container size limits. If it does not, docker run fails
+        # explicitly instead of silently dropping the Harbor constraint.
+        args += ["--storage-opt", f"size={storage_mb}m"]
     return tuple(args)
 
 
@@ -70,6 +81,7 @@ def build_verifier_argv(
     submission_dir: Path,
     logs_dir: Path,
     tmp_dir: Path,
+    artifact_mounts: tuple[tuple[Path, str, bool], ...] = (),
 ) -> tuple[str, ...]:
     """Build the exact Docker argv; no process is started by this function."""
     submission_dir = submission_dir.resolve()
@@ -90,14 +102,17 @@ def build_verifier_argv(
         *_resource_args(spec.verifier_resources),
         *_network_arg(spec.verifier_network_mode),
         # Harbor verifier scripts conventionally write reward and diagnostics
-        # below /logs/verifier. The submission is a mutable verifier-local copy
-        # so tests cannot modify the agent's canonical artifact snapshot.
-        "-v",
-        f"{_safe_mount_path(submission_dir)}:{spec.agent_workdir}",
+        # below /logs/verifier. Only explicitly declared artifacts are mounted
+        # below; the full agent workspace is never exposed to the verifier.
         "-v",
         f"{_safe_mount_path(logs_dir)}:/logs",
         "-v",
         f"{_safe_mount_path(tmp_dir)}:/tmp",
+    ]
+    for host_path, container_path, readonly in artifact_mounts:
+        suffix = ":ro" if readonly else ""
+        argv += ["-v", f"{_safe_mount_path(host_path)}:{container_path}{suffix}"]
+    argv += [
         spec.verifier_image,
         "bash",
         "/tests/test.sh",
@@ -139,28 +154,153 @@ def _hash_json(payload: dict[str, Any]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _safe_virtual_path(value: str, field: str) -> PurePosixPath:
+    if not isinstance(value, str) or not value.startswith("/"):
+        raise HarborVerifierError(f"artifact {field} must be an absolute path")
+    path = PurePosixPath(value)
+    if path == PurePosixPath("/") or ".." in path.parts:
+        raise HarborVerifierError(f"artifact {field} contains an unsafe path: {value!r}")
+    return path
+
+
 def _reject_symlinks(root: Path) -> None:
     for path in root.rglob("*"):
         if path.is_symlink():
-            raise HarborVerifierError(f"symlink in submission workspace: {path}")
+            raise HarborVerifierError(f"symlink in artifact source: {path}")
 
 
-def snapshot_workspace(source: Path, destination: Path) -> str:
-    """Copy an agent workspace into an isolated verifier input directory."""
-    source = source.resolve()
-    if not source.is_dir():
-        raise HarborVerifierError(f"agent workspace does not exist: {source}")
+def _copy_entry(source: Path, destination: Path) -> None:
+    if not source.exists():
+        raise HarborVerifierError(f"declared Harbor artifact is missing: {source}")
     _reject_symlinks(source)
     if destination.exists():
-        shutil.rmtree(destination)
+        if destination.is_dir() and not destination.is_symlink():
+            shutil.rmtree(destination)
+        else:
+            destination.unlink()
     destination.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(source, destination, symlinks=False)
+    if source.is_dir():
+        shutil.copytree(source, destination, symlinks=False)
+    elif source.is_file():
+        shutil.copy2(source, destination)
+    else:
+        raise HarborVerifierError(f"unsupported Harbor artifact source: {source}")
+
+
+def _artifact_files(root: Path, virtual_root: PurePosixPath):
+    if root.is_file():
+        yield virtual_root.as_posix(), root
+        return
+    for path in sorted(p for p in root.rglob("*") if p.is_file()):
+        yield (virtual_root / path.relative_to(root).as_posix()).as_posix(), path
+
+
+def _artifact_source(
+    source_path: PurePosixPath,
+    *,
+    spec: HarborTaskSpec,
+    workspace: Path,
+    agent_tmp_dir: Path,
+    agent_logs_dir: Path,
+    attempt_dir: Path,
+) -> Path:
+    workdir = PurePosixPath(spec.agent_workdir)
+    # /app, /workspace and /testbed are common Harbor task workdir aliases.
+    # Octagon's agent workspace is the source for each of them.
+    workspace_roots = sorted(
+        {workdir, PurePosixPath("/app"), PurePosixPath("/workspace"), PurePosixPath("/testbed")},
+        key=lambda root: len(root.parts), reverse=True,
+    )
+    for root in workspace_roots:
+        if source_path == root or str(source_path).startswith(root.as_posix().rstrip("/") + "/"):
+            return workspace / str(source_path.relative_to(root))
+    for root, host_root in (
+        (PurePosixPath("/tmp"), agent_tmp_dir),
+        (PurePosixPath("/logs"), agent_logs_dir),
+        (PurePosixPath("/home/agent"), attempt_dir / "sandbox_home"),
+    ):
+        if source_path == root or str(source_path).startswith(root.as_posix().rstrip("/") + "/"):
+            return host_root / str(source_path.relative_to(root))
+    raise HarborVerifierError(
+        f"unsupported Harbor artifact source root: {source_path.as_posix()}"
+    )
+
+
+def materialize_artifacts(
+    *,
+    spec: HarborTaskSpec,
+    workspace: Path,
+    attempt_dir: Path,
+    submission_dir: Path,
+    logs_dir: Path,
+    tmp_dir: Path,
+    agent_tmp_dir: Path | None = None,
+    agent_logs_dir: Path | None = None,
+) -> tuple[str, tuple[tuple[Path, str, bool], ...]]:
+    """Stage and hash only the artifacts declared by the Harbor task.
+
+    The verifier receives per-artifact read-only mounts. It never receives the
+    entire agent workspace, which may contain task inputs, scratch files, or
+    private material not listed in the Harbor manifest.
+    """
+    workspace = workspace.resolve()
+    attempt_dir = attempt_dir.resolve()
+    submission_dir = submission_dir.resolve()
+    logs_dir = logs_dir.resolve()
+    tmp_dir = tmp_dir.resolve()
+    agent_tmp_dir = (agent_tmp_dir or attempt_dir / "harbor" / "agent-tmp").resolve()
+    agent_logs_dir = (agent_logs_dir or attempt_dir / "harbor" / "agent-logs").resolve()
+    if submission_dir.exists():
+        shutil.rmtree(submission_dir)
+    submission_dir.mkdir(parents=True, exist_ok=True)
     manifest: list[dict[str, Any]] = []
-    for path in sorted(p for p in destination.rglob("*") if p.is_file()):
-        digest = hashlib.sha256(path.read_bytes()).hexdigest()
-        manifest.append({"path": path.relative_to(destination).as_posix(), "sha256": digest})
-    manifest_bytes = json.dumps(manifest, ensure_ascii=False, sort_keys=True).encode("utf-8")
-    return hashlib.sha256(manifest_bytes).hexdigest()
+    mounts: list[tuple[Path, str, bool]] = []
+    seen_destinations: set[str] = set()
+
+    for index, raw_artifact in enumerate(spec.artifacts):
+        if isinstance(raw_artifact, str):
+            source_raw = destination_raw = raw_artifact
+        elif isinstance(raw_artifact, dict):
+            source_raw = raw_artifact.get("source") or raw_artifact.get("path")
+            destination_raw = raw_artifact.get("destination") or raw_artifact.get("target") or source_raw
+        else:
+            raise HarborVerifierError(f"invalid Harbor artifact declaration at index {index}")
+        source_path = _safe_virtual_path(source_raw, "source")
+        destination_path = _safe_virtual_path(destination_raw, "destination")
+        destination_key = destination_path.as_posix()
+        if destination_key in seen_destinations:
+            raise HarborVerifierError(f"duplicate Harbor artifact destination: {destination_key}")
+        seen_destinations.add(destination_key)
+        source = _artifact_source(
+            source_path, spec=spec, workspace=workspace,
+            agent_tmp_dir=agent_tmp_dir, agent_logs_dir=agent_logs_dir,
+            attempt_dir=attempt_dir,
+        )
+
+        # /logs and /tmp are already mounted as directory trees. Copy only the
+        # declared child into those trees; never copy the full public tree.
+        if destination_path == PurePosixPath("/logs") or str(destination_path).startswith("/logs/"):
+            staged = logs_dir / str(destination_path.relative_to("/logs"))
+            _copy_entry(source, staged)
+        elif destination_path == PurePosixPath("/tmp") or str(destination_path).startswith("/tmp/"):
+            staged = tmp_dir / str(destination_path.relative_to("/tmp"))
+            _copy_entry(source, staged)
+        else:
+            staged = submission_dir / "mounts" / destination_path.as_posix().lstrip("/")
+            _copy_entry(source, staged)
+            mounts.append((staged, destination_path.as_posix(), True))
+
+        for virtual_name, path in _artifact_files(source, destination_path):
+            manifest.append({
+                "path": virtual_name,
+                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            })
+
+    manifest_bytes = json.dumps(
+        sorted(manifest, key=lambda item: item["path"]),
+        ensure_ascii=False, sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(manifest_bytes).hexdigest(), tuple(mounts)
 
 
 class HarborVerifierRunner:
@@ -175,6 +315,8 @@ class HarborVerifierRunner:
         workspace: Path,
         attempt_dir: Path,
         artifacts_dir: Path | None = None,
+        agent_tmp_dir: Path | None = None,
+        agent_logs_dir: Path | None = None,
     ) -> dict[str, Any]:
         harbor_dir = attempt_dir / "harbor"
         submission_dir = harbor_dir / "submission"
@@ -182,18 +324,14 @@ class HarborVerifierRunner:
         tmp_dir = harbor_dir / "verifier-tmp"
         for directory in (harbor_dir, logs_dir, tmp_dir):
             directory.mkdir(parents=True, exist_ok=True)
-        # In Harbor separate-verifier mode, files written by the agent below
-        # /logs/artifacts are the submission, not part of the task workspace.
-        # Copy only that public artifact tree; never forward the agent HOME or
-        # arbitrary runtime logs into the verifier container.
-        if artifacts_dir is not None and artifacts_dir.is_dir():
-            source = artifacts_dir.resolve()
-            _reject_symlinks(source)
-            destination = logs_dir / "artifacts"
-            if destination.exists():
-                shutil.rmtree(destination)
-            shutil.copytree(source, destination, symlinks=False)
-        submission_sha256 = snapshot_workspace(workspace, submission_dir)
+        submission_sha256, artifact_mounts = materialize_artifacts(
+            spec=spec, workspace=workspace, attempt_dir=attempt_dir,
+            submission_dir=submission_dir, logs_dir=logs_dir, tmp_dir=tmp_dir,
+            agent_tmp_dir=agent_tmp_dir,
+            agent_logs_dir=(agent_logs_dir or (
+                artifacts_dir.parent if artifacts_dir is not None else None
+            )),
+        )
         argv = build_verifier_argv(
             docker=self.docker,
             attempt_id=attempt_id,
@@ -201,6 +339,7 @@ class HarborVerifierRunner:
             submission_dir=submission_dir,
             logs_dir=logs_dir,
             tmp_dir=tmp_dir,
+            artifact_mounts=artifact_mounts,
         )
         (harbor_dir / "verifier-argv.json").write_text(
             json.dumps(list(argv), ensure_ascii=False, indent=2) + "\n",

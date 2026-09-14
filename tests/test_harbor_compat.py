@@ -131,4 +131,155 @@ def test_verifier_argv_is_pull_free_and_uses_separate_submission(tmp_path):
     assert argv[0:3] == ("docker", "run", "--rm")
     assert argv[argv.index("--pull") + 1] == "never"
     assert argv[-2:] == ("bash", "/tests/test.sh")
-    assert str(tmp_path / "submission") in argv[argv.index("-v") + 1]
+    assert f"{tmp_path / 'logs'}:/logs" in argv
+    assert f"{tmp_path / 'tmp'}:/tmp" in argv
+    assert not any(f"{tmp_path / 'submission'}:/app" in item for item in argv)
+
+
+def test_harbor_official_reward_forces_native_scoring_even_when_external_enabled():
+    from backend.scoring_queue import _scoring_backend_for_env
+
+    settings = SimpleNamespace(
+        octagon_evals=SimpleNamespace(enabled=True),
+    )
+    harbor_env = SimpleNamespace(
+        meta={"harbor_runtime": {"score_mode": "official_reward"}},
+    )
+    generic_env = SimpleNamespace(meta={})
+    assert _scoring_backend_for_env(settings, harbor_env) == "native"
+    assert _scoring_backend_for_env(settings, generic_env) == "octagon-evals"
+
+
+def test_harbor_rejects_unsupported_modes_and_non_boolean_collect_flag():
+    context = _task_context()
+    for field, value in (
+        ("environment_mode", "shared"),
+        ("execution_mode", "multi_step"),
+        ("has_collect_hooks", "false"),
+        ("has_collect_hooks", True),
+        ("collect_hook_count", 1),
+    ):
+        changed = {"_harbor": dict(context["_harbor"], **{field: value})}
+        with pytest.raises(HarborTaskSpecError):
+            HarborTaskSpec.from_context(changed)
+
+
+def test_harbor_artifact_materialization_excludes_unlisted_workspace_files(tmp_path):
+    from backend.harbor_compat.verifier import materialize_artifacts
+
+    task = HarborTaskSpec.from_context(_task_context())
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "solver.py").write_text("class Solver: pass\n", encoding="utf-8")
+    (workspace / "secret.txt").write_text("must not be mounted\n", encoding="utf-8")
+    attempt_dir = tmp_path / "attempt"
+    logs_dir = attempt_dir / "harbor" / "verifier-logs"
+    tmp_dir = attempt_dir / "harbor" / "verifier-tmp"
+    submission_dir = attempt_dir / "harbor" / "submission"
+
+    digest, mounts = materialize_artifacts(
+        spec=task,
+        workspace=workspace,
+        attempt_dir=attempt_dir,
+        submission_dir=submission_dir,
+        logs_dir=logs_dir,
+        tmp_dir=tmp_dir,
+    )
+
+    assert digest
+    assert len(mounts) == 1
+    staged, destination, readonly = mounts[0]
+    assert destination == "/app/solver.py"
+    assert readonly is True
+    assert staged.is_file()
+    assert not (submission_dir / "mounts" / "app" / "secret.txt").exists()
+    assert all("secret.txt" not in str(item) for item in mounts)
+
+
+def test_verifier_resource_and_artifact_argv_are_explicit(tmp_path):
+    from backend.harbor_compat.verifier import build_verifier_argv
+
+    task = HarborTaskSpec.from_context(_task_context())
+    argv = build_verifier_argv(
+        docker="docker",
+        attempt_id="att_verify_resources",
+        spec=task,
+        submission_dir=tmp_path / "submission",
+        logs_dir=tmp_path / "logs",
+        tmp_dir=tmp_path / "tmp",
+        artifact_mounts=((tmp_path / "solver.py", "/app/solver.py", True),),
+    )
+    assert "--storage-opt" in argv
+    assert argv[argv.index("--storage-opt") + 1] == "size=10240m"
+    assert f"{tmp_path / 'solver.py'}:/app/solver.py:ro" in argv
+    assert f"{tmp_path / 'submission'}:/app" not in argv
+
+
+def test_configured_digest_pinned_codex_runtime_is_inspected_and_reused(monkeypatch):
+    import asyncio
+    import backend.harbor_compat.runtime as runtime_module
+    from backend.process.sandbox_preflight import SandboxImageInfo
+
+    task = HarborTaskSpec.from_context(_task_context())
+    configured = "registry.example/harbor-runtime@sha256:" + "a" * 64
+    calls = []
+
+    def inspect(reference, *, docker="docker"):
+        calls.append(reference)
+        return SandboxImageInfo(
+            reference=reference,
+            image_id="sha256:runtime",
+            digest=reference,
+            agents=("codex",),
+            versions={"codex": "0.149.1"},
+        )
+
+    monkeypatch.setattr(runtime_module, "inspect_image", inspect)
+
+    async def direct_to_thread(func, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(runtime_module.asyncio, "to_thread", direct_to_thread)
+    runtime = runtime_module.HarborAttemptRuntime(
+        settings=SimpleNamespace(sandbox=SimpleNamespace(image=configured)),
+        spec=task,
+        agent_name="codex",
+    )
+    task_image = SandboxImageInfo(
+        reference=task.agent_image, image_id="sha256:task",
+        digest=task.agent_image, agents=("codex",), versions={"codex": "0.149.1"},
+    )
+    runtime_result = asyncio.run(runtime._ensure_codex_runtime(task_image))
+    assert runtime_result.reference == configured
+    assert calls == [configured]
+
+
+def test_missing_configured_digest_pinned_runtime_fails_without_rebuild(monkeypatch):
+    import asyncio
+    import backend.harbor_compat.runtime as runtime_module
+    from backend.harbor_compat.runtime import HarborRuntimeError
+    from backend.process.sandbox_preflight import SandboxImageInfo
+
+    task = HarborTaskSpec.from_context(_task_context())
+    configured = "registry.example/harbor-runtime@sha256:" + "b" * 64
+
+    def inspect(_reference, *, docker="docker"):
+        raise RuntimeError("not present")
+
+    monkeypatch.setattr(runtime_module, "inspect_image", inspect)
+
+    async def direct_to_thread(func, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(runtime_module.asyncio, "to_thread", direct_to_thread)
+    runtime = runtime_module.HarborAttemptRuntime(
+        settings=SimpleNamespace(sandbox=SimpleNamespace(image=configured)),
+        spec=task,
+        agent_name="codex",
+    )
+    task_image = SandboxImageInfo(
+        reference=task.agent_image, image_id="sha256:task",
+        digest=task.agent_image, agents=("codex",), versions={},
+    )
+    with pytest.raises(HarborRuntimeError, match="Configured Harbor Codex runtime image"):
+        asyncio.run(runtime._ensure_codex_runtime(task_image))

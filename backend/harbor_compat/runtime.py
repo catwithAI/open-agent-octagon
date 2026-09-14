@@ -143,16 +143,21 @@ class HarborAttemptRuntime:
         """Build the small Codex runtime lazily on the first Harbor Codex run."""
         configured = (
             os.environ.get("HARBOR_OCTAGON_RUNTIME_IMAGE")
-            or getattr(self.settings.sandbox, "image", None)
+            or getattr(getattr(self.settings, "sandbox", None), "image", None)
         )
         version = os.environ.get("HARBOR_CODEX_VERSION", "0.149.1")
-        # A digest-pinned configured value is an immutable external image and
-        # cannot be a build target. Use a local auto tag in that case.
-        target = configured if configured and "@sha256:" not in configured else None
-        target = target or f"harbor-octagon-codex-runtime:auto-{version}"
+        # A configured digest is an immutable runtime selection. Inspect and
+        # reuse it exactly; never replace it with an auto tag or rebuild a
+        # different image, otherwise the declared runtime pin is meaningless.
+        target = configured or f"harbor-octagon-codex-runtime:auto-{version}"
+        configured_digest = bool(configured and "@sha256:" in configured)
         try:
             return await asyncio.to_thread(inspect_image, target, docker=self.docker)
-        except Exception:
+        except Exception as exc:
+            if configured_digest:
+                raise HarborRuntimeError(
+                    f"Configured Harbor Codex runtime image is unavailable: {target}"
+                ) from exc
             if not self.spec.auto_prepare:
                 raise HarborRuntimeError(
                     f"Harbor Codex runtime is not available locally: {target}"
@@ -300,4 +305,6 @@ class HarborAttemptRuntime:
             workspace=self.workspace, attempt_dir=self.attempt_dir,
             artifacts_dir=(self.agent_logs / "artifacts")
             if self.agent_logs is not None else None,
+            agent_tmp_dir=self.agent_tmp,
+            agent_logs_dir=self.agent_logs,
         )

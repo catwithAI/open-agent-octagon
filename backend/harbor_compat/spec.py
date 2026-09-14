@@ -64,7 +64,7 @@ class HarborTaskSpec:
     agent_resources: dict[str, Any]
     verifier_resources: dict[str, Any]
     environment_mode: str
-    artifacts: tuple[str, ...]
+    artifacts: tuple[str | Mapping[str, Any], ...]
     has_collect_hooks: bool
     collect_hook_count: int
     execution_mode: str
@@ -77,8 +77,26 @@ class HarborTaskSpec:
         if not isinstance(raw, Mapping):
             raise HarborTaskSpecError("task context is missing _harbor metadata")
         artifacts = raw.get("artifacts") or []
-        if not isinstance(artifacts, list) or not all(isinstance(x, str) for x in artifacts):
-            raise HarborTaskSpecError("_harbor.artifacts must be a string array")
+        if not isinstance(artifacts, list) or not all(
+            isinstance(x, (str, Mapping)) for x in artifacts
+        ):
+            raise HarborTaskSpecError(
+                "_harbor.artifacts must be an array of absolute paths or "
+                "source/destination objects"
+            )
+        for index, artifact in enumerate(artifacts):
+            if isinstance(artifact, Mapping):
+                source = artifact.get("source") or artifact.get("path")
+                destination = (
+                    artifact.get("destination")
+                    or artifact.get("target")
+                    or source
+                )
+                if not isinstance(source, str) or not isinstance(destination, str):
+                    raise HarborTaskSpecError(
+                        f"_harbor.artifacts[{index}] must define string source "
+                        "and destination/path"
+                    )
         agent_resources = raw.get("agent_resources") or {}
         verifier_resources = raw.get("verifier_resources") or {}
         if not isinstance(agent_resources, Mapping) or not isinstance(verifier_resources, Mapping):
@@ -87,8 +105,34 @@ class HarborTaskSpec:
         if not workdir.startswith("/"):
             raise HarborTaskSpecError("_harbor.agent_workdir must be absolute")
         execution_mode = _optional_string(raw, "execution_mode") or "single_step"
-        if execution_mode not in {"single_step", "multi_step"}:
-            raise HarborTaskSpecError(f"unsupported Harbor execution_mode: {execution_mode!r}")
+        if execution_mode != "single_step":
+            raise HarborTaskSpecError(
+                f"Harbor execution_mode={execution_mode!r} is unsupported; "
+                "only single_step is fail-closed supported"
+            )
+        environment_mode = _optional_string(raw, "environment_mode") or "separate"
+        if environment_mode != "separate":
+            raise HarborTaskSpecError(
+                f"Harbor environment_mode={environment_mode!r} is unsupported; "
+                "only separate verifier mode is supported"
+            )
+        has_collect_hooks = raw.get("has_collect_hooks", False)
+        if not isinstance(has_collect_hooks, bool):
+            raise HarborTaskSpecError("_harbor.has_collect_hooks must be a boolean")
+        collect_count = raw.get("collect_hook_count", 0)
+        if isinstance(collect_count, bool):
+            raise HarborTaskSpecError("_harbor.collect_hook_count must be an integer")
+        try:
+            collect_count = int(collect_count)
+        except (TypeError, ValueError) as exc:
+            raise HarborTaskSpecError("_harbor.collect_hook_count must be an integer") from exc
+        if collect_count < 0:
+            raise HarborTaskSpecError("_harbor.collect_hook_count cannot be negative")
+        if has_collect_hooks or collect_count:
+            raise HarborTaskSpecError(
+                "Harbor collect hooks are unsupported; tasks with collect hooks "
+                "must be rejected instead of silently skipping collection"
+            )
         image_pull_policy = _optional_string(raw, "image_pull_policy") or "selected-task-only"
         if image_pull_policy not in {"never", "selected-task-only"}:
             raise HarborTaskSpecError(
@@ -97,13 +141,6 @@ class HarborTaskSpec:
         auto_prepare = raw.get("auto_prepare", image_pull_policy == "selected-task-only")
         if not isinstance(auto_prepare, bool):
             raise HarborTaskSpecError("_harbor.auto_prepare must be a boolean")
-        collect_count = raw.get("collect_hook_count", 0)
-        try:
-            collect_count = int(collect_count)
-        except (TypeError, ValueError) as exc:
-            raise HarborTaskSpecError("_harbor.collect_hook_count must be an integer") from exc
-        if collect_count < 0:
-            raise HarborTaskSpecError("_harbor.collect_hook_count cannot be negative")
         return cls(
             release=_require_string(raw, "release"),
             source_commit=_require_string(raw, "source_commit"),
@@ -120,9 +157,9 @@ class HarborTaskSpec:
             verifier_network_mode=_optional_string(raw, "verifier_network_mode"),
             agent_resources={str(k): v for k, v in agent_resources.items()},
             verifier_resources={str(k): v for k, v in verifier_resources.items()},
-            environment_mode=_optional_string(raw, "environment_mode") or "separate",
+            environment_mode=environment_mode,
             artifacts=tuple(artifacts),
-            has_collect_hooks=bool(raw.get("has_collect_hooks", False)),
+            has_collect_hooks=has_collect_hooks,
             collect_hook_count=collect_count,
             execution_mode=execution_mode,
             image_pull_policy=image_pull_policy,

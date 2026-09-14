@@ -51,6 +51,27 @@ def _octagon_evals_enabled(settings: Any | None) -> bool:
     return bool(getattr(getattr(settings, "octagon_evals", None), "enabled", False))
 
 
+def _harbor_official_reward(env: Any | None) -> bool:
+    """Whether an environment's official Harbor reward is authoritative.
+
+    This is intentionally evaluated per environment, not only from the global
+    octagon-evals switch. Harbor's verifier reward must never be replaced by a
+    generic LLM judge when external evaluation is enabled for other envs.
+    """
+    meta = getattr(env, "meta", {}) or {}
+    runtime = meta.get("harbor_runtime") or {}
+    return (
+        isinstance(runtime, dict)
+        and runtime.get("score_mode") == "official_reward"
+    )
+
+
+def _scoring_backend_for_env(settings: Any | None, env: Any | None) -> str:
+    if _harbor_official_reward(env):
+        return "native"
+    return "octagon-evals" if _octagon_evals_enabled(settings) else "native"
+
+
 def _scorer_version_for_env(env: Any | None) -> str:
     module = getattr(env, "scorer_module", None)
     declared = getattr(module, "__octagon_scorer_version__", None)
@@ -85,7 +106,14 @@ def enqueue_scoring_job(
     )
     now = _now_iso()
     job_id = f"scj_{uuid.uuid4().hex[:16]}"
-    external_evals_enabled = _octagon_evals_enabled(getattr(state, "settings", None))
+    with _open_sync(state.db_path) as conn:
+        env_row = conn.execute(
+            "SELECT env_name FROM attempts WHERE id=?", (attempt_id,)
+        ).fetchone()
+    env = state.envs.get(str(env_row[0])) if env_row else None
+    scoring_backend = _scoring_backend_for_env(
+        getattr(state, "settings", None), env
+    )
     config = {
         "adapter_status": adapter_status,
         "adapter_error_code": adapter_error_code,
@@ -94,7 +122,7 @@ def enqueue_scoring_job(
         "snapshot_ref": snapshot.relative_path,
         # Persist the selected backend with the durable job. Changing config
         # while a job is queued must not silently change its scoring semantics.
-        "scoring_backend": "octagon-evals" if external_evals_enabled else "native",
+        "scoring_backend": scoring_backend,
     }
     refs = dict(stats.get("external_refs") or {})
     if adapter_status != "completed":
@@ -106,13 +134,9 @@ def enqueue_scoring_job(
             }
         )
     with _open_sync(state.db_path) as conn:
-        env_row = conn.execute(
-            "SELECT env_name FROM attempts WHERE id=?", (attempt_id,)
-        ).fetchone()
-        env = state.envs.get(str(env_row[0])) if env_row else None
         scorer_version = (
             OCTAGON_EVALS_SCORER_VERSION
-            if _octagon_evals_enabled(getattr(state, "settings", None))
+            if scoring_backend == "octagon-evals"
             else _scorer_version_for_env(env)
         )
         conn.execute(
@@ -390,11 +414,12 @@ async def _execute_job(
             )
             task_dict = _row_to_task_dict(dict(task), frozen_input=frozen_input)
             scoring_backend = config.get("scoring_backend")
-            use_external_evals = (
-                scoring_backend == "octagon-evals"
+            effective_backend = (
+                scoring_backend
                 if scoring_backend in {"native", "octagon-evals"}
-                else _octagon_evals_enabled(getattr(state, "settings", None))
+                else _scoring_backend_for_env(getattr(state, "settings", None), env)
             )
+            use_external_evals = effective_backend == "octagon-evals"
             if use_external_evals:
                 from .octagon_evals_client import (
                     OctagonEvalsClient,

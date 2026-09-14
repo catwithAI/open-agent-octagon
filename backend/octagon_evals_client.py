@@ -208,7 +208,10 @@ class OctagonEvalsClient:
             "task": task,
             "artifact": artifact,
             "history": history,
-            "run_status": {"upstream_completed": True},
+            # StartRequest consumes this boolean at the top level. Do not put
+            # it only inside run_status: timeout/chat_failed attempts must not
+            # be presented to octagon-evals as successfully completed.
+            "upstream_completed": attempt.get("execution_status") == "completed",
             "producer": {
                 "agent_name": attempt.get("agent_name"),
                 "model": attempt.get("model"),

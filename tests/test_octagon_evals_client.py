@@ -79,3 +79,36 @@ def test_external_evals_bridge_starts_run_and_scores_all_dimensions(tmp_path: Pa
     score_payload = next(call[2] for call in calls if call[1].endswith("/tasks/t1/score"))
     assert score_payload["evidence"]["artifact"]["files"][0]["content"] == "candidate output"
     assert result.metadata["backend"] == "octagon-evals"
+
+
+def test_external_evals_sends_top_level_upstream_completed_for_failed_attempt(tmp_path: Path):
+    root = tmp_path / "attempts" / "a1" / "skill_workspace"
+    root.mkdir(parents=True)
+    calls = []
+
+    def opener(request, timeout):
+        calls.append((request.method, request.full_url, json.loads(request.data) if request.data else None, timeout))
+        if request.method == "POST" and request.full_url.endswith("/runs"):
+            return _Response({"plan_hash": "sha256:plan", "task_ids": ["t1"]})
+        if request.method == "GET" and request.full_url.endswith("/tasks/t1"):
+            return _Response({"task_id": "t1", "state": "completed", "scores": [{"value": 0.0, "resolved": 1}]})
+        raise AssertionError((request.method, request.full_url))
+
+    client = OctagonEvalsClient(
+        OctagonEvalsConfig("http://eval.test", request_timeout_seconds=7, max_evidence_bytes=1000),
+        opener=opener,
+    )
+    client.score(
+        experiment_id="exp1",
+        run_id="run1",
+        scenario={"id": "demo", "version": 1},
+        task={"id": "task1", "prompt": "do it"},
+        attempt={"env_name": "demo", "agent_name": "codex", "model": "m", "execution_status": "timeout"},
+        attempt_root=root.parent,
+        snapshot_ref="scoring-snapshots/hash",
+        input_hash="sha256:input",
+        env_meta={"dimensions": [{"name": "correctness", "weight": 100, "description": "Is it correct?"}]},
+    )
+    payload = calls[0][2]
+    assert payload["upstream_completed"] is False
+    assert "run_status" not in payload
