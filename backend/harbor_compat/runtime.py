@@ -178,19 +178,38 @@ class HarborAttemptRuntime:
             raise HarborRuntimeError(f"Harbor Codex runtime inspect failed: {target}") from exc
 
     async def _ensure_blade_wrapper(self) -> SandboxImageInfo:
-        """Build the Blade bridge lazily, without requiring a manual build step."""
-        target = os.environ.get(
-            "HARBOR_BLADE_WRAPPER_IMAGE", "harbor-octagon-blade-wrapper:auto"
-        )
+        """Build the Blade bridge lazily, without reusing stale source-image tags.
+
+        The old default tag (``...:auto``) was inspected before the Dockerfile
+        was considered. After changing ``wrapper.py``, a running backend could
+        therefore keep launching the old image forever. An implicit tag now
+        includes a hash of the wrapper build inputs; an explicitly configured
+        image remains an operator-owned immutable choice.
+        """
+        repo_root = self._repo_root()
+        dockerfile = repo_root / "docker" / "harbor-blade-wrapper" / "Dockerfile"
+        wrapper_source = repo_root / "docker" / "harbor-blade-wrapper" / "wrapper.py"
+        if not dockerfile.is_file():
+            raise HarborRuntimeError(f"Blade wrapper Dockerfile not found: {dockerfile}")
+        if not wrapper_source.is_file():
+            raise HarborRuntimeError(f"Blade wrapper source not found: {wrapper_source}")
+        base = os.environ.get("HARBOR_BLADE_WRAPPER_BASE_IMAGE", "python:3.12-slim")
+        kit_version = os.environ.get("BLADE_AGENT_KIT_VERSION", "1.1.7")
+        configured = os.environ.get("HARBOR_BLADE_WRAPPER_IMAGE")
+        if configured:
+            target = configured
+        else:
+            fingerprint = hashlib.sha256(
+                dockerfile.read_bytes()
+                + wrapper_source.read_bytes()
+                + f"\0{base}\0{kit_version}".encode("utf-8")
+            ).hexdigest()[:16]
+            target = f"harbor-octagon-blade-wrapper:auto-{fingerprint}"
         try:
             return await asyncio.to_thread(inspect_image, target, docker=self.docker)
         except Exception:
             if not self.spec.auto_prepare:
                 raise HarborRuntimeError(f"Blade wrapper is not available locally: {target}")
-        dockerfile = self._repo_root() / "docker" / "harbor-blade-wrapper" / "Dockerfile"
-        if not dockerfile.is_file():
-            raise HarborRuntimeError(f"Blade wrapper Dockerfile not found: {dockerfile}")
-        base = os.environ.get("HARBOR_BLADE_WRAPPER_BASE_IMAGE", "python:3.12-slim")
         try:
             await asyncio.to_thread(inspect_image, base, docker=self.docker)
         except Exception:
@@ -199,7 +218,8 @@ class HarborAttemptRuntime:
         logger.info("Harbor auto-prepare: building Blade wrapper %s", target)
         await self._run([
             "build", "--pull=false", "--build-arg", f"BASE_IMAGE={base}",
-            "--file", str(dockerfile), "--tag", target, str(self._repo_root()),
+            "--build-arg", f"BLADE_AGENT_KIT_VERSION={kit_version}",
+            "--file", str(dockerfile), "--tag", target, str(repo_root),
         ], timeout=1800)
         try:
             return await asyncio.to_thread(inspect_image, target, docker=self.docker)
