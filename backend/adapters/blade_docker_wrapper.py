@@ -42,6 +42,18 @@ class BladeDockerWrapperAdapter:
                 attempt_id=task.attempt_id, status="auth_failed",
                 error_code="api_key_missing", error_message="blade.api_key not configured",
             )
+        harbor_meta = task.task_context.get("_harbor") or {}
+        declared_artifacts = harbor_meta.get("artifacts")
+        if not isinstance(declared_artifacts, list) or not declared_artifacts:
+            declared_artifacts = ["/logs/artifacts/response.txt"]
+        artifact_paths = []
+        for item in declared_artifacts:
+            if isinstance(item, str):
+                artifact_paths.append(item)
+            elif isinstance(item, dict):
+                source = item.get("source") or item.get("path")
+                if isinstance(source, str):
+                    artifact_paths.append(source)
         request = {
             "attempt_id": task.attempt_id,
             "base_url": self.config.base_url,
@@ -49,6 +61,7 @@ class BladeDockerWrapperAdapter:
             "model": self.config.model,
             "task_prompt": task.task_prompt,
             "task_context": task.task_context,
+            "artifact_paths": artifact_paths,
             "timeout_seconds": task.timeout_seconds or 1200,
             # A Harbor task has no registered Octagon skill. General chat is
             # the neutral Blade surface unless an operator explicitly sets a
@@ -67,6 +80,11 @@ class BladeDockerWrapperAdapter:
             run_id=task.run_id, workspace=attempt_dir / "skill_workspace",
         )
         command = ("python3", "/usr/local/bin/harbor-blade-wrapper", "/attempt/blade-request.json")
+        requested_timeout = float(task.timeout_seconds or 1200)
+        # The remote run has the Harbor budget; the local wrapper gets a small
+        # cleanup/download grace period so a successful file-based answer is
+        # not killed at the exact deadline while the SDK is closing its stream.
+        wrapper_timeout = requested_timeout + 90.0
         try:
             async with self.launcher.attempt(attempt_spec) as sandbox:
                 async with sandbox.exec(ExecSpec(
@@ -75,7 +93,7 @@ class BladeDockerWrapperAdapter:
                 )) as proc:
                     try:
                         stdout, stderr = await asyncio.wait_for(
-                            proc.communicate(), timeout=float(task.timeout_seconds or 1200)
+                            proc.communicate(), timeout=wrapper_timeout
                         )
                     except asyncio.TimeoutError:
                         return AdapterResult(

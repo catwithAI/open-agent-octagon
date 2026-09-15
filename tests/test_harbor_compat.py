@@ -150,6 +150,13 @@ def test_harbor_official_reward_forces_native_scoring_even_when_external_enabled
     assert _scoring_backend_for_env(settings, generic_env) == "octagon-evals"
 
 
+def test_harbor_empty_artifacts_use_official_response_file_fallback():
+    context = _task_context()
+    context["_harbor"] = dict(context["_harbor"], artifacts=[])
+    task = HarborTaskSpec.from_context(context)
+    assert task.artifacts == ("/logs/artifacts/response.txt",)
+
+
 def test_harbor_rejects_unsupported_modes_and_non_boolean_collect_flag():
     context = _task_context()
     for field, value in (

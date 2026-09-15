@@ -8,6 +8,13 @@ class HarborTaskSpecError(ValueError):
     """A task is not safe to execute in Harbor compatibility mode."""
 
 
+# Harbor's answer-oriented tasks frequently omit ``artifacts`` from task.toml
+# even though their verifier contract conventionally consumes this exact file.
+# Keep this fallback narrow: it exposes one declared public output, never the
+# whole workspace or an arbitrary path inferred from agent output.
+DEFAULT_HARBOR_RESPONSE_ARTIFACT = "/logs/artifacts/response.txt"
+
+
 def _require_string(data: Mapping[str, Any], key: str) -> str:
     value = data.get(key)
     if not isinstance(value, str) or not value.strip():
@@ -77,6 +84,12 @@ class HarborTaskSpec:
         if not isinstance(raw, Mapping):
             raise HarborTaskSpecError("task context is missing _harbor metadata")
         artifacts = raw.get("artifacts") or []
+        # Harbor answer tasks commonly omit the optional artifacts array even
+        # though their instruction/verifier contract uses the conventional
+        # response file. Keep the compatibility default narrow and explicit;
+        # never infer or expose the whole workspace.
+        if not artifacts:
+            artifacts = [DEFAULT_HARBOR_RESPONSE_ARTIFACT]
         if not isinstance(artifacts, list) or not all(
             isinstance(x, (str, Mapping)) for x in artifacts
         ):
