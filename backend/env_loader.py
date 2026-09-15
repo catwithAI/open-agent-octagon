@@ -21,8 +21,10 @@ from __future__ import annotations
 import importlib.util
 import json
 import logging
+import os
 import re
 import shutil
+import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -248,18 +250,47 @@ def check_prerequisites(meta: dict[str, Any]) -> list[str]:
 
 
 def _dependency_available(name: str) -> bool:
-    """候选依赖是否本机可用：PATH 二进制或可导入的 Python 包。
+    """候选依赖是否本机可用：PATH 二进制、Python 包或受支持的运行时镜像。
 
     requires 里 "PyMuPDF/fitz（pdf→png）" 这类 Python 包在形式上与二进制名
     不可区分，只查 which() 会对装了包的机器持续误报——find_spec 兜底仍是
-    纯本地检查（非功能要求：无网络调用）。
+    纯本地检查（非功能要求：无网络调用）。``harbor-compat-runtime`` 是
+    一个语义依赖，不是 PATH 命令；它通过本地 Docker image inspect 判定。
     """
+    if name == "harbor-compat-runtime":
+        return _harbor_runtime_available()
     if shutil.which(name):
         return True
     try:
         return importlib.util.find_spec(name) is not None
     except (ImportError, ValueError):
         return False
+
+
+def _harbor_runtime_available() -> bool:
+    """检查已配置的 Harbor overlay runtime image 是否存在于本地 Docker。
+
+    只执行 ``docker image inspect``，不会 pull 镜像，也不会访问 Harbor
+    catalog。运行时镜像通过 HARBOR_OCTAGON_RUNTIME_IMAGE 配置；保留
+    OCTAGON_SANDBOX_IMAGE 作为兼容回退。
+    """
+    image = (
+        os.environ.get("HARBOR_OCTAGON_RUNTIME_IMAGE")
+        or os.environ.get("OCTAGON_SANDBOX_IMAGE")
+    )
+    if not image or shutil.which("docker") is None:
+        return False
+    try:
+        result = subprocess.run(
+            ["docker", "image", "inspect", image],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0
 
 
 class EnvLoader:

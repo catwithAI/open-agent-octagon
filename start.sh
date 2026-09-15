@@ -22,7 +22,7 @@ fi
 BACKEND_PORT="${BACKEND_PORT:-8100}"
 BACKEND_HOST="${BACKEND_HOST:-0.0.0.0}"
 FRONTEND_PORT="${FRONTEND_PORT:-5172}"
-FRONTEND_HOST="${FRONTEND_HOST:-127.0.0.1}"
+FRONTEND_HOST="${FRONTEND_HOST:-0.0.0.0}"
 START_BACKEND=1
 START_FRONTEND=1
 
@@ -127,7 +127,9 @@ if (( START_BACKEND )); then
         echo "[start.sh] Python 环境与 uv.lock 不一致，正在同步…"
         uv sync --locked --inexact
     fi
-    UVICORN_CMD=(uv run --locked --no-sync uvicorn)
+    # 用模块方式启动，避免旧路径迁移后 .venv/bin/uvicorn 的 shebang
+    # 仍指向历史工作区（例如 /home/yang/agent-octagon）导致 bad interpreter。
+    UVICORN_CMD=(uv run --locked --no-sync python -m uvicorn)
     echo "[start.sh] backend  → http://${BACKEND_HOST}:${BACKEND_PORT}  (logs/backend.log)"
     "${UVICORN_CMD[@]}" backend.main:create_app --factory \
         --host "${BACKEND_HOST}" --port "${BACKEND_PORT}" \
@@ -138,8 +140,11 @@ fi
 # ---------- 启动前端 ------------------------------------------------------
 
 if (( START_FRONTEND )); then
-    echo "[start.sh] frontend → http://${FRONTEND_HOST}:${FRONTEND_PORT}  (logs/frontend.log)"
-    (cd "${ROOT}/web" && npm run dev -- --host "${FRONTEND_HOST}" --port "${FRONTEND_PORT}") \
+    echo "[start.sh] frontend → http://${FRONTEND_HOST}:${FRONTEND_PORT}  (Windows 可访问 http://127.0.0.1:${FRONTEND_PORT})  (logs/frontend.log)"
+    # WSL/受限容器中 inotify 实例可能耗尽；默认让 Vite 使用轮询，
+    # 可通过 VITE_USE_POLLING=0 恢复 native watcher。
+    (cd "${ROOT}/web" && VITE_USE_POLLING="${VITE_USE_POLLING:-1}" \
+        npm run dev -- --host "${FRONTEND_HOST}" --port "${FRONTEND_PORT}") \
         > "${FRONTEND_LOG}" 2>&1 &
     PIDS+=("$!")
 fi

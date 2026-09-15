@@ -43,7 +43,7 @@ import sqlite3
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Protocol
+from typing import Any, Awaitable, Callable, Protocol
 
 from . import runtime_state
 from .cost.credential import judge_credentials_active
@@ -283,10 +283,13 @@ async def run_attempt(
     observer: Any | None = None,
     defer_scoring: bool = False,
     scoring_capacity: int = 2,
+    post_agent: Callable[[Any], Awaitable[None]] | None = None,
 ) -> RunAttemptResult:
     """单 attempt 的全流程,异常都被包成 terminal status,绝不向上抛。
 
     observer：wire capture 的 phase 推进与 finalize 钩子。
+    post_agent：agent sandbox 结束后、scoring queue 入队前的异步任务 runtime
+    hook（例如 Harbor artifact collect + isolated verifier）。
     不传时用 NullAttemptObserver,行为与 wire 层不存在时完全一致。
     source start/ready 已由 dispatch 的 prepare() 完成,这里不再 attempt_start。
     整个决策流程包在外层 try/finally 里,所有 early return 都会经过
@@ -302,6 +305,7 @@ async def run_attempt(
             observer=observer,
             defer_scoring=defer_scoring,
             scoring_capacity=scoring_capacity,
+            post_agent=post_agent,
         )
     finally:
         try:
@@ -317,6 +321,7 @@ async def _run_attempt_inner(
     observer: Any,
     defer_scoring: bool = False,
     scoring_capacity: int = 2,
+    post_agent: Callable[[Any], Awaitable[None]] | None = None,
 ) -> RunAttemptResult:
     state = runtime_state.get()
 
@@ -337,6 +342,29 @@ async def _run_attempt_inner(
         await observer.agent_result(adapter_result)
     except Exception:
         logger.exception("wire observer.agent_result fail-open")
+
+    # A task runtime may need to collect artifacts and run an isolated verifier
+    # after the agent sandbox has exited but before the scoring queue starts.
+    # This hook is deliberately outside adapter code so Harbor can preserve its
+    # verifier lifecycle without teaching every agent adapter about Docker.
+    if post_agent is not None:
+        try:
+            async with observer.phase("verification"):
+                await post_agent(adapter_result)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("post-agent runtime failed")
+            return _finalize_no_score(
+                db_path=runtime_state.get().db_path,
+                attempt_id=getattr(adapter_result, "attempt_id", "<unknown>"),
+                status="scoring_failed",
+                error_code="post_agent_runtime_failed",
+                error_message=str(exc),
+                pass_threshold=60,
+                external_refs={
+                    "post_agent_runtime": "failed",
+                    "original_status": getattr(adapter_result, "status", None),
+                },
+            )
 
     attempt_id = adapter_result.attempt_id
     adapter_status = adapter_result.status

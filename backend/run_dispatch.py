@@ -9,6 +9,7 @@ import asyncio
 import json
 import logging
 import re
+import sys
 import shutil
 import sqlite3
 import time
@@ -146,12 +147,38 @@ _DEFAULT_MODELS = {
 }
 
 
+def _default_model_for_agent(agent_name: str, settings: Settings) -> str | None:
+    """Return a safe default model, including the configured provider route.
+
+    A bare ``gpt-5.5`` makes Codex use its built-in ``api.openai.com`` route.
+    In this application Codex is configured through the provider declared for
+    that agent (normally ``or-codex``), so the default must retain that prefix
+    and let ``CodexAdapter`` inject both the endpoint and the key.
+    """
+    fallback = _DEFAULT_MODELS.get(agent_name)
+    if agent_name != "codex":
+        return fallback
+
+    providers = settings.model_providers or {}
+    candidates = [
+        name for name, provider in providers.items()
+        if getattr(provider, "agent", None) == agent_name
+    ]
+    # Backward-compatible configs may not have ``agent`` on the provider.
+    if not candidates and "or-codex" in providers:
+        candidates = ["or-codex"]
+    if candidates:
+        return f"{sorted(candidates)[0]}/{fallback}"
+    return fallback
+
+
 def build_adapter(
     agent_name: str,
     settings: Settings,
     model: str | None = None,
     compare_mode: str = "multi-agent",
     blade_enable_thinking: bool | None = None,
+    launcher_override: AgentLauncher | None = None,
 ) -> Any:
     # 统一策略：blade-agent / claude-code 都在本机跑（blade server / claude CLI
     # 在同一台机器），不区分 compare_mode，一律走本机 settings.blade /
@@ -164,8 +191,10 @@ def build_adapter(
         return FakeAgentAdapter()
 
     # 本机 CLI agent 的进程启动层。沙盒（docker）接入后按 settings.sandbox
-    # 在这里换成 DockerLauncher；adapter 自身不感知执行场合。
-    launcher = _build_launcher(settings, agent_name)
+    # 在这里换成 DockerLauncher；adapter 自身不感知执行场合。Harbor
+    # compatibility runtime 可以按 task 注入一个 image/workdir/network 已经
+    # 固定的 launcher，而不改变任何 agent adapter 的协议。
+    launcher = launcher_override or _build_launcher(settings, agent_name)
 
     if agent_name == "blade-agent":
         blade = settings.blade
@@ -188,6 +217,10 @@ def build_adapter(
             reconnect_timeout_seconds=blade.reconnect_timeout_seconds,
             progress_poll_interval_seconds=blade.progress_poll_interval_seconds,
         )
+        if launcher_override is not None:
+            from .adapters.blade_docker_wrapper import BladeDockerWrapperAdapter
+
+            return BladeDockerWrapperAdapter(launcher=launcher, config=config)
         return BladeServiceAdapter(config)
 
     if agent_name == "claude-code":
@@ -206,7 +239,7 @@ def build_adapter(
         return CodexAdapter(
             launcher=launcher,
             octagon_project_path=Path(".").resolve(),
-            model=model or _DEFAULT_MODELS["codex"],
+            model=model or _default_model_for_agent("codex", settings),
             providers=settings.model_providers,
         )
 
@@ -439,6 +472,13 @@ async def dispatch(
 
     from .iteration.policy import parse_iterative_review_policy
 
+    # Resolve adapter defaults before thinking policy, wire-source selection, and
+    # adapter construction. In particular, Codex must not see a bare model: a
+    # bare model silently selects api.openai.com instead of octagon.yaml's
+    # configured provider route.
+    if model is None:
+        model = _default_model_for_agent(agent_name, settings)
+
     iteration_policy = parse_iterative_review_policy(env.meta)
 
     # 兜底：多轮 conversation + blade + Anthropic 系模型 + thinking 会撞 Anthropic
@@ -465,6 +505,49 @@ async def dispatch(
         )
         blade_enable_thinking = False
 
+    # Harbor compatibility is opt-in per environment. Prepare the task image
+    # before the adapter is built: its /app (or task workdir) contents must be
+    # materialized into the host attempt workspace before DockerLauncher mounts
+    # that directory, otherwise the bind mount would hide image-baked inputs.
+    harbor_runtime = None
+    harbor_spec = None
+    launcher_override = None
+    if isinstance(getattr(env, "meta", None), dict) and env.meta.get("harbor_runtime"):
+        from .harbor_compat.runtime import HarborAttemptRuntime, HarborRuntimeError
+        from .harbor_compat.spec import HarborTaskSpec
+
+        try:
+            harbor_spec = HarborTaskSpec.from_context(task_context)
+            harbor_runtime = HarborAttemptRuntime(
+                settings=settings, spec=harbor_spec, agent_name=agent_name,
+            )
+            await harbor_runtime.prepare(
+                attempt_dir=state.data_path / "attempts" / attempt_id,
+            )
+            launcher_override = harbor_runtime.launcher()
+        except SandboxUnavailable as exc:
+            from .runner import _finalize_no_score
+            logger.error("dispatch: Harbor sandbox unavailable attempt=%s: %s", attempt_id, exc)
+            _finalize_no_score(
+                db_path=state.db_path, attempt_id=attempt_id,
+                status=ATTEMPT_STATUS_SANDBOX_UNAVAILABLE,
+                error_code=exc.error_code, error_message=str(exc),
+                pass_threshold=int((getattr(env, "meta", {}) or {}).get("pass_threshold", 60)),
+            )
+            _refresh_run_status(state.db_path, attempt_id)
+            return
+        except (HarborRuntimeError, ValueError) as exc:
+            from .runner import _finalize_no_score
+            logger.error("dispatch: Harbor runtime unavailable attempt=%s: %s", attempt_id, exc)
+            _finalize_no_score(
+                db_path=state.db_path, attempt_id=attempt_id,
+                status="harbor_runtime_unavailable",
+                error_code="harbor_runtime_prepare_failed", error_message=str(exc),
+                pass_threshold=int((getattr(env, "meta", {}) or {}).get("pass_threshold", 60)),
+            )
+            _refresh_run_status(state.db_path, attempt_id)
+            return
+
     try:
         adapter = build_adapter(
             agent_name,
@@ -472,6 +555,7 @@ async def dispatch(
             model=model,
             compare_mode=compare_mode,
             blade_enable_thinking=blade_enable_thinking,
+            launcher_override=launcher_override,
         )
     except SandboxUnavailable as exc:
         from .runner import _finalize_no_score
@@ -728,12 +812,16 @@ async def dispatch(
             iteration_turn_handler=iteration_handler,
         )
 
-        # 把 env scripts 拷贝到 workspace（防止 agent 修改源文件）
-        _copy_env_scripts(state.data_path, attempt_id, env)
-        _copy_agent_materials(state.data_path, attempt_id, env, task_context)
-        # 把 uploaded_files 落到 workspace；物料缺失直接判失败，
-        # 不能让 agent 拿着"你有一段视频"的 prompt 在空 workspace 里瞎找
-        _copy_uploads(state.data_path, attempt_id, task_context)
+        # Harbor task images are the authoritative initial workspace. Do not
+        # copy Octagon env scripts/materials/uploads over it: doing so would
+        # change the Harbor initial-state parity boundary. Harbor's public
+        # /logs/artifacts tree is mounted by HarborAttemptRuntime instead.
+        if harbor_runtime is None:
+            _copy_env_scripts(state.data_path, attempt_id, env)
+            _copy_agent_materials(state.data_path, attempt_id, env, task_context)
+            # 把 uploaded_files 落到 workspace；物料缺失直接判失败，
+            # 不能让 agent 拿着"你有一段视频"的 prompt 在空 workspace 里瞎找
+            _copy_uploads(state.data_path, attempt_id, task_context)
         # HITL 场景：把 task 预置的批复策略落到 attempt 目录，供
         # request_human_approval 工具读取。决策由 task 固定，不由 agent 代拟。
         _seed_approval_policy(state.data_path, attempt_id, task_context)
@@ -754,6 +842,7 @@ async def dispatch(
             observer=capture,
             defer_scoring=True,
             scoring_capacity=int(settings.octagon.max_active_scoring_jobs),
+            post_agent=(harbor_runtime.finalize if harbor_runtime is not None else None),
         )
     except BaseException as exc:
         # abort 幂等，且对 run_attempt 内已正常 attempt_end 的 session 是 no-op。
@@ -1013,12 +1102,17 @@ def _mcp_server_specs(env: Any) -> tuple[McpServerSpec, ...]:
         raise ValueError(
             f"env {env.name} entrypoints.mcp.name 只允许字母、数字、下划线和连字符"
         )
-    project_root = Path(env.env_dir).resolve().parent.parent
+    # MCP commands are environment-local deployment artifacts.  Resolve their
+    # relative paths from the loaded environment directory rather than assuming
+    # every environment lives at <project-root>/envs/<name>.  This keeps copied,
+    # generated, and independently mounted bundles relocatable.
+    env_dir = Path(env.env_dir).resolve()
+    executable = sys.executable if command[0] in {"python", "python3"} else command[0]
     return (McpServerSpec(
         name=name,
-        command=command[0],
+        command=executable,
         args=tuple(command[1:]),
-        cwd=str(project_root),
+        cwd=str(env_dir),
     ),)
 
 

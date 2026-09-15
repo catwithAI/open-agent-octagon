@@ -48,6 +48,11 @@ class ExecSpec:
     argv: Sequence[str]
     cwd: str
     env: Mapping[str, str] = field(default_factory=dict)
+    # Environment names that the adapter deliberately injected (typically a
+    # provider credential). Docker must forward these even when the value is
+    # identical to the backend process environment: unlike a host subprocess,
+    # ``docker exec`` does not inherit the host environment.
+    explicit_env_keys: frozenset[str] = frozenset()
     turn_id: str | None = None
 
 

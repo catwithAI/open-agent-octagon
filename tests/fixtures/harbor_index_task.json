@@ -1,0 +1,29 @@
+{
+  "id": "harbor-index-algotune-optimize-lti-sim",
+  "context": {
+    "_harbor": {
+      "release": "1.4",
+      "source_commit": "35f01ec42b14c2b5da476099f5b0d209240bca5b",
+      "task_name": "harbor-index/algotune-optimize-lti-sim",
+      "task_digest": "sha256:c0edd97f0e5f1e90a3cd93d3e8c93d441d54f32d81f56070a03feff0f247d9e3",
+      "task_toml_sha256": "9cd08f31583070c392d4c8f8d67867b40b9e217b36fb5f2340c294d8babf7b99",
+      "instruction_sha256": "f1da982f097c1212419bbb2b4641fd3ed7fa1530d1b9e8891647ce2b68f78089",
+      "agent_image": "harborframework/harbor-index:algotune-optimize-lti-sim-agent-aa042f2864ebadb5dbbb1b13b4b7dc4553743d64@sha256:93e5be6634cd5b36ded81225e8dee76212410d582e59af3d8adfdaf097eea0d4",
+      "verifier_image": "harborframework/harbor-index:algotune-optimize-lti-sim-verifier-d85872a205b342cae1e2da7468858a384fddfef6@sha256:24c6eaa05b14c837dd7ab3e23556cc058f2457d4d415141dd4be3662b0a86a6c",
+      "agent_workdir": "/app",
+      "agent_timeout_seconds": 1800,
+      "verifier_timeout_seconds": 1800,
+      "agent_network_mode": null,
+      "verifier_network_mode": null,
+      "agent_resources": {"cpus": 4, "memory_mb": 8192},
+      "verifier_resources": {"cpus": 4, "memory_mb": 8192, "storage_mb": 10240},
+      "environment_mode": "separate",
+      "artifacts": ["/app/solver.py"],
+      "has_collect_hooks": false,
+      "collect_hook_count": 0,
+      "execution_mode": "single_step",
+      "image_pull_policy": "selected-task-only",
+      "auto_prepare": true
+    }
+  }
+}
