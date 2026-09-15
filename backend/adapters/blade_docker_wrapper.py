@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import time
 from pathlib import Path
 from typing import Any
@@ -54,6 +55,19 @@ class BladeDockerWrapperAdapter:
                 source = item.get("source") or item.get("path")
                 if isinstance(source, str):
                     artifact_paths.append(source)
+        configured_timeout = getattr(self.config, "timeout_seconds", None)
+        if configured_timeout is None:
+            configured_timeout = os.environ.get("HARBOR_BLADE_TIMEOUT_SECONDS", "1800")
+        try:
+            blade_timeout = float(configured_timeout)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("HARBOR_BLADE_TIMEOUT_SECONDS must be numeric") from exc
+        if blade_timeout <= 0:
+            raise ValueError("HARBOR_BLADE_TIMEOUT_SECONDS must be positive")
+        # The pilot deliberately gives Blade 30 minutes. This is a Blade-side
+        # execution policy; Codex and the official Harbor task metadata retain
+        # their own timeout semantics.
+        effective_timeout = max(float(task.timeout_seconds or 1200), blade_timeout)
         request = {
             "attempt_id": task.attempt_id,
             "base_url": self.config.base_url,
@@ -62,7 +76,7 @@ class BladeDockerWrapperAdapter:
             "task_prompt": task.task_prompt,
             "task_context": task.task_context,
             "artifact_paths": artifact_paths,
-            "timeout_seconds": task.timeout_seconds or 1200,
+            "timeout_seconds": effective_timeout,
             # A Harbor task has no registered Octagon skill. General chat is
             # the neutral Blade surface unless an operator explicitly sets a
             # Blade entry in task context.
@@ -80,7 +94,7 @@ class BladeDockerWrapperAdapter:
             run_id=task.run_id, workspace=attempt_dir / "skill_workspace",
         )
         command = ("python3", "/usr/local/bin/harbor-blade-wrapper", "/attempt/blade-request.json")
-        requested_timeout = float(task.timeout_seconds or 1200)
+        requested_timeout = effective_timeout
         # The remote run has the Harbor budget; the local wrapper gets a small
         # cleanup/download grace period so a successful file-based answer is
         # not killed at the exact deadline while the SDK is closing its stream.

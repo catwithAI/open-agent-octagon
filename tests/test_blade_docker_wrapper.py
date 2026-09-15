@@ -75,5 +75,6 @@ def test_blade_wrapper_request_is_attempt_scoped_and_token_not_in_argv(tmp_path)
     )
     assert request["api_key"] == "secret-token"
     assert request["artifact_paths"] == ["/logs/artifacts/response.txt"]
+    assert request["timeout_seconds"] == 1800.0
     assert all("secret-token" not in part for part in commands[0].argv)
     assert commands[0].argv[-1] == "/attempt/blade-request.json"
