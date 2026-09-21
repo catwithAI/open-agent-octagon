@@ -197,3 +197,43 @@ def test_older_than_filter(tmp_path: Path) -> None:
     plans = plan_archive(data_path=data_path, db_path=db_path, older_than=0)
     assert [p["attempt_id"] for p in plans] == ["att_fresh"]
     assert attempt.is_dir()
+
+
+def _make_legacy_db(db_path: Path, rows: list[tuple[str, str, str]]) -> None:
+    """后端还没跑迁移时的旧库：attempts 表没有归档列。"""
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "CREATE TABLE attempts (id TEXT PRIMARY KEY, run_id TEXT, status TEXT)"
+        )
+        conn.executemany(
+            "INSERT INTO attempts (id, run_id, status) VALUES (?,?,?)", rows
+        )
+        conn.commit()
+
+
+def test_works_on_a_db_without_archive_columns(tmp_path: Path) -> None:
+    """独立 CLI 可能先于后端升级跑在旧库上，不能直接崩。
+
+    实测：评测机上第一次跑就撞了 `no such column: archived_at`。
+    运维工具在半升级状态下也得给出正确答案。
+    """
+    data_path = tmp_path / "data"
+    attempt = _make_attempt(data_path, "att_done")
+    db_path = data_path / "octagon.db"
+    _make_legacy_db(db_path, [("att_done", "run_1", "completed")])
+
+    plans = plan_archive(data_path=data_path, db_path=db_path)
+    assert [p["attempt_id"] for p in plans] == ["att_done"]
+    assert plans[0]["already_archived_at"] is None
+
+    summary = apply_archive(data_path=data_path, db_path=db_path, plans=plans)
+    assert summary["failures"] == []
+    assert not (attempt / "sandbox_home").exists()
+
+    # 缺的列被就地补上，标记照常写入
+    with sqlite3.connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT archived_at, archived_kinds FROM attempts WHERE id='att_done'"
+        ).fetchone()
+    assert row[0] and json.loads(row[1]) == ["sandbox_home", "sandbox_ro"]
