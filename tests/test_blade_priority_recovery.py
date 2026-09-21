@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 
 import pytest
@@ -235,3 +236,52 @@ def test_project_workspace_is_optional() -> None:
     """非 software_factory 场景没有这个字段，行为不变。"""
     assert _candidate_remote_paths("a.py")[0] == "a.py"
     assert _candidate_remote_paths("a.py", project_workspace="")[0] == "a.py"
+
+
+def test_recovery_runs_end_to_end_without_nameerror(tmp_path: Path) -> None:
+    """跑通整条 _recover_workspace_artifacts，确保没有未定义变量。
+
+    评测机上曾因合并残留 `priority_set` 未定义，整个函数抛 NameError，
+    artifact_sync 只剩 {"error": "name 'priority_set' is not defined"} ——
+    blade-agent 的产物一个都没回收，却拿到一个看起来像能力问题的 0 分。
+    单测里 BFS 与优先回收两条路径都要真的走到。
+    """
+    import types
+
+    attempt = tmp_path / "att_x"
+    (attempt / "skill_workspace").mkdir(parents=True)
+    # 让 agent_edited_paths 有东西可提取
+    (attempt / "events.jsonl").write_text(
+        json.dumps({"delta": {"arguments": '{"file_path": "out.md"}'}}) + "\n",
+        encoding="utf-8",
+    )
+
+    class _Entry:
+        def __init__(self, name):
+            self.name, self.path, self.is_dir = name, name, False
+
+    class _Client:
+        def __init__(self):
+            self.downloaded = []
+
+        async def list_dir(self, session_id, dir_path):
+            return [_Entry("out.md"), _Entry("other.txt")] if dir_path == "." else []
+
+        async def download_file(self, session_id, path):
+            self.downloaded.append(path)
+            return b"content for " + path.encode()
+
+    task = types.SimpleNamespace(task_context={})
+    adapter = _adapter()
+    result = _run(
+        adapter._recover_workspace_artifacts(
+            _Client(), "sess", attempt, task, overwrite_existing_files=False
+        )
+    )
+
+    # 四个记账字段恒存在（需求 6.2）
+    for key in ("truncated_at", "total_listed", "priority_downloaded", "priority_missing"):
+        assert key in result, key
+    assert "error" not in result, result.get("error")
+    # 优先阶段已落地的文件不该被 BFS 再拉一遍
+    assert result["downloaded"].count("out.md") == 1
