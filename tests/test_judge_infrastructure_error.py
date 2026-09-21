@@ -1,0 +1,82 @@
+"""判分设施故障不得被记成 agent 的 0 分。
+
+2026-09-18 横评：109 个 attempt 因 "Blade judge 未配置" 拿到
+score=0 / failure_kind=NULL / scoring_status=completed，跨全部 7 个 agent
+（opencode 42 / kimi 41 / dsh 41 / codex 41 / cc 35 / BA 35 / mimo 24）。
+env scorer 在 judge 起不来时仍返回一行 value=0 的维度，平台照单全收，
+于是一次配置事故被写成了能力结论——这正是 octagon 要防的那类误读。
+"""
+
+from __future__ import annotations
+
+from backend.evaluator import judge_infrastructure_error
+
+
+def test_detects_unconfigured_judge() -> None:
+    """现场实际写入 scores.detail 的那句话必须被认出来。"""
+    scores = [
+        {
+            "dimension": "official_rubric_judge",
+            "value": 0,
+            "detail": "Blade judge 未配置；请设置 octagon.yaml 的 llm_judge 或 "
+            "LLM_JUDGE_* 环境变量",
+        }
+    ]
+    assert judge_infrastructure_error(scores) is not None
+
+
+def test_detects_the_other_env_wordings() -> None:
+    """各 env 的 judge_local.py 措辞不同，都要认。"""
+    for detail in (
+        "Blade LLM judge 未配置；请设置 octagon.yaml 的 blade/llm_judge 或 "
+        "DOCUMENT_REVIEW_FORMATTING_PRODUCT_JUDGE_* 环境变量",
+        "Blade judge 未配置；请设置 octagon.yaml 的 presentbench.judge 或 "
+        "PRESENTBENCH_JUDGE_* 环境变量",
+        "judge 调用失败: connection refused",
+    ):
+        assert judge_infrastructure_error([
+            {"dimension": "d", "value": 0, "detail": detail}
+        ]) is not None, detail
+
+
+def test_real_zero_is_not_an_infrastructure_error() -> None:
+    """agent 真的没交付就是真的 0 分，不能被这条逻辑洗白。
+
+    这是本检测最重要的边界：判太松会把真实的差表现藏起来，
+    那比原来的问题更糟——原来只是冤枉 agent，这样会替 agent 掩盖。
+    """
+    for detail in (
+        "no source file changed",
+        "产物未回收",
+        "交付物缺失：未找到 xlsx",
+        "rubric judge 给出 0 分：完全没有完成任务要求",
+        "",
+    ):
+        assert judge_infrastructure_error([
+            {"dimension": "d", "value": 0, "detail": detail}
+        ]) is None, detail
+
+
+def test_nonzero_score_is_never_infrastructure() -> None:
+    """judge 跑起来了并给了分，就不是设施问题——哪怕 detail 里提到 judge。"""
+    scores = [
+        {"dimension": "d", "value": 72, "detail": "judge 未配置时的兜底说明文本"}
+    ]
+    assert judge_infrastructure_error(scores) is None
+
+
+def test_scans_all_dimensions() -> None:
+    """多维度时任一维命中即算——judge 通常只喂其中一维。"""
+    scores = [
+        {"dimension": "format", "value": 80, "detail": "ok"},
+        {"dimension": "official_rubric_judge", "value": 0, "detail": "Blade judge 未配置"},
+    ]
+    assert judge_infrastructure_error(scores) is not None
+
+
+def test_empty_and_malformed_input() -> None:
+    assert judge_infrastructure_error([]) is None
+    assert judge_infrastructure_error([{"dimension": "d"}]) is None
+    assert judge_infrastructure_error([{"value": "x", "detail": None}]) is None
+    # detail 不是字符串也不能炸
+    assert judge_infrastructure_error([{"value": 0, "detail": {"a": 1}}]) is None

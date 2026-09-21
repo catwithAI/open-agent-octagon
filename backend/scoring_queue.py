@@ -364,7 +364,11 @@ async def _execute_job(
             from .input_snapshots import resolve_attempt_input
             from .run_dispatch import _resolve_scorer, _refresh_run_status
             from .runner import _row_to_task_dict, _write_security_columns_sync
-            from .evaluator import ScorerUnavailableError, evaluate
+            from .evaluator import (
+                ScorerUnavailableError,
+                evaluate,
+                judge_infrastructure_error,
+            )
             scorer = _resolve_scorer(env)
             if scorer is None:
                 raise ScorerUnavailableError(f"env {attempt['env_name']} missing scorer")
@@ -447,6 +451,27 @@ async def _execute_job(
                 config.get("security_meta") or {},
                 outcome.security,
             )
+            # judge 自身没跑起来时，env scorer 仍会返回一行 value=0 的维度。
+            # 照单收下就等于把一次判分设施故障写成「agent 得了 0 分」——
+            # 2026-09-18 横评里 109 个 attempt 正是这样被记成
+            # score=0 / failure_kind=NULL，跨全部 7 个 agent。
+            # 走既有的 scoring 失败路径：score_total 保持 NULL（绝不写业务
+            # 0 分），failure_kind='scoring'，顶层 status 保留执行结论。
+            judge_error = judge_infrastructure_error(outcome.scores)
+            if judge_error is not None:
+                logger.error(
+                    "attempt %s 判分设施未就绪，不记 0 分：%s", attempt_id, judge_error
+                )
+                await asyncio.to_thread(
+                    _finish_failure,
+                    state.db_path,
+                    job_id,
+                    status="scoring_failed",
+                    code="judge_unavailable",
+                    message=judge_error[:500],
+                )
+                return
+
             from .experiments.scoring import commit_scoring_result
 
             final_status = "completed" if outcome.passed else "gave_up"
