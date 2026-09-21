@@ -20,6 +20,7 @@ from backend.scoring_snapshot import (
     _snapshot_hash,
     create_scoring_snapshot,
     materialize_scoring_input,
+    verify_scoring_snapshot,
 )
 
 
@@ -231,3 +232,53 @@ def test_archiving_after_a_snapshot_actually_frees_space(tmp_path: Path) -> None
     freed_mb = (before - _kb()) / 1024
 
     assert freed_mb > 2.0, f"归档只释放了 {freed_mb:.2f} MB —— 快照大概率还链着这些 inode"
+
+
+def test_file_still_being_written_does_not_corrupt_the_snapshot(tmp_path: Path) -> None:
+    """建快照后仍被写入的文件，不得让快照哈希漂移。
+
+    2026-09-21 生产事故：wire capture 在 attempt 结束后异步 finalize，
+    `wire-sources/capture-events.jsonl.partial` 在建完快照后继续增长
+    （2712 → 3608 字节）。硬链接让这些写入**穿透进快照**，判分前的
+    verify 报 scoring_input_mismatch，**7 个 attempt 全部判分失败**。
+    """
+    data_path = tmp_path / "data"
+    attempt = _build_attempt(data_path)
+    partial = attempt / "wire-sources" / "capture-events.jsonl.partial"
+    partial.parent.mkdir(parents=True)
+    partial.write_text('{"e":1}\n')
+
+    snapshot = create_scoring_snapshot(data_path=data_path, attempt_id="att_test0001")
+
+    # 快照建好之后，平台后处理继续往源文件追加。
+    with partial.open("a") as stream:
+        stream.write('{"e":2}\n{"e":3}\n')
+
+    # 快照必须纹丝不动 —— 这正是 verify_scoring_snapshot 的前提。
+    verify_scoring_snapshot(
+        data_path=data_path,
+        snapshot_ref=snapshot.relative_path,
+        attempt_id="att_test0001",
+        expected_hash=snapshot.input_hash,
+    )
+    snap_partial = (
+        data_path / snapshot.relative_path / "attempt"
+        / "wire-sources" / "capture-events.jsonl.partial"
+    )
+    assert snap_partial.read_text() == '{"e":1}\n'
+    # 不共享 inode = 源怎么写都透不进来
+    assert os.stat(snap_partial).st_ino != os.stat(partial).st_ino
+
+
+def test_normal_files_still_use_hardlinks(tmp_path: Path) -> None:
+    """解链只针对仍在变动的文件，普通产物必须仍走硬链接（否则省不下 32G）。"""
+    data_path = tmp_path / "data"
+    attempt = _build_attempt(data_path)
+    snapshot = create_scoring_snapshot(data_path=data_path, attempt_id="att_test0001")
+
+    src = attempt / "skill_workspace" / "src" / "main.py"
+    snap = (
+        data_path / snapshot.relative_path / "attempt"
+        / "skill_workspace" / "src" / "main.py"
+    )
+    assert os.stat(src).st_ino == os.stat(snap).st_ino
