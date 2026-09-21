@@ -154,15 +154,34 @@ class SandboxSection(BaseModel):
     server_side_tools: Literal["allow", "deny"] = "allow"
     # 按 agent 覆盖限额。不允许按 agent 换镜像。
     agents: dict[str, SandboxAgentOverride] = Field(default_factory=dict)
-    # 家目录里「可重建」的子目录：LibreOffice 运行时、apt 缓存、字体等。
-    # 它们由 agent 在运行时写入，每个 attempt 一份、内容几乎相同——330 个
-    # attempt 曾因此攒下 33G。挂成容器可写层（匿名卷）或 tmpfs，容器销毁即
-    # 释放，不再穿透 bind mount 落到 attempt 目录。
+    # 家目录里「可重建」的子目录：agent CLI 的包缓存、插件、运行时配置。
+    # 它们由 agent 在运行时写入，每个 attempt 一份、内容几乎相同。挂成容器
+    # 可写层（匿名卷）或 tmpfs，容器销毁即释放，不再穿透 bind mount 落到
+    # attempt 目录。
+    #
+    # 这份默认值来自 2026-09-21 在评测机上对 330 个 attempt、32.8G
+    # `sandbox_home` 的实测（不是推测）：
+    #   .local 7.95G、.npm 5.77G（_cacache）、config 5.35G（node_modules）、
+    #   .config 5.35G、.tmp 3.95G（plugins）、.cache 2.43G。
+    # spec 原列的 lo/loroot/sysroot/apt/fonts 合计仅 1.1G（3%）——镜像里
+    # 根本没装 LibreOffice；保留它们只作无害兜底。
+    #
+    # **`.config` 与 `.claude` 刻意不在列**：沙盒模式下 `host_home()` 返回的
+    # 就是 `sandbox_home`，adapter 在**容器启动前**把 agent 配置写进
+    # `sandbox_home/.config`（opencode 的 XDG_CONFIG_HOME）与
+    # `sandbox_home/.claude`（CLAUDE_CONFIG_DIR）。盖住它们 = agent 读不到
+    # 自己的配置。省 5.35G 换 agent 起不来，不划算。
+    # `.local` 收录：实测 6.28G 是 lib（运行期装的 Python 包）、1.66G 是
+    # share（mamba/mimocode），bin 全空——都是容器内重建即得的东西。
     ephemeral_home_dirs: list[str] = Field(
-        default_factory=lambda: ["lo", "loroot", "sysroot", "apt", "fonts", ".cache"]
+        default_factory=lambda: [
+            ".local", ".npm", ".cache", ".tmp", "config",
+            "lo", "loroot", "sysroot", "apt", "fonts", ".fonts",
+        ]
     )
     # 其中用 tmpfs（走内存）的子集。评测机内存有限（14G / 并发 6），
     # 只有小而热的缓存值得放内存，其余走匿名卷落 docker 存储层。
+    # 注意 .npm/.local 单个 attempt 可到近 1G，**不能**放 tmpfs。
     tmpfs_home_dirs: list[str] = Field(default_factory=lambda: ["apt", ".cache"])
     # 单个 tmpfs 的上限。并发 6 时最坏占用 = 该值 × tmpfs 目录数 × 并发数，
     # 必须留足余量，别把评测机的内存打爆。
