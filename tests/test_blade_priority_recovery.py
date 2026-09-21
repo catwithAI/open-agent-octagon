@@ -213,3 +213,25 @@ def test_dot_prefixed_paths_get_usable_candidates() -> None:
     assert not any(c.startswith("hidden/") for c in candidates)
     # `./` 前缀仍应被正常剥掉
     assert _candidate_remote_paths("./a/b.py")[0] == "a/b.py"
+
+
+def test_project_workspace_prefix_wins(tmp_path: Path) -> None:
+    """software_factory：项目工作区绝对路径必须排在最前。
+
+    agent 的 cwd 是 /root/projects/<id>，而 session 文件接口的 "." 指向
+    另一份带基线物料的目录 —— 两边都有 repo/…，但只有前者带 agent 的改动。
+    顺序错了就会稳定拉回基线（2026-09-14 现场结论）。
+    """
+    candidates = _candidate_remote_paths(
+        "repo/django/utils/numberformat.py",
+        project_workspace="/root/projects/abc123",
+    )
+    assert candidates[0] == "/root/projects/abc123/repo/django/utils/numberformat.py"
+    # 相对路径仍作为兜底保留
+    assert "repo/django/utils/numberformat.py" in candidates
+
+
+def test_project_workspace_is_optional() -> None:
+    """非 software_factory 场景没有这个字段，行为不变。"""
+    assert _candidate_remote_paths("a.py")[0] == "a.py"
+    assert _candidate_remote_paths("a.py", project_workspace="")[0] == "a.py"
