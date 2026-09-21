@@ -169,14 +169,21 @@ class SandboxSection(BaseModel):
     # **凡是 adapter 在容器启动前写过的目录，一律不能收**：沙盒模式下
     # `host_home()` 返回的就是 `sandbox_home`，那些文件写在宿主机侧，一旦被
     # 匿名卷盖住，agent 启动时读到的是空目录。实测确认必须排除：
-    #   `.config`  opencode 的 XDG_CONFIG_HOME
-    #   `.claude`  claude-code 的 CLAUDE_CONFIG_DIR
-    #   `config`   opencode/kimi/mimo 的 provider 配置——含 API key 与模型
-    #              路由，由 `_write_config` 在宿主机侧生成（盖住＝agent 拿不到
-    #              凭据，直接跑不起来）
-    #   `.local`   opencode 的 XDG_DATA_HOME / XDG_STATE_HOME 指向
-    #              `.local/share` 与 `.local/state`
-    # 这四项合计约 18G 放弃不收。换的是「agent 能不能起来」，不能省。
+    #   `.claude`       claude-code 的 CLAUDE_CONFIG_DIR（宿主机 mkdir + 写
+    #                   settings.json）
+    #   `config`        opencode/kimi/mimo 的 <PREFIX>_CONFIG_DIR（宿主机 mkdir）
+    #   `.config`       opencode 的 XDG_CONFIG_HOME
+    #   `.local`        opencode 的 XDG_DATA_HOME / XDG_STATE_HOME
+    #   `.dsh`          dsh 的 DSH_HOME（宿主机 mkdir）
+    #   `.agents`       dsh 的 DSH_AGENTS_HOME（宿主机 mkdir）
+    #   `dsh_sessions`  dsh 的 DSH_SESSION_ROOT——**会话 jsonl 证据**，盖住就
+    #                   随容器一起销毁，后端再也读不到
+    # 合计约 18G 放弃不收。换的是「agent 能不能起来 / 证据在不在」，不能省。
+    #
+    # 注意沙盒模式下 `host_home()` **忽略**传入的 `.xxx-iso-home` 默认值、
+    # 一律返回 sandbox_home 本身，所以上面这些路径就落在家目录第一层；
+    # kimi 的 `config.toml`/`mcp.json` 甚至直接落在家目录根上（含 API key），
+    # 这也是 `/home/agent` 本身绝不能挂 tmpfs 的原因。
     #
     # 剩下的 `.npm`/`.cache`/`.tmp` 是纯运行期缓存（_cacache、插件），
     # 没有任何 adapter 预写，实测合计约 12G，可安全挡在 bind mount 之外。
@@ -187,9 +194,13 @@ class SandboxSection(BaseModel):
         ]
     )
     # 其中用 tmpfs（走内存）的子集。评测机内存有限（14G / 并发 6），
-    # 只有小而热的缓存值得放内存，其余走匿名卷落 docker 存储层。
-    # 注意 .npm 单个 attempt 可到近 100M，**不能**放 tmpfs。
-    tmpfs_home_dirs: list[str] = Field(default_factory=lambda: ["apt", ".cache"])
+    # 只有**确定很小**的目录才值得放内存，其余走匿名卷落 docker 存储层。
+    #
+    # `.cache` 曾在这里，已移出：实测 presentbench 场景下 mimo-code /
+    # claude-code 会把 ms-playwright 的浏览器二进制（658MB）下到 `.cache`，
+    # 512m tmpfs 直接 ENOSPC，而且并发 6 时要吃掉 4G 内存。
+    # `.npm` 同理（_cacache 可到近 100M）。两者都走匿名卷。
+    tmpfs_home_dirs: list[str] = Field(default_factory=lambda: ["apt"])
     # 单个 tmpfs 的上限。并发 6 时最坏占用 = 该值 × tmpfs 目录数 × 并发数，
     # 必须留足余量，别把评测机的内存打爆。
     tmpfs_size: str = "512m"

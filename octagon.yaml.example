@@ -287,7 +287,9 @@ sandbox:
   # .config / .claude / config / .local 刻意不在列——adapter 在容器启动前
   # 把 provider 配置与凭据写在那里，盖住会让 agent 直接跑不起来。
   ephemeral_home_dirs: [.npm, .cache, .tmp, lo, loroot, sysroot, apt, fonts, .fonts]
-  # 其中走内存的子集；其余落 docker 存储层。评测机内存有限，别放太多。
-  tmpfs_home_dirs: [apt, .cache]
+  # 其中走内存的子集；其余落 docker 存储层。只放**确定很小**的目录：
+  # .cache 里 presentbench 会下 658MB 的 ms-playwright 浏览器，放 tmpfs 会
+  # ENOSPC 且并发 6 时吃 4G 内存，必须走匿名卷。
+  tmpfs_home_dirs: [apt]
   # 单个 tmpfs 的上限。最坏占用 = 该值 × tmpfs 目录数 × 并发数。
   tmpfs_size: 512m

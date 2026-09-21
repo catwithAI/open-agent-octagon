@@ -138,8 +138,11 @@ def test_ephemeral_home_dirs_stay_off_the_bind_mount(tmp_path: Path) -> None:
     # provider 配置/凭据，直接跑不起来（见 test_adapter_written_dirs_...）。
     for name in (".config", ".claude", "config", ".local"):
         assert f"{HOME_MOUNT}/{name}" not in anonymous
-    for name in ("apt", ".cache"):
-        assert f"{HOME_MOUNT}/{name}:rw,size=512m" in tmpfs
+    assert f"{HOME_MOUNT}/apt:rw,size=512m" in tmpfs
+    # `.cache` 必须走匿名卷而不是 tmpfs：presentbench 下 ms-playwright 的
+    # 浏览器二进制有 658MB，512m tmpfs 会 ENOSPC，并发 6 还要吃 4G 内存。
+    assert f"{HOME_MOUNT}/.cache" in anonymous
+    assert f"{HOME_MOUNT}/.cache" not in tmpfs
     assert str(tmp_path / "h") not in tmpfs
 
 
@@ -564,12 +567,21 @@ def test_adapter_written_dirs_are_never_ephemeral() -> None:
     侧；被匿名卷盖住后 agent 启动时读到的是空目录 —— provider 配置、API key、
     模型路由全部消失，agent 直接跑不起来。
 
-    对照 adapter 里的实际写入点：
-      opencode_family: XDG_CONFIG_HOME=.config, XDG_DATA_HOME=.local/share,
-                       XDG_STATE_HOME=.local/state, iso_config_dir=config
-      claude_code:     CLAUDE_CONFIG_DIR=.claude
+    对照 adapter 里的实际写入点（沙盒模式下 host_home() 忽略传入的
+    `.xxx-iso-home`，一律返回 sandbox_home 本身，所以这些路径就落在家目录一级）：
+      claude_code.py:212/219   .claude            CLAUDE_CONFIG_DIR（宿主机 mkdir + 写 settings.json）
+      opencode_family.py:430   config             <PREFIX>_CONFIG_DIR（宿主机 mkdir）
+      opencode_family.py:434   .config            XDG_CONFIG_HOME
+      opencode_family.py:435/437 .local           XDG_DATA_HOME / XDG_STATE_HOME
+      dsh.py:591               .dsh               DSH_HOME（宿主机 mkdir）
+      dsh.py:591               .agents            DSH_AGENTS_HOME（宿主机 mkdir）
+      dsh.py:591               dsh_sessions       DSH_SESSION_ROOT——**会话 jsonl 证据**，
+                                                  盖住就随容器销毁，后端再也读不到
     """
-    forbidden = {".config", ".claude", "config", ".local"}
+    forbidden = {
+        ".config", ".claude", "config", ".local",
+        ".dsh", ".agents", "dsh_sessions",
+    }
     defaults = set(Settings().sandbox.ephemeral_home_dirs)
     leaked = forbidden & defaults
     assert not leaked, (
