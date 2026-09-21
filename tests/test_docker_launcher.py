@@ -131,9 +131,13 @@ def test_ephemeral_home_dirs_stay_off_the_bind_mount(tmp_path: Path) -> None:
 
     anonymous = set(_mount_targets(argv, "-v"))
     tmpfs = " ".join(_mount_targets(argv, "--tmpfs"))
-    # 默认六项全部被挡住，且没有一项带宿主机路径。
-    for name in ("lo", "loroot", "sysroot", "fonts"):
+    # 实测占大头的几项必须被挡住，且没有一项带宿主机路径。
+    for name in (".local", ".npm", ".tmp", "config", "lo", "loroot", "sysroot", "fonts"):
         assert f"{HOME_MOUNT}/{name}" in anonymous
+    # `.config` / `.claude` 刻意不挡：adapter 在容器启动前把 agent 配置写在
+    # 那里（XDG_CONFIG_HOME / CLAUDE_CONFIG_DIR），盖住会让 agent 读不到配置。
+    assert f"{HOME_MOUNT}/.config" not in anonymous
+    assert f"{HOME_MOUNT}/.claude" not in anonymous
     for name in ("apt", ".cache"):
         assert f"{HOME_MOUNT}/{name}:rw,size=512m" in tmpfs
     assert str(tmp_path / "h") not in tmpfs

@@ -144,3 +144,63 @@ materialize 之后会把工作副本 chmod 成 0644 供 legacy scorer 原地改�
 
 最终实测（10 个 attempt × 3MB 运行时）：建快照新增 **0 MB**（旧实现翻倍），
 归档后 30.2 MB → 1.6 MB，**净降 94.7%**。
+
+## 评测机 49 实测验证（2026-09-21）
+
+在 49 上用独立 worktree（`/tmp/octagon-verify`，不动线上工作树）验证，
+**推翻了 spec 的两处事实前提**：
+
+### ① BA 的低分不是产物回收失败，是 judge 没配置
+
+`att_2e47cfa79012` 的真实数据：路径提取 **2 → 9 个**（含真正的交付物
+`Aurisic_Prepaid_Amortization_Schedule_2025.xlsx`），需求 4.3 达标。
+但这个 attempt 的产物**本来就拉回来了**（xlsx 有 3 sheet / 80 单元格），
+0 分的实际原因是：
+
+    official_rubric_judge  0  "Blade judge 未配置；请设置 octagon.yaml 的
+                               llm_judge 或 LLM_JUDGE_* 环境变量"
+
+同场景下 claude-code / codex / kimi-code / opencode / mimo-code **也都是
+gave_up 0 分**；全横评因该原因判 0 的 score 行共 **259 条，跨全部 7 个
+agent**（opencode 42、kimi 41、dsh 41、codex 41、cc 35、**BA 35**、mimo 24）。
+BA 在其中属中游，不是异常值。
+
+→ **spec「BA 27 个 attempt 低分 = 产物回收失败」的归因不成立**。真正要修的是
+judge 配置（`~/restart-octagon.sh` 已 export `LLM_JUDGE_MODEL`，但该批 run
+跑在改动之前）。本 PR 的回收改进仍有价值（提取数 2→9、下载校验、四字段记账），
+但**不要指望它把 BA 的分数拉起来**。
+
+### ② `sandbox_home` 的 33G 不是 LibreOffice
+
+镜像 `octagon-agent-runtime:20260914` 里**根本没装 LibreOffice**
+（`soffice: not found`；office 场景用 python-pptx/openpyxl/docx）。
+330 个 attempt、32.8G 的真实构成：
+
+| 目录 | 实测 | spec 是否列入 |
+|---|---|---|
+| `.local`（lib 6.28G + share 1.66G） | 7.95G | ✗ |
+| `.npm`（_cacache） | 5.77G | ✗ |
+| `config`（node_modules） | 5.35G | ✗ |
+| `.config`（opencode） | 5.35G | ✗ |
+| `.tmp`（plugins） | 3.95G | ✗ |
+| `.cache` | 2.43G | ✓ |
+| `loroot`+`lo`+`sysroot`+`apt`+`fonts` | **1.1G** | ✓ |
+
+spec 的清单只覆盖 **3.5G / 11%**。已按实测改为
+`.local/.npm/.cache/.tmp/config` + 原五项兜底 → 覆盖 **27.0G / 82%**。
+
+**`.config` 与 `.claude` 刻意不收**（放弃 5.35G）：沙盒模式下
+`host_home()` 返回的就是 `sandbox_home`，adapter 在**容器启动前**把配置写进
+`sandbox_home/.config`（opencode 的 XDG_CONFIG_HOME）与 `sandbox_home/.claude`
+（CLAUDE_CONFIG_DIR）；盖住它们 agent 就读不到自己的配置。
+
+### ③ 部署阻塞项已在生产镜像上复现并验证修复
+
+`octagon-agent-runtime:20260914` + 匿名卷 + 非 root uid →
+`lo/loroot/sysroot/fonts` **全部 NOT WRITABLE**；加一层预建 0777 后全部
+WRITABLE。**上线前必须重建镜像**这条已从推断升级为实测。
+
+### 其它
+
+- 49 上（Linux）跑全量测试：**89 passed, 1 skipped**，与 macOS 一致。
+- 路径提取性能：13MB events.jsonl 0.2s。
