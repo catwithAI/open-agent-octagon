@@ -212,7 +212,7 @@ def _digest_of(path: Path) -> str | None:
         return None
 
 
-def _candidate_remote_paths(rel: str) -> list[str]:
+def _candidate_remote_paths(rel: str, *, project_workspace: str = "") -> list[str]:
     """一个相对路径在远端可能的几种写法，按可能性排序。"""
     # `lstrip("./")` 按字符集剥，会把 `.hidden/report.md` 削成
     # `hidden/report.md`，每个候选前缀都指向不存在的路径。
@@ -220,6 +220,11 @@ def _candidate_remote_paths(rel: str) -> list[str]:
     while clean.startswith("./"):
         clean = clean[2:]
     seen: dict[str, None] = {}
+    # software_factory 场景：agent 的 cwd 是项目工作区绝对路径，而文件接口的
+    # "." 指向另一份带基线物料的目录——两边都有 repo/…，只有前者带 agent 的
+    # 改动。所以它必须排在最前（2026-09-14 现场结论）。
+    if project_workspace:
+        seen.setdefault(f"{project_workspace.rstrip('/')}/{clean}", None)
     for prefix in _REMOTE_PATH_PREFIXES:
         seen.setdefault(f"{prefix}{clean}", None)
     # 只剩文件名的写法：agent 在工作区根上直接写文件的常见情形。
@@ -2701,6 +2706,7 @@ class BladeServiceAdapter:
         download_root: Path,
         baseline_root: Path,
         errors: list[str],
+        project_workspace: str = "",
     ) -> tuple[list[str], list[str]]:
         """定向下载 agent 编辑过的路径，并校验落地内容确实变了。
 
@@ -2719,7 +2725,9 @@ class BladeServiceAdapter:
             # 文件不存在时为 None：那时任何内容都算命中（本来就没有）。
             baseline = _digest_of(baseline_root / rel)
             landed = False
-            for candidate in _candidate_remote_paths(rel):
+            for candidate in _candidate_remote_paths(
+                rel, project_workspace=project_workspace
+            ):
                 try:
                     content = await client.download_file(session_id, candidate)
                 except Exception:
