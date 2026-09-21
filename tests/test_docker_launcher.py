@@ -537,3 +537,21 @@ def test_ephemeral_home_dirs_are_writable_by_a_non_root_agent(tmp_path: Path) ->
     assert "ALL_WRITABLE" in done.stdout, (
         f"ephemeral 目录在非 root uid 下不可写；stdout={done.stdout!r} stderr={done.stderr!r}"
     )
+
+
+def test_dockerfile_precreates_every_ephemeral_dir() -> None:
+    """镜像必须预建 `ephemeral_home_dirs` 里的每一项。
+
+    匿名卷的属主/权限继承镜像里该路径的目录；镜像里没有就是 root:root 0755，
+    而容器以宿主机 uid 跑 —— agent 写不进去，该 agent 直接跑不起来。
+    这条把「Dockerfile 与配置默认值必须同步」变成测试，而不是注释里的约定。
+    """
+    dockerfile = (
+        Path(__file__).resolve().parent.parent / "docker" / "agent-runtime" / "Dockerfile"
+    ).read_text(encoding="utf-8")
+    defaults = Settings().sandbox.ephemeral_home_dirs
+    assert defaults, "默认清单不该为空"
+    missing = [d for d in defaults if f"/home/agent/{d}" not in dockerfile]
+    assert not missing, (
+        f"这些 ephemeral 目录没在 Dockerfile 里预建，匿名卷会不可写：{missing}"
+    )
