@@ -19,6 +19,22 @@
 | `blade.keep_blade_session` | **false** | 排查 BA 时临时开 true（能看到它的项目目录），**查完必须改回**，否则 session 无限累积 |
 | `octagon.research_capture_max_policy` | **parsed** | wire 采集详细度。磁盘吃紧时降到 `metadata` |
 | `llm_judge.model` | `deepseek-4.1-flash` | 换判分模型 |
+| `octagon.scoring_deadline_seconds` | **960** | 见下方「判分超时」 |
+
+### ⚠️ 判分超时：两个超时值必须对齐
+
+`octagon.scoring_deadline_seconds`（平台杀评分）与 `llm_judge.timeout`（judge 自己放弃）
+是**两个独立的超时**，配反了会丢分数：
+
+- 默认 `scoring_deadline_seconds=300`，而 `llm_judge.timeout=900`
+- → judge 还有 600s 额度没用完，平台先把评分杀了
+- → 记 `scoring_deadline_exceeded`，`score_total` 保持 NULL，**这个 attempt 的分数就此丢失**
+
+实测 `gdpval-prepaid` 的判分最长 **301s**（均 41s），正好卡在 300s 上。
+已显式设成 **960**（> judge 的 900），让 judge 自己的超时先生效——
+那样至少能拿到一个明确原因，而不是被平台无差别掐断。
+
+改完要重启才生效（deadline 在 job 执行时从 `state.settings` 读）。
 
 其余小节（`insights` / `cost` / `research_features` 等）跑横评时不用动。
 
