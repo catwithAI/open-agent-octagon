@@ -80,3 +80,60 @@ def test_empty_and_malformed_input() -> None:
     assert judge_infrastructure_error([{"value": "x", "detail": None}]) is None
     # detail 不是字符串也不能炸
     assert judge_infrastructure_error([{"value": 0, "detail": {"a": 1}}]) is None
+
+
+def test_judge_failure_never_writes_a_business_zero(tmp_path) -> None:
+    """落库效果：judge 挂掉的 attempt 分数保持 NULL，不是 0。
+
+    这是整条链路的要害——只要写进去一个 0，它就再也无法与「agent 真的
+    得了 0 分」区分，聚合、矩阵、BA 点评全被污染。
+    """
+    import asyncio
+    import sqlite3
+
+    from backend.db import init_db
+    from backend.scoring_queue import _finish_failure
+
+    db = tmp_path / "octagon.db"
+    asyncio.run(init_db(db))
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "INSERT INTO tasks (id,env_name,prompt,created_at) VALUES ('t','e','p','x')"
+        )
+        conn.execute(
+            "INSERT INTO runs (id,task_id,env_name,status,created_at)"
+            " VALUES ('r','t','e','running','x')"
+        )
+        conn.execute(
+            "INSERT INTO attempts (id,run_id,task_id,env_name,status,execution_status,"
+            "scoring_status,env_session_id,env_token_hash,created_at,score_total)"
+            " VALUES ('a','r','t','e','scoring','completed','running','s','h','x',NULL)"
+        )
+        conn.execute(
+            "INSERT INTO scoring_jobs (id,attempt_id,status,scorer_version,"
+            "scorer_config_json,input_hash,created_at)"
+            " VALUES ('j','a','running','v','{}','h','x')"
+        )
+        conn.commit()
+
+    _finish_failure(
+        db,
+        "j",
+        status="scoring_failed",
+        code="judge_unavailable",
+        message="Blade judge 未配置；请设置 octagon.yaml 的 llm_judge",
+    )
+
+    with sqlite3.connect(db) as conn:
+        status, score, kind, scoring_status, code, execution = conn.execute(
+            "SELECT status,score_total,failure_kind,scoring_status,scoring_error_code,"
+            "execution_status FROM attempts WHERE id='a'"
+        ).fetchone()
+
+    assert score is None, "判分设施故障被写成了业务 0 分"
+    assert kind == "scoring"
+    assert scoring_status == "scoring_failed"
+    assert code == "judge_unavailable"
+    # agent 干完了活、产出可评，只是 judge 没跑成——顶层状态保留执行结论。
+    assert status == "completed"
+    assert execution == "completed"
