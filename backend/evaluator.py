@@ -165,6 +165,15 @@ _JUDGE_INFRA_MARKERS = (
     "judge response parse",
     "parse/validation failed",
     "missing rubric item",
+    # judge 的 HTTP 调用失败：上游 5xx / 网关错误 / 连接问题。
+    # 2026-09-21 实测 `Blade judge failed: Server error '502 Bad Gateway'`
+    # —— 网关抖一下，agent 就背一个 0 分。
+    "judge failed:",
+    "server error",
+    "bad gateway",
+    "service unavailable",
+    "gateway timeout",
+    "connection error",
 )
 
 

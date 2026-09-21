@@ -57,6 +57,22 @@ def test_detects_judge_that_returned_an_invalid_verdict() -> None:
         ]) is not None, detail
 
 
+def test_detects_judge_http_failures() -> None:
+    """judge 的 HTTP 调用失败（上游 5xx / 网关抖动）同样不是 agent 的锅。
+
+    2026-09-21 实测：`Blade judge failed: Server error '502 Bad Gateway'`
+    —— 网关抖一下，codex 就背一个 0 分。
+    """
+    for detail in (
+        "Blade judge failed: Server error '502 Bad Gateway' for url 'https://agent...'",
+        "Blade judge failed: Service Unavailable",
+        "judge failed: connection error",
+    ):
+        assert judge_infrastructure_error([
+            {"dimension": "official_rubric_judge", "value": 0, "detail": detail}
+        ]) is not None, detail
+
+
 def test_real_zero_is_not_an_infrastructure_error() -> None:
     """agent 真的没交付就是真的 0 分，不能被这条逻辑洗白。
 
