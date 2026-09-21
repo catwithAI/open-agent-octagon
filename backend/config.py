@@ -166,22 +166,29 @@ class SandboxSection(BaseModel):
     # spec 原列的 lo/loroot/sysroot/apt/fonts 合计仅 1.1G（3%）——镜像里
     # 根本没装 LibreOffice；保留它们只作无害兜底。
     #
-    # **`.config` 与 `.claude` 刻意不在列**：沙盒模式下 `host_home()` 返回的
-    # 就是 `sandbox_home`，adapter 在**容器启动前**把 agent 配置写进
-    # `sandbox_home/.config`（opencode 的 XDG_CONFIG_HOME）与
-    # `sandbox_home/.claude`（CLAUDE_CONFIG_DIR）。盖住它们 = agent 读不到
-    # 自己的配置。省 5.35G 换 agent 起不来，不划算。
-    # `.local` 收录：实测 6.28G 是 lib（运行期装的 Python 包）、1.66G 是
-    # share（mamba/mimocode），bin 全空——都是容器内重建即得的东西。
+    # **凡是 adapter 在容器启动前写过的目录，一律不能收**：沙盒模式下
+    # `host_home()` 返回的就是 `sandbox_home`，那些文件写在宿主机侧，一旦被
+    # 匿名卷盖住，agent 启动时读到的是空目录。实测确认必须排除：
+    #   `.config`  opencode 的 XDG_CONFIG_HOME
+    #   `.claude`  claude-code 的 CLAUDE_CONFIG_DIR
+    #   `config`   opencode/kimi/mimo 的 provider 配置——含 API key 与模型
+    #              路由，由 `_write_config` 在宿主机侧生成（盖住＝agent 拿不到
+    #              凭据，直接跑不起来）
+    #   `.local`   opencode 的 XDG_DATA_HOME / XDG_STATE_HOME 指向
+    #              `.local/share` 与 `.local/state`
+    # 这四项合计约 18G 放弃不收。换的是「agent 能不能起来」，不能省。
+    #
+    # 剩下的 `.npm`/`.cache`/`.tmp` 是纯运行期缓存（_cacache、插件），
+    # 没有任何 adapter 预写，实测合计约 12G，可安全挡在 bind mount 之外。
     ephemeral_home_dirs: list[str] = Field(
         default_factory=lambda: [
-            ".local", ".npm", ".cache", ".tmp", "config",
+            ".npm", ".cache", ".tmp",
             "lo", "loroot", "sysroot", "apt", "fonts", ".fonts",
         ]
     )
     # 其中用 tmpfs（走内存）的子集。评测机内存有限（14G / 并发 6），
     # 只有小而热的缓存值得放内存，其余走匿名卷落 docker 存储层。
-    # 注意 .npm/.local 单个 attempt 可到近 1G，**不能**放 tmpfs。
+    # 注意 .npm 单个 attempt 可到近 100M，**不能**放 tmpfs。
     tmpfs_home_dirs: list[str] = Field(default_factory=lambda: ["apt", ".cache"])
     # 单个 tmpfs 的上限。并发 6 时最坏占用 = 该值 × tmpfs 目录数 × 并发数，
     # 必须留足余量，别把评测机的内存打爆。

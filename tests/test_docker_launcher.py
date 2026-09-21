@@ -131,13 +131,13 @@ def test_ephemeral_home_dirs_stay_off_the_bind_mount(tmp_path: Path) -> None:
 
     anonymous = set(_mount_targets(argv, "-v"))
     tmpfs = " ".join(_mount_targets(argv, "--tmpfs"))
-    # 实测占大头的几项必须被挡住，且没有一项带宿主机路径。
-    for name in (".local", ".npm", ".tmp", "config", "lo", "loroot", "sysroot", "fonts"):
+    # 纯运行期缓存必须被挡住，且没有一项带宿主机路径。
+    for name in (".npm", ".tmp", "lo", "loroot", "sysroot", "fonts"):
         assert f"{HOME_MOUNT}/{name}" in anonymous
-    # `.config` / `.claude` 刻意不挡：adapter 在容器启动前把 agent 配置写在
-    # 那里（XDG_CONFIG_HOME / CLAUDE_CONFIG_DIR），盖住会让 agent 读不到配置。
-    assert f"{HOME_MOUNT}/.config" not in anonymous
-    assert f"{HOME_MOUNT}/.claude" not in anonymous
+    # adapter 在容器启动前写过的目录一律不挡——盖住会让 agent 读不到自己的
+    # provider 配置/凭据，直接跑不起来（见 test_adapter_written_dirs_...）。
+    for name in (".config", ".claude", "config", ".local"):
+        assert f"{HOME_MOUNT}/{name}" not in anonymous
     for name in ("apt", ".cache"):
         assert f"{HOME_MOUNT}/{name}:rw,size=512m" in tmpfs
     assert str(tmp_path / "h") not in tmpfs
@@ -554,4 +554,24 @@ def test_dockerfile_precreates_every_ephemeral_dir() -> None:
     missing = [d for d in defaults if f"/home/agent/{d}" not in dockerfile]
     assert not missing, (
         f"这些 ephemeral 目录没在 Dockerfile 里预建，匿名卷会不可写：{missing}"
+    )
+
+
+def test_adapter_written_dirs_are_never_ephemeral() -> None:
+    """adapter 在容器启动前写过的家目录子目录，绝不能挂成匿名卷。
+
+    沙盒模式下 `host_home()` 返回的就是 `sandbox_home`，这些文件写在宿主机
+    侧；被匿名卷盖住后 agent 启动时读到的是空目录 —— provider 配置、API key、
+    模型路由全部消失，agent 直接跑不起来。
+
+    对照 adapter 里的实际写入点：
+      opencode_family: XDG_CONFIG_HOME=.config, XDG_DATA_HOME=.local/share,
+                       XDG_STATE_HOME=.local/state, iso_config_dir=config
+      claude_code:     CLAUDE_CONFIG_DIR=.claude
+    """
+    forbidden = {".config", ".claude", "config", ".local"}
+    defaults = set(Settings().sandbox.ephemeral_home_dirs)
+    leaked = forbidden & defaults
+    assert not leaked, (
+        f"这些目录被 adapter 在容器启动前写入，挂匿名卷会让 agent 读不到配置：{leaked}"
     )
