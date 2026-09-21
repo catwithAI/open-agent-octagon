@@ -94,7 +94,15 @@ def plan_archive(
     rows: dict[str, dict[str, Any]] = {}
     if Path(db_path).exists():
         with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
-            query = "SELECT id, run_id, status, archived_at FROM attempts"
+            # 归档列由 `_migrate_attempts_archive` 添加，但本工具是独立 CLI，
+            # 完全可能先于后端升级跑在旧库上（实测：评测机上就是这样）。
+            # 缺列时按「没有任何 attempt 归档过」处理，而不是崩掉——
+            # 运维工具的第一要求是在半升级状态下仍能给出正确答案。
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(attempts)")}
+            has_archived = "archived_at" in cols
+            select = "SELECT id, run_id, status"
+            select += ", archived_at" if has_archived else ", NULL"
+            query = f"{select} FROM attempts"
             params: tuple[Any, ...] = ()
             if run_id:
                 query += " WHERE run_id=?"
@@ -215,6 +223,12 @@ def _write_archive_markers(
 ) -> None:
     with sqlite3.connect(db_path, timeout=30) as conn:
         conn.execute("PRAGMA busy_timeout=30000")
+        # 旧库（后端还没升级）缺这两列：就地补上。它们是可空列，
+        # 与 `_migrate_attempts_archive` 等价，后端再跑迁移时是幂等的。
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(attempts)")}
+        for name in ("archived_at", "archived_kinds"):
+            if name not in cols:
+                conn.execute(f"ALTER TABLE attempts ADD COLUMN {name} TEXT")
         for attempt_id, kinds in removed_kinds.items():
             # 与既有归档记录合并：同一 attempt 可能分批归档不同类别。
             row = conn.execute(
