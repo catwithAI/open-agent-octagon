@@ -39,6 +39,10 @@ class AttemptSpec:
     run_id: str | None = None
     # agent 唯一可写目录；沙盒模式下同路径挂载。
     workspace: Path | None = None
+    # 场景级保留的家目录子目录（env meta.yaml 的 `sandbox.keep_home_dirs`）。
+    # 默认这些目录被挡在 bind mount 之外（可重建、不留证据）；确实要留作
+    # 证据的场景在这里指名。None = 用全局默认。
+    keep_home_dirs: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True)

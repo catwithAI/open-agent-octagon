@@ -766,6 +766,9 @@ def _finalize_no_score(
         "capture_infrastructure_failed",
         "model_integrity_failed",
         "sandbox_unavailable",
+        # 磁盘写满是评测机的资源问题，不是 agent 做得差——混进 agent 失败
+        # 会直接污染横评矩阵。
+        "disk_exhausted",
     }
     if status == "cancelled":
         failure_kind = "cancelled"

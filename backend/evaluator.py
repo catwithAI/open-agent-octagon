@@ -143,6 +143,45 @@ def _extract_meta(env: Any) -> tuple[int, dict[str, int]]:
     return pass_threshold, weights
 
 
+# judge 自身没跑起来时，env scorer 仍会返回一行 value=0 的维度，detail 里写着
+# 原因。平台若照单全收，这个 0 就与「agent 真的做得差」完全无法区分——
+# 2026-09-18 横评里 109 个 attempt 因此被记成 score=0 / failure_kind=NULL，
+# 跨全部 7 个 agent，把一次配置事故写成了能力结论。
+#
+# 判据取 detail 里的稳定短语：各 env 的 judge_local.py 措辞略有差异
+# （"Blade judge 未配置" / "Blade LLM judge 未配置"），但都含「judge」与
+# 「未配置」；另收 judge 调用本身失败的几种写法。
+_JUDGE_INFRA_MARKERS = (
+    "judge 未配置",
+    "judge not configured",
+    "judge 调用失败",
+    "judge request failed",
+)
+
+
+def judge_infrastructure_error(scores: list[dict[str, Any]]) -> str | None:
+    """判分链路自身没跑起来时返回原因，否则 None。
+
+    只认**明确指向 judge 基础设施**的 detail。agent 交付物为空、格式不对
+    之类仍是真实的低分，不在此列。
+    """
+    for row in scores:
+        detail = row.get("detail")
+        text = detail if isinstance(detail, str) else str(detail or "")
+        if not text:
+            continue
+        lowered = text.lower()
+        if any(marker in text or marker in lowered for marker in _JUDGE_INFRA_MARKERS):
+            try:
+                value = int(row.get("value", 0))
+            except (TypeError, ValueError):
+                value = 0
+            # 只有「judge 没跑 + 给了 0 分」才是伪装成能力问题的那种失败。
+            if value == 0:
+                return text
+    return None
+
+
 def _aggregate_total(scores: list[dict[str, Any]], weights: dict[str, int]) -> int:
     """加权平均(weight 为 0 的维度不参与;全 0 时简单平均)。
 

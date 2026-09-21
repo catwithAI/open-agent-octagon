@@ -8,3 +8,15 @@ sandbox-image:
 
 sandbox-smoke:
 	docker/agent-runtime/smoke.sh $(SANDBOX_IMAGE)
+
+.PHONY: archive-attempts archive-attempts-apply
+
+# attempt 归档（spec: docs/specs/260921-eval-storage-and-artifact-recovery）。
+# 默认 dry-run：只打印将删什么、能回收多少。
+DATA_PATH ?= ./data
+
+archive-attempts:
+	uv run python -m backend.tools.archive_attempts --data-path $(DATA_PATH)
+
+archive-attempts-apply:
+	uv run python -m backend.tools.archive_attempts --data-path $(DATA_PATH) --yes

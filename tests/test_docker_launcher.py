@@ -11,6 +11,7 @@ import subprocess
 import sys
 import textwrap
 import uuid
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -95,11 +96,96 @@ def test_build_run_argv_has_whitelist_mounts_limits_and_labels(tmp_path: Path) -
     assert f"-v {tmp_path / 'h'}:{HOME_MOUNT}" in s
     assert f"-v {tmp_path / 'r'}:{RO_MOUNT}:ro" in s
     assert argv[-3:] == (FAKE_IMAGE.reference, "sleep", "infinity")
-    # 只有三处挂载
-    assert s.count(" -v ") == 3
+    # 只有三处**宿主机**挂载。匿名卷（`-v /home/agent/lo`）没有宿主机侧，
+    # 不构成白名单缺口——这里按「参数里带宿主机路径」来数。
+    host_mounts = [
+        value
+        for flag, value in zip(argv, argv[1:], strict=False)
+        if flag == "-v" and ":" in value
+    ]
+    assert len(host_mounts) == 3
     assert "--add-host host.docker.internal:host-gateway" in s
     if os.getuid() != 0:
         assert f"--user {os.getuid()}:{os.getgid()}" in s
+
+
+def _mount_targets(argv: tuple[str, ...], flag: str) -> list[str]:
+    return [v for f, v in zip(argv, argv[1:], strict=False) if f == flag]
+
+
+def test_ephemeral_home_dirs_stay_off_the_bind_mount(tmp_path: Path) -> None:
+    """可重建的运行时目录不得落到 sandbox_home。
+
+    330 个 attempt 各存一份 LibreOffice 运行时 = 33G。这些目录挂成匿名卷 /
+    tmpfs 后随容器销毁，attempt 目录里只剩 agent 真正的产出。
+    """
+    launcher = DockerLauncher(settings=_settings(), image=FAKE_IMAGE)
+    spec = _spec(tmp_path)
+    ws = spec.workspace
+    from backend.process.docker_launcher import _Mount
+
+    mounts = (_Mount(ws, str(ws)), _Mount(tmp_path / "h", HOME_MOUNT), _Mount(tmp_path / "r", RO_MOUNT, readonly=True))
+    argv = launcher.build_run_argv(
+        spec, mounts=mounts, limits=launcher._limits_for("claude-code"), workspace=ws
+    )
+
+    anonymous = set(_mount_targets(argv, "-v"))
+    tmpfs = " ".join(_mount_targets(argv, "--tmpfs"))
+    # 纯运行期缓存必须被挡住，且没有一项带宿主机路径。
+    for name in (".npm", ".tmp", "lo", "loroot", "sysroot", "fonts"):
+        assert f"{HOME_MOUNT}/{name}" in anonymous
+    # adapter 在容器启动前写过的目录一律不挡——盖住会让 agent 读不到自己的
+    # provider 配置/凭据，直接跑不起来（见 test_adapter_written_dirs_...）。
+    for name in (".config", ".claude", "config", ".local"):
+        assert f"{HOME_MOUNT}/{name}" not in anonymous
+    assert f"{HOME_MOUNT}/apt:rw,size=512m" in tmpfs
+    # `.cache` 必须走匿名卷而不是 tmpfs：presentbench 下 ms-playwright 的
+    # 浏览器二进制有 658MB，512m tmpfs 会 ENOSPC，并发 6 还要吃 4G 内存。
+    assert f"{HOME_MOUNT}/.cache" in anonymous
+    assert f"{HOME_MOUNT}/.cache" not in tmpfs
+    assert str(tmp_path / "h") not in tmpfs
+
+
+def test_keep_home_dirs_opts_a_scenario_out(tmp_path: Path) -> None:
+    """需求 1.4：确实要留证据的场景可以按目录放开，而非全局关掉。"""
+    launcher = DockerLauncher(settings=_settings(), image=FAKE_IMAGE)
+    spec = replace(_spec(tmp_path), keep_home_dirs=("lo", "fonts"))
+    ws = spec.workspace
+    from backend.process.docker_launcher import _Mount
+
+    mounts = (_Mount(ws, str(ws)), _Mount(tmp_path / "h", HOME_MOUNT), _Mount(tmp_path / "r", RO_MOUNT, readonly=True))
+    argv = launcher.build_run_argv(
+        spec, mounts=mounts, limits=launcher._limits_for("claude-code"), workspace=ws
+    )
+
+    anonymous = set(_mount_targets(argv, "-v"))
+    # 放开的两项重新落回 bind mount（不再被盖住），其余仍被挡。
+    assert f"{HOME_MOUNT}/lo" not in anonymous
+    assert f"{HOME_MOUNT}/fonts" not in anonymous
+    assert f"{HOME_MOUNT}/loroot" in anonymous
+
+
+def test_ephemeral_dirs_reject_path_traversal(tmp_path: Path) -> None:
+    """配置里的目录名不得把挂载点顶出 /home/agent。"""
+    launcher = DockerLauncher(
+        settings=_settings(ephemeral_home_dirs=["../../etc", "/etc", "lo", ""]),
+        image=FAKE_IMAGE,
+    )
+    spec = _spec(tmp_path)
+    ws = spec.workspace
+    from backend.process.docker_launcher import _Mount
+
+    mounts = (_Mount(ws, str(ws)), _Mount(tmp_path / "h", HOME_MOUNT), _Mount(tmp_path / "r", RO_MOUNT, readonly=True))
+    argv = launcher.build_run_argv(
+        spec, mounts=mounts, limits=launcher._limits_for("claude-code"), workspace=ws
+    )
+
+    targets = _mount_targets(argv, "-v")
+    assert f"{HOME_MOUNT}/lo" in targets
+    assert all(".." not in t for t in targets)
+    # `/etc` 被剥成 `etc` 后仍在 /home/agent 之下，不会盖住宿主机 /etc。
+    assert all(t == "/etc" or not t.startswith("/etc") for t in targets if ":" not in t)
+    assert "/etc" not in targets
 
 
 def _sandbox(tmp_path: Path, **sandbox_cfg):
@@ -412,3 +498,92 @@ def test_dsh_adapter_locus_follows_launcher(tmp_path: Path) -> None:
     adapter = DshAdapter(model="p/m", octagon_project_path=tmp_path, launcher=launcher)
     assert adapter.capabilities.execution_locus == "docker-sandbox"
     assert DshAdapter(model="p/m", octagon_project_path=tmp_path).capabilities.execution_locus == "host"
+
+
+_SANDBOX_IMAGE = os.environ.get("SANDBOX_IMAGE", "octagon-agent-runtime:dev")
+
+
+def _sandbox_image_ok() -> bool:
+    if shutil.which("docker") is None:
+        return False
+    try:
+        subprocess.run(
+            ["docker", "image", "inspect", _SANDBOX_IMAGE],
+            capture_output=True, timeout=20, check=True,
+        )
+        return True
+    except Exception:
+        return False
+
+
+@pytest.mark.skipif(
+    not _sandbox_image_ok(),
+    reason=f"需要本地沙盒镜像 {_SANDBOX_IMAGE}（make sandbox-image）",
+)
+def test_ephemeral_home_dirs_are_writable_by_a_non_root_agent(tmp_path: Path) -> None:
+    """匿名卷的属主/权限**继承镜像里该路径的目录**。
+
+    镜像里不存在该目录时，匿名卷是 root:root 0755；而容器以宿主机 uid 跑，
+    agent 写不进去，LibreOffice 直接起不来——office 类场景会整体失败，且
+    表现为 agent 能力问题。Dockerfile 必须预建这些目录并放开权限。
+    """
+    argv = [
+        "docker", "run", "--rm", "--user", "4242:4242",
+        "-v", f"{HOME_MOUNT}/lo",
+        "-v", f"{HOME_MOUNT}/fonts",
+        "--tmpfs", f"{HOME_MOUNT}/.cache:rw,size=64m",
+        _SANDBOX_IMAGE, "sh", "-c",
+        f"for d in lo fonts .cache; do touch {HOME_MOUNT}/$d/probe || exit 1; done; "
+        "echo ALL_WRITABLE",
+    ]
+    done = subprocess.run(argv, capture_output=True, text=True, timeout=120)
+    assert "ALL_WRITABLE" in done.stdout, (
+        f"ephemeral 目录在非 root uid 下不可写；stdout={done.stdout!r} stderr={done.stderr!r}"
+    )
+
+
+def test_dockerfile_precreates_every_ephemeral_dir() -> None:
+    """镜像必须预建 `ephemeral_home_dirs` 里的每一项。
+
+    匿名卷的属主/权限继承镜像里该路径的目录；镜像里没有就是 root:root 0755，
+    而容器以宿主机 uid 跑 —— agent 写不进去，该 agent 直接跑不起来。
+    这条把「Dockerfile 与配置默认值必须同步」变成测试，而不是注释里的约定。
+    """
+    dockerfile = (
+        Path(__file__).resolve().parent.parent / "docker" / "agent-runtime" / "Dockerfile"
+    ).read_text(encoding="utf-8")
+    defaults = Settings().sandbox.ephemeral_home_dirs
+    assert defaults, "默认清单不该为空"
+    missing = [d for d in defaults if f"/home/agent/{d}" not in dockerfile]
+    assert not missing, (
+        f"这些 ephemeral 目录没在 Dockerfile 里预建，匿名卷会不可写：{missing}"
+    )
+
+
+def test_adapter_written_dirs_are_never_ephemeral() -> None:
+    """adapter 在容器启动前写过的家目录子目录，绝不能挂成匿名卷。
+
+    沙盒模式下 `host_home()` 返回的就是 `sandbox_home`，这些文件写在宿主机
+    侧；被匿名卷盖住后 agent 启动时读到的是空目录 —— provider 配置、API key、
+    模型路由全部消失，agent 直接跑不起来。
+
+    对照 adapter 里的实际写入点（沙盒模式下 host_home() 忽略传入的
+    `.xxx-iso-home`，一律返回 sandbox_home 本身，所以这些路径就落在家目录一级）：
+      claude_code.py:212/219   .claude            CLAUDE_CONFIG_DIR（宿主机 mkdir + 写 settings.json）
+      opencode_family.py:430   config             <PREFIX>_CONFIG_DIR（宿主机 mkdir）
+      opencode_family.py:434   .config            XDG_CONFIG_HOME
+      opencode_family.py:435/437 .local           XDG_DATA_HOME / XDG_STATE_HOME
+      dsh.py:591               .dsh               DSH_HOME（宿主机 mkdir）
+      dsh.py:591               .agents            DSH_AGENTS_HOME（宿主机 mkdir）
+      dsh.py:591               dsh_sessions       DSH_SESSION_ROOT——**会话 jsonl 证据**，
+                                                  盖住就随容器销毁，后端再也读不到
+    """
+    forbidden = {
+        ".config", ".claude", "config", ".local",
+        ".dsh", ".agents", "dsh_sessions",
+    }
+    defaults = set(Settings().sandbox.ephemeral_home_dirs)
+    leaked = forbidden & defaults
+    assert not leaked, (
+        f"这些目录被 adapter 在容器启动前写入，挂匿名卷会让 agent 读不到配置：{leaked}"
+    )

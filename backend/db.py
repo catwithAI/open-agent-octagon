@@ -121,7 +121,9 @@ CREATE TABLE IF NOT EXISTS attempts (
     model_integrity_violation_count INTEGER NOT NULL DEFAULT 0,
     model_integrity_error_code TEXT,
     model_integrity_error_message TEXT,
-    model_integrity_checked_at TEXT
+    model_integrity_checked_at TEXT,
+    archived_at TEXT,
+    archived_kinds TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_attempts_run_id ON attempts(run_id);
@@ -730,6 +732,22 @@ def _migrate_attempts_wire(conn: sqlite3.Connection) -> None:
             conn.execute(f"ALTER TABLE attempts ADD COLUMN {name} {decl}")
 
 
+def _migrate_attempts_archive(conn: sqlite3.Connection) -> None:
+    """归档标记列。
+
+    读取方据此区分「没采集到」与「已归档回收」——两者在磁盘上都表现为
+    目录不存在，但含义完全相反。逐列幂等。
+    """
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(attempts)").fetchall()}
+    additions = [
+        ("archived_at", "TEXT"),
+        ("archived_kinds", "TEXT"),
+    ]
+    for name, decl in additions:
+        if name not in cols:
+            conn.execute(f"ALTER TABLE attempts ADD COLUMN {name} {decl}")
+
+
 def _migrate_attempts_cost(conn: sqlite3.Connection) -> None:
     """成本核算列（token_cost_accounting）。逐列幂等。
 
@@ -1195,6 +1213,7 @@ def _init_db_sync(db_path: Path) -> None:
         _migrate_attempts_security(conn)
         _migrate_attempts_wire(conn)
         _migrate_attempts_cost(conn)
+        _migrate_attempts_archive(conn)
         _migrate_attempts_model_integrity(conn)
         _migrate_run_cost_audits(conn)
         _migrate_cost_key_ledgers(conn)

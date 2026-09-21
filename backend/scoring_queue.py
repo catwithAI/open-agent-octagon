@@ -96,6 +96,13 @@ def enqueue_scoring_job(
                 "original_error_message": adapter_error_message,
             }
         )
+    # 产物没回收到的 attempt 照常判分（分数本身是事实），但要标成
+    # infrastructure：否则它会以一个「真实的低分」混进横评矩阵，看起来像
+    # agent 能力差。2026-09-18 横评里 blade-agent 的 27 个 attempt 就是
+    # 这样被整体误读的（需求 6.3）。
+    from .adapters.blade_service import artifact_recovery_failed
+
+    recovery_failed = adapter_status == "completed" and artifact_recovery_failed(refs)
     with _open_sync(state.db_path) as conn:
         env_row = conn.execute(
             "SELECT env_name FROM attempts WHERE id=?", (attempt_id,)
@@ -108,8 +115,8 @@ def enqueue_scoring_job(
             "scoring_status='queued',scoring_queued_at=?,score_total=NULL,"
             "external_refs_json=?,event_count=?,last_event_at=?,thinking_count=?,"
             "tool_call_count=?,token_usage_json=?,cost_estimate=?,duration_ms=?,"
-            "transport_status=?,ended_at=NULL,error_code=NULL,error_message=NULL "
-            "WHERE id=?",
+            "transport_status=?,ended_at=NULL,error_code=NULL,error_message=NULL,"
+            "failure_kind=? WHERE id=?",
             (
                 _execution_status(adapter_status),
                 now,
@@ -125,6 +132,7 @@ def enqueue_scoring_job(
                 stats.get("cost_estimate"),
                 int(stats.get("duration_ms", 0)),
                 stats.get("transport_status", "unknown"),
+                "infrastructure" if recovery_failed else None,
                 attempt_id,
             ),
         )
@@ -356,7 +364,11 @@ async def _execute_job(
             from .input_snapshots import resolve_attempt_input
             from .run_dispatch import _resolve_scorer, _refresh_run_status
             from .runner import _row_to_task_dict, _write_security_columns_sync
-            from .evaluator import ScorerUnavailableError, evaluate
+            from .evaluator import (
+                ScorerUnavailableError,
+                evaluate,
+                judge_infrastructure_error,
+            )
             scorer = _resolve_scorer(env)
             if scorer is None:
                 raise ScorerUnavailableError(f"env {attempt['env_name']} missing scorer")
@@ -439,6 +451,27 @@ async def _execute_job(
                 config.get("security_meta") or {},
                 outcome.security,
             )
+            # judge 自身没跑起来时，env scorer 仍会返回一行 value=0 的维度。
+            # 照单收下就等于把一次判分设施故障写成「agent 得了 0 分」——
+            # 2026-09-18 横评里 109 个 attempt 正是这样被记成
+            # score=0 / failure_kind=NULL，跨全部 7 个 agent。
+            # 走既有的 scoring 失败路径：score_total 保持 NULL（绝不写业务
+            # 0 分），failure_kind='scoring'，顶层 status 保留执行结论。
+            judge_error = judge_infrastructure_error(outcome.scores)
+            if judge_error is not None:
+                logger.error(
+                    "attempt %s 判分设施未就绪，不记 0 分：%s", attempt_id, judge_error
+                )
+                await asyncio.to_thread(
+                    _finish_failure,
+                    state.db_path,
+                    job_id,
+                    status="scoring_failed",
+                    code="judge_unavailable",
+                    message=judge_error[:500],
+                )
+                return
+
             from .experiments.scoring import commit_scoring_result
 
             final_status = "completed" if outcome.passed else "gave_up"
