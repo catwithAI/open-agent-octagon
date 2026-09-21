@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
 import shutil
 import sqlite3
 import stat
+import threading
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,9 +29,80 @@ class ScoringInputMismatchError(RuntimeError):
 class ScoringSnapshot:
     input_hash: str
     relative_path: str
+    link_mode: str = "link"
 
 
-def _ignore_non_deliverables(directory: str, names: list[str]) -> set[str]:
+# `copytree` 的 `copy_function` 没有返回值，也没有地方挂状态，而回落是否发生
+# 必须记进 manifest（需求 2.2：不得静默）。用线程局部的计数器承接。
+# 今天 `create_scoring_snapshot` 在事件循环线程上同步调用、本就串行，用
+# threading.local 是为了将来它被挪进 `asyncio.to_thread` 时不必再回来改。
+_link_stats = threading.local()
+
+
+def _link_or_copy(src: str, dst: str) -> None:
+    """优先硬链接；跨设备或不支持硬链接时回落复制。
+
+    快照的语义是「判分期间产物不可再变」，而不是「产物有独立的第二份字节」。
+    硬链接同样满足：判分前容器已被 kill（sandbox spec D-11），没有写入方，
+    且 `_make_read_only` 把快照置为只读。源文件此后被删除也不影响快照——
+    硬链接持有 inode 引用。省下的是整整一份 attempt 树的磁盘（实测 32G）。
+    """
+    stats = _link_stats.__dict__
+    try:
+        os.link(src, dst)
+    except OSError as exc:
+        # EXDEV：跨文件系统。EMLINK：inode 链接数到顶。EPERM/EOPNOTSUPP：
+        # 文件系统不支持硬链接（部分 overlayfs / 网络盘）。这些都是环境限制，
+        # 回落复制即可；其它 errno（如 ENOSPC）是真错误，必须抛出去。
+        if exc.errno not in (errno.EXDEV, errno.EMLINK, errno.EPERM, errno.EOPNOTSUPP):
+            raise
+        shutil.copy2(src, dst)
+        stats["copied"] = stats.get("copied", 0) + 1
+    else:
+        stats["linked"] = stats.get("linked", 0) + 1
+
+
+def _link_mode(stats: dict[str, int]) -> str:
+    linked = stats.get("linked", 0)
+    copied = stats.get("copied", 0)
+    if linked and copied:
+        return "mixed"
+    if copied:
+        return "copy"
+    return "link"
+
+
+# attempt 根目录下的 agent 私有运行时目录。它们不是交付物：`sandbox_home` 是
+# 容器家目录（LibreOffice 运行时、apt 缓存、字体），`sandbox_ro` 是只读物料。
+#
+# 只在 attempt 根一层排除，不进 `ARTIFACT_SKIP_DIRS`——那份清单是按**任意层级
+# 的目录名**匹配的，且与 API 产物扫描、scorer 共用；把这些名字加进去会波及
+# 那些链路，而它们只在 attempt 根下才有这个含义。
+_ATTEMPT_ROOT_RUNTIME_DIRS = frozenset({
+    "sandbox_home",
+    "sandbox_ro",
+    ".opencode-iso-home",
+})
+
+
+def _ignore_factory(attempt_root: Path):
+    """Build the `copytree` ignore hook for one attempt root."""
+    resolved_root = Path(attempt_root).resolve()
+
+    def _is_attempt_root(directory: str) -> bool:
+        try:
+            return Path(directory).resolve() == resolved_root
+        except OSError:
+            return False
+
+    return lambda directory, names: _ignore_non_deliverables(
+        directory, names, is_attempt_root=_is_attempt_root(directory)
+    )
+
+
+def _ignore_non_deliverables(
+    directory: str, names: list[str], *, is_attempt_root: bool = False
+) -> set[str]:
     """`copytree` ignore hook: never copy dependency/build trees into a snapshot.
 
     Filtering after the copy would be too late — the cost being avoided is the
@@ -40,8 +113,18 @@ def _ignore_non_deliverables(directory: str, names: list[str]) -> set[str]:
     Scoring reads the frozen copy, so anything dropped here is invisible to the
     judge. That is the intent: judging is about what the agent delivered, and a
     reinstallable dependency tree is not part of it.
+
+    同理排除 attempt 根下的沙盒运行时目录。改硬链接后这一条从「省一次复制」
+    升级成**归档能否真正回收空间**的前提：快照一旦链住 `sandbox_home` 的
+    inode，归档删掉 attempt 侧的目录项也不会释放任何字节（实测：声称回收
+    4.8MB，`du` 纹丝不动）。
     """
-    return {name for name in names if name in ARTIFACT_SKIP_DIRS}
+    ignored = {name for name in names if name in ARTIFACT_SKIP_DIRS}
+    # 只有正在遍历 attempt 根时才排除运行时目录——workspace 深处若有同名目录，
+    # 那是 agent 自己建的，属于产物。
+    if is_attempt_root:
+        ignored |= {name for name in names if name in _ATTEMPT_ROOT_RUNTIME_DIRS}
+    return ignored
 
 
 def _tree_manifest(root: Path) -> list[dict[str, Any]]:
@@ -117,6 +200,16 @@ def _snapshot_hash(attempt_root: Path) -> tuple[str, list[dict[str, Any]]]:
 
 
 def _make_read_only(root: Path) -> None:
+    """冻结快照树。
+
+    快照用硬链接后，文件的 chmod 落在**共享 inode** 上，attempt 目录里的同一
+    文件也会变成 0444。这是可接受的、甚至是想要的：快照建立时 attempt 已执行
+    结束（`enqueue_scoring_job` 在此刻把状态推进到 scoring），不应再有写入方，
+    只读正好把这一点落到文件系统上。
+
+    删除不受影响——`unlink` 看的是父目录的写权限，而目录不共享 inode，
+    所以归档仍然可以删 attempt 目录里的文件。
+    """
     for path in sorted(root.rglob("*"), reverse=True):
         if path.is_symlink():
             continue
@@ -160,14 +253,25 @@ def create_scoring_snapshot(*, data_path: Path, attempt_id: str) -> ScoringSnaps
     snapshots.mkdir(parents=True, exist_ok=True)
     temporary = snapshots / f".tmp-{attempt_id}-{uuid.uuid4().hex}"
     copied_attempt = temporary / "attempt"
+    _link_stats.__dict__.clear()
     try:
-        shutil.copytree(source, copied_attempt, symlinks=True, ignore=_ignore_non_deliverables)
+        shutil.copytree(
+            source,
+            copied_attempt,
+            symlinks=True,
+            ignore=_ignore_factory(source),
+            copy_function=_link_or_copy,
+        )
+        # env.db 必须先解链再重建：`_stabilize_env_db` 写的是一份事务一致的
+        # backup，若沿用硬链接就会写穿到 attempt 目录里的活动数据库。
         _stabilize_env_db(source, copied_attempt)
+        link_mode = _link_mode(dict(_link_stats.__dict__))
         input_hash, manifest = _snapshot_hash(copied_attempt)
         destination = snapshots / input_hash.removeprefix("sha256:")
         metadata = {
             "schema_version": SNAPSHOT_SCHEMA_VERSION,
             "input_hash": input_hash,
+            "link_mode": link_mode,
             "entries": manifest,
         }
         (temporary / "snapshot.json").write_text(
@@ -189,7 +293,9 @@ def create_scoring_snapshot(*, data_path: Path, attempt_id: str) -> ScoringSnaps
             attempt_id=attempt_id,
             expected_hash=input_hash,
         )
-        return ScoringSnapshot(input_hash=input_hash, relative_path=relative)
+        return ScoringSnapshot(
+            input_hash=input_hash, relative_path=relative, link_mode=link_mode
+        )
     finally:
         if temporary.exists():
             _remove_tree(temporary)
@@ -241,6 +347,9 @@ def materialize_scoring_input(
     if work_root.exists():
         _remove_tree(work_root)
     destination.parent.mkdir(parents=True)
+    # 这里**不能**用硬链接：下面要把工作副本 chmod 成可写，供 legacy scorer
+    # 原地改动。硬链接会让那次 chmod 写穿到只读快照的 inode 上，快照就不再
+    # 冻结了。materialize 的语义本来就是「一份可改的私有副本」，必须真复制。
     shutil.copytree(frozen_attempt, destination, symlinks=True)
     for path in [destination, *destination.rglob("*")]:
         if not path.is_symlink():

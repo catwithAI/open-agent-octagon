@@ -99,6 +99,33 @@ class _Mount:
         return f"{self.host}:{self.container}{suffix}"
 
 
+def _ephemeral_home_argv(dirs: list[str], *, tmpfs: set[str], tmpfs_size: str) -> list[str]:
+    """把家目录里可重建的子目录挡在 bind mount 之外。
+
+    `/home/agent` 仍是 bind mount——agent 的真实产出要留证据。但 LibreOffice
+    运行时、apt 缓存、字体这些是**可重建**的：每个 attempt 存一份几乎相同的
+    副本，330 个 attempt 就是 33G。在它们上面再叠一层挂载后，写入落到容器
+    可写层（匿名卷）或内存（tmpfs），容器一销毁就没了。
+
+    为什么不是「跑完再删」：写入成本在运行期就已经付掉了（IO 与空间峰值都
+    发生在那时），事后 rm 只是把这份 IO 再付一次。
+    """
+    argv: list[str] = []
+    for name in dirs:
+        # 目录名来自配置，仍要挡住 `..` 与绝对路径——它们会把挂载点顶到
+        # /home/agent 之外，盖住宿主机路径。
+        clean = name.strip().strip("/")
+        if not clean or ".." in Path(clean).parts:
+            continue
+        target = f"{HOME_MOUNT}/{clean}"
+        if clean in tmpfs:
+            argv += ["--tmpfs", f"{target}:rw,size={tmpfs_size}"]
+        else:
+            # 匿名卷：落 docker 存储层，随容器销毁回收，不进 attempt 目录。
+            argv += ["-v", target]
+    return argv
+
+
 @dataclass
 class _ExecRecord:
     turn_id: str | None
@@ -322,6 +349,16 @@ class DockerLauncher:
             argv += ["--user", f"{os.getuid()}:{os.getgid()}"]
         for mount in mounts:
             argv += ["-v", mount.arg()]
+        # 顺序要紧：ephemeral 挂载必须排在 /home/agent 的 bind mount 之后，
+        # docker 按挂载点深度处理嵌套挂载，先声明父挂载才能在其上叠子挂载。
+        sandbox_cfg = self.settings.sandbox
+        argv += _ephemeral_home_argv(
+            sandbox_cfg.ephemeral_dirs_for(
+                list(spec.keep_home_dirs) if spec.keep_home_dirs else None
+            ),
+            tmpfs=set(sandbox_cfg.tmpfs_home_dirs),
+            tmpfs_size=sandbox_cfg.tmpfs_size,
+        )
         argv += [self.image.reference, "sleep", "infinity"]
         return tuple(argv)
 

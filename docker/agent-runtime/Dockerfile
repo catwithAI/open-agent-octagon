@@ -104,7 +104,18 @@ RUN test -n "${DSH_VERSION}" \
 
 # ---- 运行时环境 -----------------------------------------------------------
 # HOME 由 launcher 以 rw 挂载 sandbox_home；--user 是宿主机 uid，所以这里不 chown 而是 777。
-RUN mkdir -p /home/agent /attempt && chmod 0777 /home/agent
+#
+# `lo`/`loroot`/`sysroot`/`fonts` 由 launcher 盖成匿名卷（可重建的运行时，
+# 不该堆进 attempt 目录）。**匿名卷的属主与权限继承镜像里该路径的目录**：
+# 镜像里不存在就是 root:root 0755，而容器以宿主机 uid 跑，agent 写不进去，
+# LibreOffice 直接起不来。所以这里必须预建且 0777——与 /home/agent 同一个
+# 理由：构建期不知道宿主机 uid，只能放权限。
+RUN mkdir -p /home/agent /attempt \
+    && mkdir -p /home/agent/lo /home/agent/loroot /home/agent/sysroot \
+                /home/agent/fonts /home/agent/apt /home/agent/.cache \
+    && chmod 0777 /home/agent /home/agent/lo /home/agent/loroot \
+                  /home/agent/sysroot /home/agent/fonts /home/agent/apt \
+                  /home/agent/.cache
 ENV HOME=/home/agent \
     PATH=/usr/local/bin:/usr/bin:/bin \
     DISABLE_AUTOUPDATER=1 \
