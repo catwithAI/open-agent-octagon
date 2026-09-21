@@ -31,6 +31,7 @@ from .db import (
 )
 from .experiments.hashing import canonical_hash
 from .model_providers import parse_model_ref
+from .disk_guard import DISK_EXHAUSTED_CODE, LowDiskSpace, ensure_free_disk
 from .run_dispatch import KNOWN_AGENTS, dispatch as dispatch_attempt
 from .runner import create_attempt
 
@@ -597,6 +598,27 @@ def _attempt_semaphore(capacity: int) -> asyncio.Semaphore:
     return semaphore
 
 
+def _mark_low_disk(db_path: Path, attempt_id: str, message: str) -> None:
+    """把因磁盘不足未能启动的 attempt 收敛掉。
+
+    走 `_finalize_no_score` 而不是自己写 SQL：它一并完成 failure_kind 判定、
+    run 状态投影与 cell 投影。`disk_exhausted` 已登记为 infrastructure，
+    统计时能与 agent 自身的失败分开（需求 7.3）。
+    """
+    from .run_dispatch import _refresh_run_status
+    from .runner import _finalize_no_score
+
+    _finalize_no_score(
+        db_path=db_path,
+        attempt_id=attempt_id,
+        status=DISK_EXHAUSTED_CODE,
+        error_code=DISK_EXHAUSTED_CODE,
+        error_message=message,
+        pass_threshold=60,
+    )
+    _refresh_run_status(db_path, attempt_id)
+
+
 async def _dispatch_with_lease(job: dict[str, Any]) -> None:
     capacity = int(job["settings"].octagon.max_active_attempts)
     semaphore = _attempt_semaphore(capacity)
@@ -617,6 +639,21 @@ async def _dispatch_with_lease(job: dict[str, Any]) -> None:
             state.attempt_tasks[registered_attempt_id] = asyncio.current_task()
         try:
             attempt_id = job.get("attempt_id")
+            # 磁盘闸：信号量之后、真正启动之前。放这里而不是入队时，是因为
+            # 排队期间空间会被前面的 attempt 吃掉——要用启动那一刻的读数。
+            min_free_gb = float(job["settings"].octagon.min_free_disk_gb)
+            try:
+                ensure_free_disk(state.data_path, min_free_gb=min_free_gb)
+            except LowDiskSpace as exc:
+                logger.error("attempt %s 不予调度：%s", attempt_id, exc)
+                if not attempt_id:
+                    # 没有 attempt 行可标记，就不能默默咽掉——静默返回会让这个
+                    # job 消失得无影无踪：run 停在原状态，也没有任何失败记录。
+                    raise
+                await asyncio.to_thread(
+                    _mark_low_disk, state.db_path, attempt_id, str(exc)
+                )
+                return
             if attempt_id:
                 with _open_sync(state.db_path) as conn:
                     row = conn.execute(

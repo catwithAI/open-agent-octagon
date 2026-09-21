@@ -1740,27 +1740,60 @@ def build_router() -> APIRouter:
             cancel_dispatch_tasks,
             kill_orphaned_agent_processes,
         )
+        from .disk_guard import DISK_EXHAUSTED_CODE, is_disk_full_error
         from .scoring_queue import cancel_scoring_for_runs
 
         # 顺序要紧：先停产生新工作的来源（评分 job、dispatch 协程），
         # 再收敛状态。反过来会让已收敛的 attempt 又被写回 running。
-        cancelled_scoring = cancel_scoring_for_runs([run_id])
+        #
+        # 在此之上再排一层：不需要磁盘的动作排在需要落盘的动作之前，且落盘
+        # 失败不阻断取消。磁盘写满时正是最需要停止的时刻，而此前整个 stop
+        # 会因落盘失败返回 500——用户得先手动腾空间才能停，可空间还在被跑着
+        # 的 attempt 继续吃掉。取消协程、杀进程才是真正让 token 停止燃烧的
+        # 动作，它们不该被一次写盘失败连坐（需求 7.2）。
         cancelled_tasks = cancel_dispatch_tasks([run_id])
         # 跨重启存活、已无内存协程的 Agent：cancel_dispatch_tasks 够不着
         # 它们，只改 DB 会让进程继续烧 token。按落盘 pid 直接杀。
         killed_orphans = await asyncio.to_thread(
             kill_orphaned_agent_processes, state.db_path, [run_id]
         )
-        converged = await asyncio.to_thread(
-            cancel_attempts_for_runs, state.db_path, [run_id]
-        )
-        return {
+
+        cancelled_scoring = 0
+        scoring_error: str | None = None
+        try:
+            cancelled_scoring = cancel_scoring_for_runs([run_id])
+        except Exception as exc:  # noqa: BLE001
+            scoring_error = str(exc)
+            logger.exception("stop %s：评分 job 取消落盘失败", run_id)
+
+        converged = 0
+        persist_error: str | None = None
+        try:
+            converged = await asyncio.to_thread(
+                cancel_attempts_for_runs, state.db_path, [run_id]
+            )
+        except Exception as exc:  # noqa: BLE001
+            # 状态没写成不改变「已经停了」这个事实：协程已取消、进程已杀。
+            # 把失败如实报给调用方，别假装收敛成功，也别把整个停止判成失败。
+            persist_error = str(exc)
+            if is_disk_full_error(exc):
+                # 磁盘满是这条容错路径存在的原因，明确标出来：运维看到它就
+                # 知道要先腾空间再重放收敛，而不是去查 DB 损坏。
+                persist_error = f"{DISK_EXHAUSTED_CODE}: {exc}"
+            logger.exception("stop %s：状态收敛落盘失败，取消本身已生效", run_id)
+
+        payload: dict[str, Any] = {
             "stopped": cancelled_tasks,
             "run_id": run_id,
             "cancelled_scoring_jobs": cancelled_scoring,
             "killed_orphan_processes": killed_orphans,
             "converged_attempts": converged,
         }
+        if persist_error is not None:
+            payload["convergence_persist_error"] = persist_error
+        if scoring_error is not None:
+            payload["scoring_cancel_persist_error"] = scoring_error
+        return payload
 
     @router.get("/runs/{run_id}/attempts/{attempt_id}/artifacts")
     async def list_artifacts(run_id: str, attempt_id: str) -> dict[str, Any]:

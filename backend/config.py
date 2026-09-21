@@ -96,6 +96,10 @@ class OctagonSection(BaseModel):
     rubric_evolution_process_threshold: int = Field(default=10, ge=1, le=10000)
     rubric_evolution_association_threshold: int = Field(default=100, ge=1, le=100000)
     rubric_evolution_overlap_ratio: float = Field(default=0.25, ge=0, le=0.5)
+    # 磁盘护栏：可用空间低于该值就不再启动新 attempt。0 = 关闭。
+    # 2026-09-18 的横评在第 336 个 attempt 处把盘写到 0 字节，之后连 stop 都
+    # 失败（写状态也要落盘）；护栏的意义是永远不走到那一步。
+    min_free_disk_gb: float = Field(default=15.0, ge=0)
 
 
 class BladeSection(BaseModel):
@@ -150,6 +154,28 @@ class SandboxSection(BaseModel):
     server_side_tools: Literal["allow", "deny"] = "allow"
     # 按 agent 覆盖限额。不允许按 agent 换镜像。
     agents: dict[str, SandboxAgentOverride] = Field(default_factory=dict)
+    # 家目录里「可重建」的子目录：LibreOffice 运行时、apt 缓存、字体等。
+    # 它们由 agent 在运行时写入，每个 attempt 一份、内容几乎相同——330 个
+    # attempt 曾因此攒下 33G。挂成容器可写层（匿名卷）或 tmpfs，容器销毁即
+    # 释放，不再穿透 bind mount 落到 attempt 目录。
+    ephemeral_home_dirs: list[str] = Field(
+        default_factory=lambda: ["lo", "loroot", "sysroot", "apt", "fonts", ".cache"]
+    )
+    # 其中用 tmpfs（走内存）的子集。评测机内存有限（14G / 并发 6），
+    # 只有小而热的缓存值得放内存，其余走匿名卷落 docker 存储层。
+    tmpfs_home_dirs: list[str] = Field(default_factory=lambda: ["apt", ".cache"])
+    # 单个 tmpfs 的上限。并发 6 时最坏占用 = 该值 × tmpfs 目录数 × 并发数，
+    # 必须留足余量，别把评测机的内存打爆。
+    tmpfs_size: str = "512m"
+
+    def ephemeral_dirs_for(self, keep: list[str] | None = None) -> list[str]:
+        """场景级放开：从默认列表里减项（需求 1.4）。
+
+        某些场景确实要把运行时产物留作证据，此时 env 用 `keep_home_dirs`
+        指名保留——而不是让所有场景都付这份成本。
+        """
+        kept = {item.strip() for item in (keep or []) if item.strip()}
+        return [name for name in self.ephemeral_home_dirs if name not in kept]
 
     def limits_for(self, agent_name: str) -> SandboxLimits:
         override = self.agents.get(agent_name)

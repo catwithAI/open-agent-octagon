@@ -93,6 +93,7 @@ from .token_usage import (
 )
 from .error_taxonomy import classify, retry_delay_seconds, should_retry
 from ..artifact_scope import ARTIFACT_SKIP_DIRS
+from .edited_paths import agent_edited_paths
 from ..conversation.plan import effective_conversation
 from ..conversation.summary import summarize_conversation
 from ..conversation.turns import with_turn_ext
@@ -155,6 +156,38 @@ _BLADE_SKILL_RUN_RE = re.compile(
 _ARTIFACT_SKIP_DIRS = ARTIFACT_SKIP_DIRS
 _ARTIFACT_MAX_FILES = 500
 _ARTIFACT_MAX_DEPTH = 5
+
+# 优先回收时试探的远端前缀：日志里的路径未必与远端工作区同根。
+_REMOTE_PATH_PREFIXES = ("", "workspace/", "skill_workspace/", "output/")
+
+
+def _digest_bytes(content: bytes) -> str:
+    return hashlib.sha256(content).hexdigest()
+
+
+def _digest_of(path: Path) -> str | None:
+    """文件当前内容的摘要；不存在返回 None。"""
+    try:
+        return _digest_bytes(path.read_bytes())
+    except OSError:
+        return None
+
+
+def _candidate_remote_paths(rel: str) -> list[str]:
+    """一个相对路径在远端可能的几种写法，按可能性排序。"""
+    # `lstrip("./")` 按字符集剥，会把 `.hidden/report.md` 削成
+    # `hidden/report.md`，每个候选前缀都指向不存在的路径。
+    clean = rel
+    while clean.startswith("./"):
+        clean = clean[2:]
+    seen: dict[str, None] = {}
+    for prefix in _REMOTE_PATH_PREFIXES:
+        seen.setdefault(f"{prefix}{clean}", None)
+    # 只剩文件名的写法：agent 在工作区根上直接写文件的常见情形。
+    name = Path(clean).name
+    if name != clean:
+        seen.setdefault(name, None)
+    return list(seen)
 
 # blade 主循环的 loop_name；fork 出的子 agent 形如 "agent:<8hex>"。
 _ROOT_LOOP = "root"
@@ -333,6 +366,26 @@ def _iterative_artifact_sync_error(result: AdapterResult) -> str | None:
     if sync.get("truncated_at") is not None:
         return f"产物同步在 {sync['truncated_at']} 个文件处截断"
     return None
+
+
+def artifact_recovery_failed(external_refs: dict[str, Any]) -> bool:
+    """优先路径一个都没落地 —— 产物没回收到，分数不可用。
+
+    这是 2026-09-18 横评里 blade-agent 27 个 attempt 全部低分的形状：attempt
+    正常跑完、拿到一个真实的低分，而那个分数衡量的是空工作区。把它标成
+    infrastructure，统计时才能与「agent 确实没做好」分开（需求 6.3）。
+
+    只有「有依据、且全部落空」才算失败：`priority_source == "none"` 表示压根
+    没提取到路径，那是另一种情况（需求 4.4），不在这里判。
+    """
+    sync = external_refs.get("artifact_sync")
+    if not isinstance(sync, dict):
+        return False
+    missing = sync.get("priority_missing")
+    if not isinstance(missing, list) or not missing:
+        return False
+    got = sync.get("priority_downloaded")
+    return not (isinstance(got, list) and got)
 
 
 def _fail_incomplete_iterative_artifact_sync(result: AdapterResult) -> bool:
@@ -2596,6 +2649,56 @@ class BladeServiceAdapter:
             messages = []
         return [item for item in messages if isinstance(item, dict)]
 
+    async def _download_priority_paths(
+        self,
+        client: BladeAgentClient,
+        session_id: str,
+        paths: list[str],
+        *,
+        download_root: Path,
+        baseline_root: Path,
+        errors: list[str],
+    ) -> tuple[list[str], list[str]]:
+        """定向下载 agent 编辑过的路径，并校验落地内容确实变了。
+
+        「`download_file` 没抛异常」不等于「拿到了产物」：实测下载成功但文件
+        内容仍是基线（mtime 停在物料拷贝时间）。远端路径前缀可能与本地不同，
+        请求到的其实是另一个位置的同名文件。所以下载后比对 hash——与基线一致
+        就视为未命中，换候选前缀再试（需求 5.1/5.2）。
+        """
+        got: list[str] = []
+        missing: list[str] = []
+        for rel in paths:
+            target = download_root / rel
+            # 基线必须取自**活的 workspace**，不能取 download_root：续聊/恢复
+            # 时 download_root 是新建的空 staging 目录，摘要恒为 None，校验就
+            # 完全失效——而那恰恰是这个校验要守的路径。
+            # 文件不存在时为 None：那时任何内容都算命中（本来就没有）。
+            baseline = _digest_of(baseline_root / rel)
+            landed = False
+            for candidate in _candidate_remote_paths(rel):
+                try:
+                    content = await client.download_file(session_id, candidate)
+                except Exception:
+                    # 候选路径猜错会 404，这是预期内的试探，不记进 errors——
+                    # errors 非空会让迭代评审路径把 attempt 判成 chat_failed。
+                    continue
+                if baseline is not None and _digest_bytes(content) == baseline:
+                    # 内容没变 = 没真正拿到，继续试下一个候选。
+                    continue
+                try:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes(content)
+                except OSError as exc:
+                    errors.append(f"write {rel}: {exc}")
+                    break
+                got.append(rel)
+                landed = True
+                break
+            if not landed:
+                missing.append(rel)
+        return got, missing
+
     async def _recover_workspace_artifacts(
         self,
         client: BladeAgentClient,
@@ -2643,6 +2746,28 @@ class BladeServiceAdapter:
         skipped_existing: list[str] = []
         errors: list[str] = []
         truncated = False
+
+        # 优先回收：先按 agent 实际编辑过的路径定向下载，再进 BFS 兜底。
+        # BFS 的 500 上限本身是合理的防爆保护，但它会把交付物挤掉——
+        # 优先路径不受这个上限约束。
+        # workspace_root 留空是故意的：blade 在沙盒内按 session 选定工作区
+        # （/root/智能助手工作空间/<session>），adapter 事前不知具体子目录。
+        # `normalize_path` 用工作区标记反查前缀，与安全扫描的做法一致。
+        priority_paths, priority_source = agent_edited_paths(attempt_dir)
+        priority_downloaded: list[str] = []
+        priority_missing: list[str] = []
+        if priority_paths:
+            got, missing = await self._download_priority_paths(
+                client,
+                session_id,
+                priority_paths,
+                download_root=download_root,
+                baseline_root=workspace_dir,
+                errors=errors,
+            )
+            priority_downloaded.extend(got)
+            priority_missing.extend(missing)
+            downloaded.extend(got)
 
         queue: list[tuple[str, int]] = [(".", 0)]
         seen_files = 0
@@ -2701,6 +2826,12 @@ class BladeServiceAdapter:
             "skipped_existing": skipped_existing,
             "total_listed": len(listing),
             "errors": errors,
+            # 这四个字段恒存在（需求 6.2）：排查低分时要一眼看出是
+            # 「agent 没做」还是「没回收到」。truncated_at 为 None 表示没截断。
+            "truncated_at": _ARTIFACT_MAX_FILES if truncated else None,
+            "priority_downloaded": priority_downloaded,
+            "priority_missing": priority_missing,
+            "priority_source": "+".join(priority_source) if priority_source else "none",
         }
         if truncated:
             # 静默截断会被误读成"全量回收"，显式标注
@@ -2711,7 +2842,26 @@ class BladeServiceAdapter:
             )
         if staging_dir is not None:
             if errors or truncated:
+                # staging 被整个丢弃 —— 包括优先阶段已经拉到的那些文件。
+                # 若仍把它们记在 priority_downloaded 里，`artifact_recovery_failed`
+                # 会判定回收成功，于是 attempt 拿着一个「对空工作区打出的分数」
+                # 进矩阵，且不带 infrastructure 标记。产物确实没落地，记账就得
+                # 照实说：全部转入 priority_missing。
                 shutil.rmtree(staging_dir, ignore_errors=True)
+                if priority_downloaded:
+                    logger.warning(
+                        "staging 丢弃使 %d 个优先产物未落地 (session %s)",
+                        len(priority_downloaded), session_id,
+                    )
+                    for rel in priority_downloaded:
+                        if rel in downloaded:
+                            downloaded.remove(rel)
+                    priority_missing.extend(priority_downloaded)
+                    priority_downloaded.clear()
+                    result["priority_downloaded"] = priority_downloaded
+                    result["priority_missing"] = priority_missing
+                    result["downloaded"] = downloaded
+                    result["staging_discarded"] = True
             else:
                 backup_dir = attempt_dir / f".skill_workspace.previous-{time.time_ns()}"
                 try:

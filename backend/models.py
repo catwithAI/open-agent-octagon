@@ -123,6 +123,10 @@ AttemptStatus = Literal[
     # 全局强制的，这里是基础设施终态，不回落宿主机执行，不算 agent 质量结果。
     "sandbox_unavailable",
     "input_snapshot_missing",
+    # 评测机可用磁盘低于阈值，attempt 未获调度。与 sandbox_unavailable 同类：
+    # 基础设施终态，不是 agent 质量结果。必须声明在这里——终态集合由本 Literal
+    # 扣除非终态推导，漏声明会让它既不算终态也不算非终态，run 永远收敛不了。
+    "disk_exhausted",
 ]
 
 # 非终态：attempt 仍在活跃流转、可继续接受工具调用。集合极小且稳定；终态由
@@ -196,6 +200,10 @@ class AttemptModel(BaseModel):
     scoring_deadline_at: str | None = None
     scoring_error_code: str | None = None
     scoring_error_message: str | None = None
+    # 归档：可重建目录（sandbox_home 等）被回收的时间与类别。读取方据此把
+    # 「已归档」与「没采集到」分开——两者在磁盘上都是目录不存在。
+    archived_at: str | None = None
+    archived_kinds: list[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def _no_token_in_external_refs(self) -> "AttemptModel":
@@ -257,6 +265,12 @@ class AttemptModel(BaseModel):
             "scoring_deadline_at": self.scoring_deadline_at,
             "scoring_error_code": self.scoring_error_code,
             "scoring_error_message": self.scoring_error_message,
+            "archived_at": self.archived_at,
+            "archived_kinds": (
+                json.dumps(self.archived_kinds, ensure_ascii=False)
+                if self.archived_kinds
+                else None
+            ),
         }
 
     @classmethod
@@ -311,6 +325,8 @@ class AttemptModel(BaseModel):
             scoring_deadline_at=row.get("scoring_deadline_at"),
             scoring_error_code=row.get("scoring_error_code"),
             scoring_error_message=row.get("scoring_error_message"),
+            archived_at=row.get("archived_at"),
+            archived_kinds=json.loads(row.get("archived_kinds") or "[]"),
         )
 
 
