@@ -2631,6 +2631,46 @@ tbody td a:hover { text-decoration: underline; }
   font-family: var(--mono);
 }
 
+/* judge 重评面板（per-attempt）：重新评分按钮 + 评分历史下拉 */
+.rejudge-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.rejudge-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.rejudge-history {
+  font-size: 11px;
+}
+.rejudge-history summary {
+  cursor: pointer;
+  color: var(--ink-muted);
+  font-family: var(--mono);
+}
+.rejudge-history-list {
+  margin: 6px 0 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 11px;
+}
+.rejudge-history-list li {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.rejudge-history-score {
+  font-weight: 600;
+  color: var(--text-0);
+}
+
 /* step comparison table */
 .step-table-wrap {
   overflow-x: auto;

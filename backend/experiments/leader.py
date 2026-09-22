@@ -58,10 +58,15 @@ def _tie_break(conn: sqlite3.Connection, group_id: str) -> str:
 def _candidates_through(
     conn: sqlite3.Connection, group_id: str, scope_key: str, seq: int | None = None
 ) -> list[sqlite3.Row]:
-    sequence_clause = "" if seq is None else " AND o.seq<=?"
+    sequence_clause = ""
+    subquery_seq_clause = ""
     params: tuple[Any, ...] = (group_id, scope_key)
     if seq is not None:
-        params += (seq,)
+        sequence_clause = " AND o.seq<=?"
+        # 去重子查询与外层用同一个 seq 界：consume_score_outbox 按 seq 逐条
+        # 处理时，候选集必须是「截至该 seq 的最新 revision」。
+        subquery_seq_clause = " AND o2.seq<=?"
+        params += (seq, seq)
     return conn.execute(
         "SELECT o.id AS outbox_id,o.attempt_id,o.score,o.scorer_fingerprint,o.seq,"
         "o.created_at,a.duration_ms FROM score_transition_outbox o "
@@ -69,6 +74,13 @@ def _candidates_through(
         "JOIN run_group_cells c ON c.run_id=a.run_id "
         "WHERE c.run_group_id=? AND o.scope_key=? "
         "AND a.status IN ('completed','gave_up')"
+        # 重评后同一 attempt 有多个 revision 的 outbox 行——只取最新一版，
+        # 让 leader/final_leader_state 反映**最新权威分**（重评把分打低也生效）。
+        " AND o.score_revision = ("
+        " SELECT MAX(o2.score_revision) FROM score_transition_outbox o2"
+        " WHERE o2.attempt_id=o.attempt_id AND o2.scope_key=o.scope_key"
+        + subquery_seq_clause
+        + ")"
         + sequence_clause
         + " ORDER BY o.seq,o.id",
         params,
@@ -137,6 +149,10 @@ def consume_score_outbox(db_path: Path, *, group_id: str | None = None) -> int:
                 reason = "first"
             elif previous["current_attempt_id"] != best["attempt_id"]:
                 reason = "upgrade"
+            elif previous["current_value"] != best["score"]:
+                # 同一 attempt 被重评：outbox 加了新 revision，分数可能升也可能降。
+                # 时间线如实记一条 rejudge 事件，而不是把它伪装成换人。
+                reason = "rejudge"
 
             if reason is not None:
                 sequence = conn.execute(

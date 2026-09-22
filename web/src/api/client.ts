@@ -183,6 +183,24 @@ export type AttemptSummary = {
   model_integrity?: ModelIntegrity;
 };
 
+// judge 重评历史：attempt_judge_runs 的 append-only 快照，revision 1,2,3…
+// 最新 revision 在前。直接展示用 attempts.score_total（最新权威分）。
+export type JudgeRunDimension = { dimension: string; value: number; detail: string };
+export type JudgeRun = {
+  id: string;
+  score_revision: number;
+  score_total: number;
+  status: string;
+  judge_model: string | null;
+  judge_prompt_version: string | null;
+  rubric_version: string | null;
+  manifest_ref: string | null;
+  scoring_job_id: string | null;
+  dimensions: JudgeRunDimension[];
+  created_at: string;
+};
+export type JudgeRunList = { attempt_id: string; items: JudgeRun[] };
+
 export type ModelIntegrityStatus = "not_observed" | "verified" | "violated";
 export type ModelIntegrity = {
   expected_model: string | null;
@@ -1013,6 +1031,11 @@ export const api = {
   getSecurityEvents: (runId: string, attemptId: string) =>
     req<SecurityEvent[]>("GET", `/api/runs/${runId}/attempts/${attemptId}/security_events`),
   stopRun: (runId: string) => req<{ stopped: number; run_id: string }>("POST", `/api/runs/${runId}/stop`),
+  rejudgeAttempt: (runId: string, attemptId: string) =>
+    req<{ job_id: string; attempt_id: string; status: "queued" }>(
+      "POST", `/api/runs/${runId}/attempts/${attemptId}/rejudge`),
+  getJudgeRuns: (runId: string, attemptId: string) =>
+    req<JudgeRunList>("GET", `/api/runs/${runId}/attempts/${attemptId}/judge-runs`),
   getArtifacts: (runId: string, attemptId: string) =>
     req<ArtifactDir>("GET", `/api/runs/${runId}/attempts/${attemptId}/artifacts`),
   artifactUrl: (runId: string, attemptId: string, path: string) =>
