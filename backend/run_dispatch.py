@@ -146,6 +146,46 @@ _DEFAULT_MODELS = {
 }
 
 
+def _build_blade_config(
+    settings: Settings,
+    *,
+    model: str | None = None,
+    blade_enable_thinking: bool | None = None,
+) -> BladeAdapterConfig:
+    """settings.blade → BladeAdapterConfig。CLI 与 SDK 两条通道共用。"""
+    blade = settings.blade
+    # 模型名的 provider 前缀剥离只发生在 API 边界（api.py
+    # _normalize_model_for_agent），这里拿到的已是 BA 原生 ID。不能再剥一次：
+    # 若剥离后首段恰好与某个 provider 重名（如配了名为 upstream 的 provider），
+    # 二次剥离会把已通过 catalog 校验的模型名改成未经校验的错误 ID。
+    return BladeAdapterConfig(
+        base_url=blade.base_url,
+        skills_path=Path(blade.skills_path),
+        keep_blade_session=blade.keep_blade_session,
+        api_key=blade.api_key.get_secret_value() if blade.api_key else None,
+        model=model,
+        enable_thinking=blade_enable_thinking,
+        sandbox_env_base_url=blade.sandbox_env_base_url,
+        request_timeout_seconds=blade.request_timeout_seconds,
+        inactivity_timeout_seconds=blade.inactivity_timeout_seconds,
+        reconnect_timeout_seconds=blade.reconnect_timeout_seconds,
+        progress_poll_interval_seconds=blade.progress_poll_interval_seconds,
+    )
+
+
+def build_blade_sdk_adapter(
+    settings: Settings, model: str | None = None
+) -> BladeServiceAdapter:
+    """恢复路径专用：无视 transport 配置，始终返回 SDK adapter。
+
+    断点恢复依赖 `recover_existing` / `recover_iterative_existing` 与
+    `run(resume_session_id=...)`——这些是 Socket.IO 通道独有的能力，
+    blade-cli 没有对应语义（CLI 每次 `chat run` 都新建会话）。
+    因此即便新 attempt 默认走 CLI，恢复既有 blade session 仍走 SDK。
+    """
+    return BladeServiceAdapter(_build_blade_config(settings, model=model))
+
+
 def build_adapter(
     agent_name: str,
     settings: Settings,
@@ -168,26 +208,16 @@ def build_adapter(
     launcher = _build_launcher(settings, agent_name)
 
     if agent_name == "blade-agent":
-        blade = settings.blade
-        # 模型名的 provider 前缀剥离只发生在 API 边界（api.py
-        # _normalize_model_for_agent），这里拿到的已是 BA 原生 ID。不能再剥一次：
-        # 若剥离后首段恰好与某个 provider 重名（如配了名为 upstream 的 provider），
-        # 二次剥离会把已通过 catalog 校验的模型名改成未经校验的错误 ID。
-        blade_model = model
-        api_key = blade.api_key.get_secret_value() if blade.api_key else None
-        config = BladeAdapterConfig(
-            base_url=blade.base_url,
-            skills_path=Path(blade.skills_path),
-            keep_blade_session=blade.keep_blade_session,
-            api_key=api_key,
-            model=blade_model,
-            enable_thinking=blade_enable_thinking,
-            sandbox_env_base_url=blade.sandbox_env_base_url,
-            request_timeout_seconds=blade.request_timeout_seconds,
-            inactivity_timeout_seconds=blade.inactivity_timeout_seconds,
-            reconnect_timeout_seconds=blade.reconnect_timeout_seconds,
-            progress_poll_interval_seconds=blade.progress_poll_interval_seconds,
+        config = _build_blade_config(
+            settings, model=model, blade_enable_thinking=blade_enable_thinking
         )
+        # 默认走 blade-cli 子进程；settings.blade.transport="sdk" 切回老的
+        # Socket.IO adapter。两条路打同一个 blade server，但采集能力不同
+        # （CLI 无 token usage / 无实时事件流），见 adapters/blade_cli.py。
+        if settings.blade.transport == "cli":
+            from .adapters.blade_cli import BladeCliAdapter
+
+            return BladeCliAdapter(config, cli_path=settings.blade.cli_path)
         return BladeServiceAdapter(config)
 
     if agent_name == "claude-code":

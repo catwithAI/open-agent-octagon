@@ -63,12 +63,21 @@ logger = logging.getLogger(__name__)
 
 def _list_agents(settings) -> list[dict[str, Any]]:
     agents = []
-    # blade-agent
-    blade_available = bool(settings.blade.api_key)
+    # blade-agent：默认通道是 blade-cli，除 api_key 外还要求 blade 二进制在位。
+    # 漏了这一条会让 /agents 报 available、真跑时才 cli_not_found。
+    blade_detail: str | None = None
+    blade_cli_path: str | None = None
+    if not settings.blade.api_key:
+        blade_detail = "blade.api_key not set"
+    elif settings.blade.transport == "cli":
+        blade_cli_path = settings.blade.cli_path or shutil.which("blade")
+        if not blade_cli_path:
+            blade_detail = "blade CLI not found in PATH (blade.transport=cli)"
     agents.append({
         "name": "blade-agent",
-        "status": "available" if blade_available else "not_configured",
-        "detail": None if blade_available else "blade.api_key not set",
+        "status": "available" if blade_detail is None else "not_configured",
+        "detail": blade_detail,
+        "cli_path": blade_cli_path,
     })
     # claude-code
     claude_path = shutil.which("claude")
