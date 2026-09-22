@@ -238,6 +238,25 @@ class SandboxSection(BaseModel):
         return f"{parts.scheme or 'http'}://host.docker.internal:{port}"
 
 
+class JudgeSection(BaseModel):
+    """评分后端开关：internal=agent-octagon 内置 env scorer（默认，行为不变）；
+    evals=调 octagon-evals 的 ``/evaluate`` 做 LLM-as-judge。
+
+    ``evals`` 模式只替换 judge 环节：每个维度打包成 EvaluateRequest 送 evals，
+    返回的 [0,1] 标量转回维度分后，commit / outbox / leader / provenance 全链路
+    不变。deterministic 检查类维度在 evals 侧也走其内置 checker，语义不漂移。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    backend: Literal["internal", "evals"] = "internal"
+    # evals 服务的 HTTP 入口（octagon-evals 的 start.sh 默认 8000）。
+    evals_base_url: str = "http://127.0.0.1:8000"
+    # 单次 /evaluate 的调用超时（秒）。与 octagon.scoring_deadline_seconds 的
+    # 关系：wait_for 的硬上限在 agent-octagon 侧，这里只兜住 evals 的响应。
+    evals_timeout: float = Field(default=300.0, gt=0)
+
+
 class SameModelSection(BaseModel):
     """历史遗留：same-model 模式曾经把 blade-agent/claude-code 打到独立的
     远端机器（48），有自己的 API key / vLLM 部署。48 不再使用后，
@@ -355,6 +374,7 @@ class Settings(BaseModel):
     insights: InsightsSection = Field(default_factory=InsightsSection)
     cost: CostSection = Field(default_factory=CostSection)
     sandbox: SandboxSection = Field(default_factory=SandboxSection)
+    judge: JudgeSection = Field(default_factory=JudgeSection)
     # CC/Codex 的第三方模型 provider（blade 的模型列表走 /api/blade/models 实时查，
     # 不在这里配）。api key 解析见 resolve_api_key：api_key_env 指向的环境变量
     # 优先，回落到 api_key 直填（octagon.yaml 已 gitignore）；load_settings 会把
@@ -433,6 +453,15 @@ def _apply_env_overrides(data: dict[str, Any]) -> dict[str, Any]:
     if v := os.environ.get("OCTAGON_SANDBOX_ENV_BASE_URL"):
         sandbox["env_base_url"] = v
     data["sandbox"] = sandbox
+
+    judge = dict(data.get("judge") or {})
+    if v := os.environ.get("OCTAGON_JUDGE_BACKEND"):
+        judge["backend"] = v
+    if v := os.environ.get("OCTAGON_EVALS_BASE_URL"):
+        judge["evals_base_url"] = v
+    if v := os.environ.get("OCTAGON_EVALS_TIMEOUT"):
+        judge["evals_timeout"] = v
+    data["judge"] = judge
 
     insights = dict(data.get("insights") or {})
     if v := os.environ.get("INSIGHTS_PROVIDER"):
