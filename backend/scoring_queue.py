@@ -39,6 +39,16 @@ class ScoringDeadlineExceeded(RuntimeError):
     """
 
 
+class RejudgeError(RuntimeError):
+    """重评校验失败。``status_code`` 直接映射 HTTP 响应。"""
+
+    def __init__(self, status_code: int, code: str, message: str) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.code = code
+        self.message = message
+
+
 # 未声明 env 专属版本时使用的兼容默认值。判分方式变化必须升版；
 # 具体 env 可通过 scorer.py 的
 # `__octagon_scorer_version__` 声明自己的口径版本，避免一个 env 改评分方式却
@@ -71,8 +81,13 @@ def enqueue_scoring_job(
     stats: dict[str, Any],
     security_meta: dict[str, Any],
     capacity: int,
+    execution_ended_at: str | None = None,
 ) -> str:
-    """Atomically persist execution output and its scoring job, then schedule it."""
+    """Atomically persist execution output and its scoring job, then schedule it.
+
+    ``execution_ended_at`` 仅供重评传入原执行结束时间：否则 UPDATE 会把
+    execution_ended_at 写成重评时刻，误标成"重评瞬间刚结束执行"。
+    """
     state = runtime_state.get()
     snapshot = create_scoring_snapshot(
         data_path=state.data_path,
@@ -119,7 +134,7 @@ def enqueue_scoring_job(
             "failure_kind=? WHERE id=?",
             (
                 _execution_status(adapter_status),
-                now,
+                execution_ended_at or now,
                 adapter_error_code,
                 adapter_error_message,
                 now,
@@ -151,6 +166,79 @@ def enqueue_scoring_job(
         conn.commit()
     schedule_scoring_job(job_id, capacity=capacity)
     return job_id
+
+
+def _read_security_meta(data_path: Path, attempt_id: str) -> dict[str, Any]:
+    """Read the adapter's security_meta snapshot for an attempt (best-effort)."""
+    try:
+        return json.loads(
+            (Path(data_path) / "attempts" / attempt_id / "security_meta.json").read_text(
+                encoding="utf-8"
+            )
+        )
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _prepare_rejudge(state: Any, attempt_id: str, run_id: str, capacity: int) -> dict[str, Any]:
+    """校验 + 清理旧评分投影，返回 ``enqueue_scoring_job`` 需要的全部入参。
+
+    同步函数（内部是 SQLite + 文件检查），由路由经 ``asyncio.to_thread`` 调用。
+    校验失败抛 :class:`RejudgeError`。**不删** ``score_transition_outbox`` 行：
+    ``leader_events.source_outbox_id`` 外键引用 + ``replay_leader_events`` 重放
+    都依赖它；重评 commit 由 ``_next_score_revision`` 在下一 revision 追加。
+    """
+    with _open_sync(state.db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        attempt = conn.execute(
+            "SELECT * FROM attempts WHERE id=?", (attempt_id,)
+        ).fetchone()
+        if attempt is None or str(attempt["run_id"]) != run_id:
+            raise RejudgeError(404, "attempt_not_found", "attempt not found for run")
+        exec_status = attempt["execution_status"] or ""
+        if exec_status in {"queued", "running"}:
+            raise RejudgeError(409, "attempt_not_terminal", "execution has not terminated")
+        inflight = conn.execute(
+            "SELECT id FROM scoring_jobs WHERE attempt_id=? "
+            "AND status IN ('queued','running')",
+            (attempt_id,),
+        ).fetchone()
+        if inflight is not None or attempt["scoring_status"] in {"queued", "running"}:
+            raise RejudgeError(409, "scoring_in_flight", "scoring already in flight for this attempt")
+        # 清理旧评分投影：旧 scoring_jobs 行必须删（UNIQUE(attempt_id,
+        # scorer_version) 会拦第二次入队）；scores 是当前维度的投影，清了让
+        # commit_scoring_result 重写。attempt_judge_runs 是 append-only 历史，
+        # 绝不动。
+        conn.execute("DELETE FROM scoring_jobs WHERE attempt_id=?", (attempt_id,))
+        conn.execute("DELETE FROM scores WHERE attempt_id=?", (attempt_id,))
+        conn.commit()
+    # 快照源目录必须在盘上（create_scoring_snapshot 会 copytree + hash）
+    attempt_dir = Path(state.data_path) / "attempts" / attempt_id
+    if not attempt_dir.is_dir():
+        raise RejudgeError(409, "attempt_dir_missing", "attempt artifact directory no longer exists")
+    # env 必须已加载（_execute_job 里 env is None 会 RuntimeError → job failed）
+    if state.envs.get(str(attempt["env_name"])) is None:
+        raise RejudgeError(409, "env_unavailable", "environment is not loaded")
+    return {
+        "attempt_id": attempt_id,
+        "adapter_status": exec_status,  # completed/timeout/failed 即 adapter_status
+        "adapter_error_code": attempt["execution_error_code"],
+        "adapter_error_message": attempt["execution_error_message"],
+        "stats": {
+            "external_refs": json.loads(attempt["external_refs_json"] or "{}"),
+            "event_count": int(attempt["event_count"] or 0),
+            "last_event_at": attempt["last_event_at"],
+            "thinking_count": int(attempt["thinking_count"] or 0),
+            "tool_call_count": int(attempt["tool_call_count"] or 0),
+            "token_usage": json.loads(attempt["token_usage_json"] or "{}"),
+            "cost_estimate": attempt["cost_estimate"],
+            "duration_ms": int(attempt["duration_ms"] or 0),
+            "transport_status": attempt["transport_status"] or "unknown",
+        },
+        "security_meta": _read_security_meta(state.data_path, attempt_id),
+        "capacity": capacity,
+        "execution_ended_at": attempt["execution_ended_at"],
+    }
 
 
 def _scoring_semaphore(capacity: int) -> asyncio.Semaphore:

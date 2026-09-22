@@ -121,6 +121,28 @@ def _compute_attempt_cost(
     return compute_breakdown(token_usage, model, pricing_path)
 
 
+def _next_score_revision(conn: sqlite3.Connection, attempt_id: str) -> int:
+    """下一个空闲 outbox revision：≥ MAX(attempt_judge_runs)+1，且不被占用。
+
+    与 ``record_judge_run`` 的计数基准（attempt_judge_runs）一致；while 扫描
+    覆盖「上次 commit 已写 outbox N+1 但 judge run 未落」的陈旧半提交角——
+    例如 runner 同步评分路径（defer_scoring=False）只走 commit 不走
+    record_judge_run，attempt 可能「有 outbox rev1 却无 judge run 行」。
+    """
+    row = conn.execute(
+        "SELECT COALESCE(MAX(score_revision),0)+1 FROM attempt_judge_runs "
+        "WHERE attempt_id=?",
+        (attempt_id,),
+    ).fetchone()
+    revision = int(row[0])
+    while conn.execute(
+        "SELECT 1 FROM score_transition_outbox WHERE attempt_id=? AND score_revision=?",
+        (attempt_id, revision),
+    ).fetchone() is not None:
+        revision += 1
+    return revision
+
+
 def commit_scoring_result(
     *,
     db_path: Path,
@@ -152,10 +174,14 @@ def commit_scoring_result(
     manifest_ref, fingerprint = _write_manifest(data_path, manifest)
     scored_at = _now_iso()
     with _open_sync(db_path) as conn:
+        # revision-aware 幂等护栏：首次评分 revision=1；重评 append revision 2/3…
+        # （attempt_judge_runs 从不删改）。查具体 revision 而不是写死 1，否则
+        # 第二次评分会被 no-op——judge 白跑、新分永远落不了库。
+        score_revision = _next_score_revision(conn, attempt_id)
         existing = conn.execute(
             "SELECT id FROM score_transition_outbox WHERE attempt_id=? "
-            "AND score_revision=1",
-            (attempt_id,),
+            "AND score_revision=?",
+            (attempt_id, score_revision),
         ).fetchone()
         if existing is not None:
             return str(existing[0])
@@ -237,7 +263,7 @@ def commit_scoring_result(
         sequence = conn.execute(
             "SELECT COALESCE(MAX(seq),0)+1 FROM score_transition_outbox"
         ).fetchone()[0]
-        outbox_id = f"score_{canonical_hash({'attempt_id': attempt_id, 'revision': 1}).removeprefix('sha256:')[:20]}"
+        outbox_id = f"score_{canonical_hash({'attempt_id': attempt_id, 'revision': score_revision}).removeprefix('sha256:')[:20]}"
         conn.execute(
             "INSERT INTO score_transition_outbox(id,attempt_id,score_revision,scope_key,"
             "score,scorer_fingerprint,manifest_ref,seq,created_at,scope_terminal) "
@@ -245,7 +271,7 @@ def commit_scoring_result(
             (
                 outbox_id,
                 attempt_id,
-                1,
+                score_revision,
                 scope_key,
                 score_total,
                 fingerprint,
@@ -268,7 +294,13 @@ def extract_candidates(db_path: Path, group_id: str, scope_key: str) -> Candidat
             "JOIN attempts a ON a.id=o.attempt_id "
             "JOIN run_group_cells c ON c.run_id=a.run_id "
             "WHERE c.run_group_id=? AND o.scope_key=? "
-            "AND a.status IN ('completed','gave_up') ORDER BY o.seq,o.id",
+            "AND a.status IN ('completed','gave_up') "
+            # 重评后同一 attempt 有多个 revision 的 outbox 行——只取最新一版，
+            # 否则 leader/robustness 会把同一 attempt 重复计入。
+            "AND o.score_revision = ("
+            " SELECT MAX(o2.score_revision) FROM score_transition_outbox o2"
+            " WHERE o2.attempt_id=o.attempt_id AND o2.scope_key=o.scope_key"
+            ") ORDER BY o.seq,o.id",
             (group_id, scope_key),
         ).fetchall()
     candidates = tuple(

@@ -41,7 +41,12 @@ def _snapshot_input(conn: sqlite3.Connection, group_id: str) -> dict[str, Any]:
         "SELECT a.*,o.scorer_fingerprint FROM attempts a "
         "JOIN run_group_cells c ON c.run_id=a.run_id "
         "LEFT JOIN score_transition_outbox o ON o.attempt_id=a.id "
-        "WHERE c.run_group_id=? ORDER BY a.created_at,a.id",
+        # 重评后同一 attempt 有多个 revision 的 outbox 行——只取最新一版，
+        # 否则每个 robustness slice 都会重复计入同一个 attempt。
+        " AND o.score_revision = ("
+        " SELECT MAX(o2.score_revision) FROM score_transition_outbox o2"
+        " WHERE o2.attempt_id=a.id)"
+        " WHERE c.run_group_id=? ORDER BY a.created_at,a.id",
         (group_id,),
     ).fetchall()
     return {
