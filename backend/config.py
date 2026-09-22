@@ -119,6 +119,14 @@ class BladeSection(BaseModel):
     # Socket 断开后 SDK 自动重连、续订和补放事件的宽限。
     reconnect_timeout_seconds: float = Field(default=30.0, gt=0)
     progress_poll_interval_seconds: float = Field(default=4.0, gt=0)
+    # 调用 BA 的通道："cli" 走 blade-cli 子进程（默认），"sdk" 走
+    # blade_agent_kit + Socket.IO 的老 adapter。
+    # 差异见 backend/adapters/blade_cli.py 模块 docstring：CLI 通道不采集
+    # token usage，也没有实时事件流（events.jsonl 是事后从 session history
+    # 重建的）。需要 token 口径或断点恢复时切回 "sdk"。
+    transport: Literal["cli", "sdk"] = "cli"
+    # blade 可执行文件路径；不填则在 PATH 里找 `blade`。
+    cli_path: str | None = None
 
 
 class SandboxLimits(BaseModel):
@@ -400,6 +408,10 @@ def _apply_env_overrides(data: dict[str, Any]) -> dict[str, Any]:
         blade["reconnect_timeout_seconds"] = v
     if v := os.environ.get("BLADE_PROGRESS_POLL_INTERVAL_SECONDS"):
         blade["progress_poll_interval_seconds"] = v
+    if v := os.environ.get("BLADE_TRANSPORT"):
+        blade["transport"] = v
+    if v := os.environ.get("BLADE_CLI_PATH"):
+        blade["cli_path"] = v
     data["blade"] = blade
 
     same_model = dict(data.get("same_model") or {})

@@ -13,8 +13,8 @@ from backend.wire.policy import policy_rank
 from .hashing import canonical_hash
 from .models import AgentModel, ExperimentProtocol, ProtocolLimits
 
-# agent → CLI 可执行文件名。blade-agent 不在此表（它走 SDK 调远端 server，
-# 可用性看 api_key 而非本机二进制）。
+# agent → CLI 可执行文件名。blade-agent 不在此表：它的可用性判据是
+# api_key（+ transport=cli 时的 blade 二进制），见下面 availability 的构造。
 _CLI_EXECUTABLES = {
     "claude-code": "claude",
     "codex": "codex",
@@ -28,6 +28,21 @@ _CLI_EXECUTABLES = {
 _IMPORT_PROBE_AGENTS = {"dsh": "deepseek_harness"}
 
 KNOWN_AGENTS = frozenset({"blade-agent", *_CLI_EXECUTABLES, *_IMPORT_PROBE_AGENTS})
+
+
+def _blade_availability(settings: Settings) -> str:
+    """blade-agent 可用性：api_key 必需；transport=cli 时还要 blade 二进制在位。
+
+    只看 api_key 会让实验建得出来、跑起来才 cli_not_found——横评一整批
+    attempt 全废，还会被误读成 agent 能力问题。
+    """
+    if not settings.blade.api_key:
+        return "not_configured"
+    if settings.blade.transport == "cli" and not (
+        settings.blade.cli_path or shutil.which("blade")
+    ):
+        return "not_found"
+    return "configured"
 
 
 def _module_installed(module: str) -> bool:
@@ -56,11 +71,7 @@ class CatalogSnapshotBuilder:
         # KNOWN_AGENTS 的**每一个**成员：下面 selections 用
         # `availability[item.agent]` 直接索引，漏一个就是建实验时 KeyError
         # （新接 agent 时踩过）。
-        availability = {
-            "blade-agent": (
-                "configured" if self.settings.blade.api_key else "not_configured"
-            ),
-        }
+        availability = {"blade-agent": _blade_availability(self.settings)}
         for agent_name, executable in _CLI_EXECUTABLES.items():
             availability[agent_name] = (
                 "available" if shutil.which(executable) else "not_found"
