@@ -43,3 +43,4 @@ RUNTRACE_*.md
 TRAJECTORY_API_TRACE_CONTRAST_ANALYSIS.md
 ba-agent-eval-benchmark-selection.html
 docker/agent-runtime/requirements-envs.generated.txt
+node_modules/

@@ -81,7 +81,11 @@ export function sameModelForAgent(
 ): string {
   if (agent === "blade-agent") {
     const catalogMatch = bladeModelIds.find(
-      (id) => id === bareModel || id.endsWith(`/${bareModel}`),
+      (id) => id === bareModel
+        || id.endsWith(`/${bareModel}`)
+        // blade 目录的匿名 provider 前缀形态：provider-<hex>::<model>。
+        // 之前只认 "/" 分隔，这种 id 匹配不上会回退 upstream/ 直传 → 422。
+        || id.endsWith(`::${bareModel}`),
     );
     if (catalogMatch) return catalogMatch;
     // Blade 的上游模型使用原生 source 前缀。目录接口可能因鉴权/版本暂时
@@ -91,6 +95,15 @@ export function sameModelForAgent(
   }
   const prefix = agentPrefix[agent];
   return prefix ? `${prefix}/${bareModel}` : bareModel;
+}
+
+/** blade 目录 id 的裸名：剥 transport 前缀（provider-<hex>::、blade/）取模型本体。
+ *  供「选中 blade 下拉模型 → 填 bareModel」用；sameModelForAgent 会按同一规则
+ *  把裸名重新匹配回目录 id。 */
+export function bladeBareId(id: string): string {
+  return id
+    .replace(/^provider-[0-9a-f]+::/, "")
+    .replace(/^blade\//, "");
 }
 
 export function cardinality(protocol: ExperimentProtocolDraft): BuilderValidation {
