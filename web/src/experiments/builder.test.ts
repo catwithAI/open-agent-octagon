@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   acceptRecommendation,
   availableMutators,
+  bladeBareId,
   cardinality,
   legacyProtocol,
   modelVisiblePrompt,
@@ -109,6 +110,35 @@ describe("experiment builder protocol", () => {
       {},
       [],
     )).toBe("upstream/z-ai/glm-5.2");
+  });
+
+  it("matches Blade catalog ids with the anonymous provider :: separator", () => {
+    const catalog = [
+      "provider-efe778e50f::deepseek/deepseek-v4-flash-0731",
+      "blade/minimax/minimax-m3",
+      "free/nex-agi/nex-n2.5-mini:free",
+      "qwen35b特调版",
+    ];
+    // :: 前缀形态：不再回退 upstream/，直接命中目录 id。
+    expect(sameModelForAgent("blade-agent", "deepseek/deepseek-v4-flash-0731", {}, catalog))
+      .toBe("provider-efe778e50f::deepseek/deepseek-v4-flash-0731");
+    // blade/ 前缀形态
+    expect(sameModelForAgent("blade-agent", "minimax/minimax-m3", {}, catalog))
+      .toBe("blade/minimax/minimax-m3");
+    // 自定义 label（无前缀分隔）
+    expect(sameModelForAgent("blade-agent", "qwen35b特调版", {}, catalog))
+      .toBe("qwen35b特调版");
+  });
+
+  it("extracts the bare model id from Blade catalog ids", () => {
+    expect(bladeBareId("provider-efe778e50f::deepseek/deepseek-v4-flash-0731"))
+      .toBe("deepseek/deepseek-v4-flash-0731");
+    expect(bladeBareId("blade/minimax/minimax-m3")).toBe("minimax/minimax-m3");
+    expect(bladeBareId("free/nex-agi/nex-n2.5-mini:free")).toBe("free/nex-agi/nex-n2.5-mini:free");
+    expect(bladeBareId("qwen35b特调版")).toBe("qwen35b特调版");
+    // round-trip：bare → sameModelForAgent 回到目录 id
+    const id = "provider-efe778e50f::deepseek/deepseek-v4-flash-0731";
+    expect(sameModelForAgent("blade-agent", bladeBareId(id), {}, [id])).toBe(id);
   });
 
   it("previews the timeout notice only when disclosure is enabled", () => {

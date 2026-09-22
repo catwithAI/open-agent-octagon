@@ -11,7 +11,7 @@ import {
   type TaskJson,
 } from "../api/client";
 import { ModalityBadges, ModalityChip, missingModalities, modalityOptionMark } from "../components/ModalityChips";
-import { sameModelForAgent } from "../experiments/builder";
+import { bladeBareId, sameModelForAgent } from "../experiments/builder";
 import { AGENT_NAMES } from "../agents";
 import { useI18n } from "../i18n";
 
@@ -35,6 +35,10 @@ export function SameModelSubmit() {
   const [bareModel, setBareModel] = useState("");
   const [orModels, setOrModels] = useState<OpenRouterModel[]>([]);
   const [bladeModels, setBladeModels] = useState<BladeModelOption[]>([]);
+  const [bladeDefaultModel, setBladeDefaultModel] = useState<string | null>(null);
+  const [bladeModelsError, setBladeModelsError] = useState("");
+  const [bladeFilter, setBladeFilter] = useState("");
+  const [bladePickerOpen, setBladePickerOpen] = useState(false);
   const [orFilter, setOrFilter] = useState("");
   const [agentPrefix, setAgentPrefix] = useState<Record<string, string>>({});
   const execution = "parallel" as const;
@@ -67,6 +71,8 @@ export function SameModelSubmit() {
     }).catch(() => setOrModels([]));
     api.bladeModels().then((config) => {
       setBladeModels(config.models ?? []);
+      setBladeDefaultModel(config.default ?? null);
+      setBladeModelsError(config.error ?? "");
     }).catch(() => setBladeModels([]));
   }, []);
 
@@ -136,6 +142,23 @@ export function SameModelSubmit() {
   const missingPrefix = selectedList.filter(
     (a) => a !== "blade-agent" && !agentPrefix[a],
   );
+
+  // bareModel 是否命中 blade 可用目录（含 provider-<hex>:: / blade/ 前缀形态）。
+  // 命中 → blade 走目录 id；未命中 → 回退 upstream/ 直传，blade 可能 422。
+  const bladeCatalogHasModel = (bare: string): boolean => {
+    const b = bare.trim();
+    if (!b) return false;
+    return bladeModels.some(
+      (m) => m.id === b || m.id.endsWith(`/${b}`) || m.id.endsWith(`::${b}`),
+    );
+  };
+  const bladeFiltered = (() => {
+    const q = bladeFilter.trim().toLowerCase();
+    if (!q) return bladeModels;
+    return bladeModels.filter(
+      (m) => m.id.toLowerCase().includes(q) || (m.label ?? "").toLowerCase().includes(q),
+    );
+  })();
   const canSubmit = envName && selectedList.length >= 2 && !!bareModel.trim()
     && missingPrefix.length === 0
     && !submitting && (usePrompt || !!taskId);
@@ -343,6 +366,72 @@ export function SameModelSubmit() {
             })}
           </div>
         )}
+        {/* Blade 可用模型（自动发现）：独立下拉区块，与 OpenRouter 列表分开。
+            选中即填 bareModel（剥 transport 前缀）；blade 走修好的路由回目录 id。 */}
+        <div style={{ marginTop: 10, borderTop: "1px solid var(--border-subtle)", paddingTop: 10 }}>
+          <p style={{ fontSize: 12, fontWeight: 600, marginBottom: 4, color: "var(--text-1)" }}>
+            {t("sameModel.bladeModelsTitle")}
+          </p>
+          <div className="multi-model-search">
+            <input
+              value={bladeFilter}
+              onChange={(e) => setBladeFilter(e.target.value)}
+              onFocus={() => setBladePickerOpen(true)}
+              onBlur={() => setBladePickerOpen(false)}
+              placeholder={bladeModels.length > 0
+                ? t("sameModel.bladeModelsSearch", { n: bladeModels.length })
+                : t("sameModel.bladeModelsSearchEmpty")}
+            />
+            {bladePickerOpen && bladeModels.length > 0 && (
+              <div className="model-picker-options multi-model-search-results">
+                {bladeFiltered.slice(0, 50).map((m) => (
+                  <button
+                    key={m.id}
+                    type="button"
+                    className={`model-picker-option${bareModel === bladeBareId(m.id) ? " selected" : ""}`}
+                    onMouseDown={(e) => e.preventDefault()}
+                    onClick={() => { setBareModel(bladeBareId(m.id)); setBladeFilter(""); setBladePickerOpen(false); }}
+                    title={m.label && m.label !== m.id ? `${m.label} (${m.id})` : m.id}
+                  >
+                    <span className="model-picker-option-main">
+                      {m.label || m.id}
+                      {bladeDefaultModel === m.id && (
+                        <span className="muted" style={{ marginLeft: 6, fontSize: 11 }}>
+                          {t("sameModel.bladeDefault")}
+                        </span>
+                      )}
+                    </span>
+                    {m.label && m.label !== m.id && (
+                      <span className="model-picker-option-sub">{m.id}</span>
+                    )}
+                  </button>
+                ))}
+                {bladeFiltered.length === 0 && (
+                  <div className="model-picker-empty">{t("sameModel.noMatch")}</div>
+                )}
+                {bladeFiltered.length > 50 && (
+                  <div className="model-picker-empty">
+                    {t("sameModel.moreResults", { n: bladeFiltered.length - 50 })}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+          {bladeModels.length === 0 && (
+            <p className="muted" style={{ fontSize: 12, marginTop: 4 }}>
+              {t("sameModel.bladeModelsUnavailable")}
+              {bladeModelsError && `：${bladeModelsError}`}
+            </p>
+          )}
+          {/* 仅在拿到 blade 目录时才告警未命中；目录拉取失败时不误报（可能只是
+              暂时不可达，执行层仍允许 off-catalog 直传）。 */}
+          {bladeModels.length > 0 && selected.has("blade-agent") && bareModel.trim()
+            && !bladeCatalogHasModel(bareModel.trim()) && (
+            <p className="warning" style={{ fontSize: 12, marginTop: 6 }} role="alert">
+              {t("sameModel.bladeNotInCatalog", { model: bareModel.trim() })}
+            </p>
+          )}
+        </div>
         {/* 提交预览：让用户看清每个 agent 实际会用什么 model 串。 */}
         {bareModel.trim() && (
           <p className="muted" style={{ fontSize: 12, marginTop: 6 }}>
