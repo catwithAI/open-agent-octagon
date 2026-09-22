@@ -656,6 +656,57 @@ CREATE INDEX IF NOT EXISTS idx_input_snapshots_variant
     ON attempt_input_snapshots(variant_id);
 CREATE INDEX IF NOT EXISTS idx_input_snapshots_content_hash
     ON attempt_input_snapshots(content_hash);
+
+-- 数据治理版本锚（从新 run 开始记录）。旧 attempts 无此行 = 治理前数据，
+-- 读时兼容。attempt_id 1:1 于 attempts；纯增量，不改任何现有表/列。
+CREATE TABLE IF NOT EXISTS attempt_provenance (
+    attempt_id          TEXT PRIMARY KEY REFERENCES attempts(id) ON DELETE CASCADE,
+    schema_version      TEXT NOT NULL,
+    env_dir_hash        TEXT,             -- env 目录内容 hash（meta+core+scorer+tasks+private）
+    task_id             TEXT,
+    task_content_hash   TEXT,             -- canonical task JSON 的 sha256
+    agent_name          TEXT,
+    agent_cli_version   TEXT,             -- host CLI 版本探测（docker/blade 记镜像版本于 security_meta）
+    model_canonical     TEXT,             -- 规范化模型 id（统一 provider 前缀别名）
+    judge_model         TEXT,             -- LLM judge 实际用的模型
+    judge_prompt_version TEXT,            -- judge prompt 版本（judge_result.json）
+    rubric_hash         TEXT,             -- rubric 内容 hash（rubric_versions.rubric_hash）
+    rubric_version      TEXT,             -- attempts.rubric_version 冻结值
+    input_snapshot_ref  TEXT,             -- attempt_input_snapshots.content_hash
+    manifest_ref        TEXT,             -- scores.evaluation_manifest_ref
+    provenance_complete INTEGER NOT NULL DEFAULT 0,  -- 1 = 4 锚齐全 + 已评分
+    created_at          TEXT NOT NULL,
+    updated_at          TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_attempt_provenance_env
+    ON attempt_provenance(env_dir_hash);
+CREATE INDEX IF NOT EXISTS idx_attempt_provenance_model
+    ON attempt_provenance(model_canonical);
+
+-- append-only judge 运行历史：每个 attempt 每次 judge 执行一行（revision 递增）。
+-- attempt_provenance(1:1) 存「当前权威分是谁评的」；这里存完整历史，重评时
+-- append revision 2/3… 而不覆盖。纯增量，不改任何现有表/列。
+CREATE TABLE IF NOT EXISTS attempt_judge_runs (
+    id                  TEXT PRIMARY KEY,       -- 'jgr_<hex>'
+    attempt_id          TEXT NOT NULL REFERENCES attempts(id) ON DELETE CASCADE,
+    score_revision      INTEGER NOT NULL,       -- 1,2,3…;UNIQUE(attempt_id, score_revision)
+    score_total         REAL NOT NULL,          -- 这次 judge 的总分
+    status              TEXT NOT NULL DEFAULT 'completed',  -- completed/failed/timeout/cancelled
+    judge_model         TEXT,
+    judge_prompt_version TEXT,
+    rubric_hash         TEXT,
+    rubric_version      TEXT,
+    scorer_fingerprint  TEXT,                   -- manifest canonical hash
+    manifest_ref        TEXT,
+    scoring_job_id      TEXT,
+    dimensions_json     TEXT NOT NULL DEFAULT '[]',  -- [{dimension,value,detail}] 各维度快照
+    error_code          TEXT,
+    error_message       TEXT,
+    created_at          TEXT NOT NULL,
+    UNIQUE(attempt_id, score_revision)
+);
+CREATE INDEX IF NOT EXISTS idx_attempt_judge_runs_attempt
+    ON attempt_judge_runs(attempt_id);
 """
 
 

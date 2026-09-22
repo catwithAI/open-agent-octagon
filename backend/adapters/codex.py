@@ -55,6 +55,39 @@ from .token_usage import compact_usage, empty_usage, usage_detail
 logger = logging.getLogger(__name__)
 
 
+#: cli 版本探测缓存：(cli_path, mtime) → version | None。见 claude_code._detect_cli_version。
+_CODEX_CLI_VERSION_CACHE: dict[tuple[str, float], str | None] = {}
+
+
+def _detect_cli_version(cli_path: str) -> str | None:
+    """best-effort 探测 codex CLI 版本,失败/超时返回 None(不阻塞)。
+
+    缓存按 (cli_path, mtime),每个二进制只探测一次。沙盒/docker 镜像的
+    agent 版本由 launcher 记(security_meta.agent_version),不走这里。
+    """
+    try:
+        stat = Path(cli_path).stat()
+    except OSError:
+        return None
+    key = (cli_path, stat.st_mtime)
+    if key in _CODEX_CLI_VERSION_CACHE:
+        return _CODEX_CLI_VERSION_CACHE[key]
+    version: str | None = None
+    try:
+        import subprocess
+
+        proc = subprocess.run(
+            [cli_path, "--version"],
+            capture_output=True,
+            timeout=3.0,
+        )
+        text = proc.stdout.decode("utf-8", errors="replace").strip().splitlines()
+        if text:
+            version = text[0].strip()
+    except Exception:  # noqa: BLE001 —— best-effort 探测
+        version = None
+    _CODEX_CLI_VERSION_CACHE[key] = version
+    return version
 
 
 class CodexAdapter:
@@ -208,6 +241,8 @@ class CodexAdapter:
                 error_code="codex_not_in_path",
                 error_message="codex CLI not found in PATH",
             )
+        # 版本锚(host CLI):一次缓存探测,best-effort,None 表示探测失败。
+        cli_version = _detect_cli_version(cli_path)
 
         prompt = self._render_prompt(task)
         model_ref = parse_model_ref(self.model, self.providers)
@@ -722,6 +757,7 @@ class CodexAdapter:
                 status=failure_status,
                 external_refs={
                     "cli_path": cli_path,
+                    "cli_version": cli_version,
                     "model_used": self.model,
                     "codex_thread_id": codex_thread_id,
                     "iteration_error_status": failure_status,
@@ -747,6 +783,7 @@ class CodexAdapter:
             status=status,
             external_refs={
                 "cli_path": cli_path,
+                "cli_version": cli_version,
                 "model_used": self.model,
                 # 权威 thread ID（来自 thread.started）。多轮 resume 用它；
                 # 单轮 --ephemeral 不落 session，通常为 None。
