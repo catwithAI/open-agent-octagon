@@ -370,6 +370,20 @@ async def _execute_job(
                 judge_infrastructure_error,
             )
             scorer = _resolve_scorer(env)
+            # settings.judge.backend="evals"：judge 环节换成 octagon-evals 的
+            # /evaluate。dimensions 从 env meta.yaml 打包（维度 ID=维度名，
+            # 与内置 scorer 的输出形状一致），commit/outbox/leader 全链路复用。
+            judge_cfg = getattr(getattr(state, "settings", None), "judge", None)
+            if judge_cfg is not None and judge_cfg.backend == "evals":
+                from .evals_scorer import EvalsJudgeError, make_evals_scorer
+
+                scorer = make_evals_scorer(
+                    env=env,
+                    base_url=judge_cfg.evals_base_url,
+                    timeout=judge_cfg.evals_timeout,
+                    data_path=state.data_path,
+                    job_id=job_id,
+                )
             if scorer is None:
                 raise ScorerUnavailableError(f"env {attempt['env_name']} missing scorer")
             frozen_input = resolve_attempt_input(
@@ -613,6 +627,23 @@ async def _execute_job(
             )
             # 请求 scorer 收手，避免 judge 子进程在后台继续跑。
             _invoke_scorer_cancel_hook(state, attempt_id)
+            from .run_dispatch import _refresh_run_status
+
+            _refresh_run_status(state.db_path, attempt_id)
+        except EvalsJudgeError as exc:
+            # 外部 evals judge 环节失败（服务不可达/响应非法）：记
+            # scoring_failed + judge_unavailable，score_total 保持 NULL——
+            # 与 judge_infrastructure_error 同一语义，不落业务 0 分。
+            logger.error(
+                "evals judge failed job=%s attempt=%s: %s", job_id, attempt_id, exc
+            )
+            _finish_failure(
+                state.db_path,
+                job_id,
+                status="scoring_failed",
+                code="judge_unavailable",
+                message=str(exc)[:500],
+            )
             from .run_dispatch import _refresh_run_status
 
             _refresh_run_status(state.db_path, attempt_id)
