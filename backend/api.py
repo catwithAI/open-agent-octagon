@@ -1856,7 +1856,19 @@ def build_router() -> APIRouter:
             ) from exc
         # enqueue_scoring_job 内部会 schedule_scoring_job → asyncio.create_task，
         # 必须在事件循环线程调用（与 runner 一致），不能包进 to_thread。
-        job_id = enqueue_scoring_job(**prepared)
+        try:
+            job_id = enqueue_scoring_job(**prepared)
+        except sqlite3.IntegrityError as exc:
+            # 并发 rejudge TOCTOU：两次请求都通过 scoring_in_flight 检查，第二个
+            # enqueue 撞 UNIQUE(attempt_id, scorer_version)。route 只 catch
+            # RejudgeError 会把它漏成 500，预期是 409（审查 #5）。
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "scoring_in_flight",
+                    "message": "concurrent rejudge for the same attempt",
+                },
+            ) from exc
         # 把 run 从 completed 拉回 scoring：runs.status='scoring', ended_at=NULL。
         # 否则 SSE 流在 stream:end 后已关闭、新评分永远不会被前端看到。
         await asyncio.to_thread(_refresh_run_status, state.db_path, attempt_id)

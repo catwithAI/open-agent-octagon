@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import { api, type JudgeRun } from "../api/client";
 import { useI18n } from "../i18n";
@@ -43,8 +43,14 @@ export function ReJudgePanel({
     void load();
   }, [runId, attemptId]);
 
-  // 评分结束（成功/失败）→ 刷新历史下拉
+  // 评分结束（成功/失败）→ 刷新历史下拉。跳过 mount 首次：load 已被上面的
+  // runId effect 调过，否则已评分 attempt 每次打开页面都翻倍历史请求（审查 #7）。
+  const mounted = useRef(false);
   useEffect(() => {
+    if (!mounted.current) {
+      mounted.current = true;
+      return;
+    }
     if (scoringDone) void load();
   }, [scoringDone]);
 

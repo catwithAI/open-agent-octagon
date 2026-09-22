@@ -628,6 +628,7 @@ CREATE TABLE IF NOT EXISTS score_transition_outbox (
     score REAL NOT NULL,
     scorer_fingerprint TEXT NOT NULL,
     manifest_ref TEXT,
+    scoring_job_id TEXT,
     seq INTEGER NOT NULL,
     created_at TEXT NOT NULL,
     consumed_at TEXT,
@@ -1233,6 +1234,10 @@ def _migrate_research_columns(conn: sqlite3.Connection) -> None:
     if "scope_terminal" not in outbox_cols:
         conn.execute(
             "ALTER TABLE score_transition_outbox ADD COLUMN scope_terminal INTEGER"
+        )
+    if "scoring_job_id" not in outbox_cols:
+        conn.execute(
+            "ALTER TABLE score_transition_outbox ADD COLUMN scoring_job_id TEXT"
         )
     leader_cols = {
         row[1] for row in conn.execute("PRAGMA table_info(leader_events)").fetchall()

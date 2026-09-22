@@ -82,11 +82,15 @@ def enqueue_scoring_job(
     security_meta: dict[str, Any],
     capacity: int,
     execution_ended_at: str | None = None,
+    rejudge_prev: dict[str, Any] | None = None,
 ) -> str:
     """Atomically persist execution output and its scoring job, then schedule it.
 
     ``execution_ended_at`` 仅供重评传入原执行结束时间：否则 UPDATE 会把
     execution_ended_at 写成重评时刻，误标成"重评瞬间刚结束执行"。
+
+    ``rejudge_prev`` 仅供重评传入原分数/状态：失败路径据此恢复，否则一次
+    失败的重评会永久摧毁最后一次成功评分（审查 #1）。
     """
     state = runtime_state.get()
     snapshot = create_scoring_snapshot(
@@ -102,6 +106,8 @@ def enqueue_scoring_job(
         "security_meta": security_meta,
         "snapshot_ref": snapshot.relative_path,
     }
+    if rejudge_prev is not None:
+        config["rejudge"] = rejudge_prev
     refs = dict(stats.get("external_refs") or {})
     if adapter_status != "completed":
         refs.update(
@@ -196,7 +202,10 @@ def _prepare_rejudge(state: Any, attempt_id: str, run_id: str, capacity: int) ->
         if attempt is None or str(attempt["run_id"]) != run_id:
             raise RejudgeError(404, "attempt_not_found", "attempt not found for run")
         exec_status = attempt["execution_status"] or ""
-        if exec_status in {"queued", "running"}:
+        # 白名单而不是黑名单：cancelled（用户手动 stop）和 NULL（脏旧数据）
+        # 都不能重评——否则 _execution_status 的 catch-all 会把 cancelled 转成
+        # failed，重评成功后用户的中止操作从记录里被抹掉（审查 #2）。
+        if exec_status not in {"completed", "timeout", "failed"}:
             raise RejudgeError(409, "attempt_not_terminal", "execution has not terminated")
         inflight = conn.execute(
             "SELECT id FROM scoring_jobs WHERE attempt_id=? "
@@ -205,6 +214,25 @@ def _prepare_rejudge(state: Any, attempt_id: str, run_id: str, capacity: int) ->
         ).fetchone()
         if inflight is not None or attempt["scoring_status"] in {"queued", "running"}:
             raise RejudgeError(409, "scoring_in_flight", "scoring already in flight for this attempt")
+        # rejudge 用**当前** env 的 rubric：attempts.rubric_version 是创建时冻结
+        # 的旧值，不更新的话 record_judge_run 会把新分归到旧 rubric 名下
+        # （审查 #6）。best-effort——active_rubrics 无当前版本时保持原值。
+        active_rubric = conn.execute(
+            "SELECT rubric_version FROM active_rubrics WHERE env_name=?",
+            (attempt["env_name"],),
+        ).fetchone()
+        if active_rubric is not None and active_rubric[0]:
+            conn.execute(
+                "UPDATE attempts SET rubric_version=? WHERE id=?",
+                (str(active_rubric[0]), attempt_id),
+            )
+        # 保存 rejudge 前的分数：rejudge 失败时恢复到原分，否则 attempt 永久
+        # 显示 NULL 而 leaderboard（outbox rev1）仍显示旧分，两者不一致且不可
+        # 恢复（审查 #1）。历史分（attempt_judge_runs）和 outbox 行绝不动。
+        rejudge_prev = {
+            "score_total": attempt["score_total"],
+            "status": attempt["status"],
+        }
         # 清理旧评分投影：旧 scoring_jobs 行必须删（UNIQUE(attempt_id,
         # scorer_version) 会拦第二次入队）；scores 是当前维度的投影，清了让
         # commit_scoring_result 重写。attempt_judge_runs 是 append-only 历史，
@@ -238,6 +266,7 @@ def _prepare_rejudge(state: Any, attempt_id: str, run_id: str, capacity: int) ->
         "security_meta": _read_security_meta(state.data_path, attempt_id),
         "capacity": capacity,
         "execution_ended_at": attempt["execution_ended_at"],
+        "rejudge_prev": rejudge_prev,
     }
 
 
@@ -319,6 +348,21 @@ def _job_cancelled(db_path: Path, job_id: str) -> bool:
     return row is None or row[0] is not None or row[1] == "cancelled"
 
 
+def _job_already_committed(db_path: Path, job_id: str) -> bool:
+    """该 scoring job 是否已 commit 过（crash 重跑幂等）。
+
+    commit_scoring_result 按 ``scoring_job_id`` 写 outbox；同一 job 若已成功
+    commit 过（进程在标记 job completed 前崩溃，启动恢复重跑），这里命中，
+    _execute_job 直接标记完成、**不再重复跑 judge**——否则会错误地 append
+    一条重新 judge 过的虚假 rejudge 并覆盖 score_total（审查 #3）。
+    """
+    with _open_sync(db_path) as conn:
+        row = conn.execute(
+            "SELECT 1 FROM score_transition_outbox WHERE scoring_job_id=?", (job_id,)
+        ).fetchone()
+    return row is not None
+
+
 #: execution 终态 → 顶层 status 的投影。
 #: 执行成功的（completed）保留 completed；执行本身就失败/超时的沿用原状态；
 #: 拿不到执行结论时才回落 scoring_failed。
@@ -378,11 +422,22 @@ def _finish_failure(
     failure_kind = "cancelled" if status == "cancelled" else "scoring"
     with _open_sync(db_path) as conn:
         row = conn.execute(
-            "SELECT attempt_id FROM scoring_jobs WHERE id=?", (job_id,)
+            "SELECT attempt_id, scorer_config_json FROM scoring_jobs WHERE id=?",
+            (job_id,),
         ).fetchone()
         if row is None:
             return
         attempt_id = row[0]
+        # rejudge 失败恢复：job config 里带 rejudge_prev 时，score_total 回退到
+        # rejudge 前最后一次成功评分（审查 #1）。否则 attempt 永久 NULL 而
+        # leaderboard（outbox 旧 revision）仍显示旧分，两边不一致且不可恢复。
+        prev_score_total = None
+        try:
+            _cfg = json.loads(row[1] or "{}")
+            _prev = (_cfg.get("rejudge") or {}) if isinstance(_cfg, dict) else {}
+            prev_score_total = _prev.get("score_total")
+        except (TypeError, ValueError):
+            prev_score_total = None
         conn.execute(
             "UPDATE scoring_jobs SET status=?,ended_at=?,error_code=?,error_message=? "
             "WHERE id=?",
@@ -390,10 +445,10 @@ def _finish_failure(
         )
         conn.execute(
             "UPDATE attempts SET status=?,scoring_status=?,scoring_ended_at=?,"
-            "scoring_error_code=?,scoring_error_message=?,score_total=NULL,"
+            "scoring_error_code=?,scoring_error_message=?,score_total=?,"
             "error_code=?,error_message=?,failure_kind=?,ended_at=? WHERE id=?",
             (
-                legacy, status, now, code, message, code, message,
+                legacy, status, now, code, message, prev_score_total, code, message,
                 failure_kind, now, attempt_id,
             ),
         )
@@ -434,6 +489,23 @@ async def _execute_job(
                     code="scoring_cancelled",
                     message="用户手动停止评分",
                 )
+                return
+            # crash 重跑幂等：commit 已写过 outbox（进程在标记 completed 前崩溃）
+            # → 直接标记完成，不重复跑 judge（审查 #3）。
+            if _job_already_committed(state.db_path, job_id):
+                logger.info(
+                    "scoring job already committed, skipping re-run job=%s", job_id
+                )
+                with _open_sync(state.db_path) as conn:
+                    conn.execute(
+                        "UPDATE scoring_jobs SET status='completed',ended_at=?,"
+                        "heartbeat_at=? WHERE id=?",
+                        (_now_iso(), _now_iso(), job_id),
+                    )
+                    conn.commit()
+                from .run_dispatch import _refresh_run_status
+
+                _refresh_run_status(state.db_path, attempt_id)
                 return
             with _open_sync(state.db_path) as conn:
                 conn.row_factory = sqlite3.Row
@@ -600,6 +672,7 @@ async def _execute_job(
                 duration_ms=int(attempt["duration_ms"]),
                 transport_status=attempt["transport_status"],
                 model=attempt["model"],
+                scoring_job_id=job_id,
             )
             # 数据治理锚(评分阶段补全):judge 锚 + manifest_ref + cli 版本,
             # 置 provenance_complete=1。best-effort,失败不影响评分落库。

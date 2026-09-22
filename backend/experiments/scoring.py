@@ -164,6 +164,7 @@ def commit_scoring_result(
     transport_status: str = "unknown",
     model: str | None = None,
     pricing_path: Path | None = None,
+    scoring_job_id: str | None = None,
 ) -> str:
     """Commit scores + attempt terminal + outbox in one SQLite transaction.
 
@@ -178,13 +179,26 @@ def commit_scoring_result(
         # （attempt_judge_runs 从不删改）。查具体 revision 而不是写死 1，否则
         # 第二次评分会被 no-op——judge 白跑、新分永远落不了库。
         score_revision = _next_score_revision(conn, attempt_id)
-        existing = conn.execute(
-            "SELECT id FROM score_transition_outbox WHERE attempt_id=? "
-            "AND score_revision=?",
-            (attempt_id, score_revision),
-        ).fetchone()
-        if existing is not None:
-            return str(existing[0])
+        if scoring_job_id is not None:
+            # 按 job 身份幂等：同一 scoring job 已 commit 过（commit 成功但进程
+            # 在标记 job completed 前崩溃，启动恢复重跑）直接返回既有 outbox 行。
+            # 不能按「下一个空闲 revision」判断——那个值天然不存在于 outbox，
+            # 检查永远不触发，crash 重跑会错误地 append 一条重复 judge 的 rev2。
+            existing = conn.execute(
+                "SELECT id FROM score_transition_outbox WHERE attempt_id=? "
+                "AND scoring_job_id=?",
+                (attempt_id, scoring_job_id),
+            ).fetchone()
+            if existing is not None:
+                return str(existing[0])
+        else:
+            existing = conn.execute(
+                "SELECT id FROM score_transition_outbox WHERE attempt_id=? "
+                "AND score_revision=?",
+                (attempt_id, score_revision),
+            ).fetchone()
+            if existing is not None:
+                return str(existing[0])
         attempt = conn.execute(
             "SELECT external_refs_json FROM attempts WHERE id=?", (attempt_id,)
         ).fetchone()
@@ -266,8 +280,8 @@ def commit_scoring_result(
         outbox_id = f"score_{canonical_hash({'attempt_id': attempt_id, 'revision': score_revision}).removeprefix('sha256:')[:20]}"
         conn.execute(
             "INSERT INTO score_transition_outbox(id,attempt_id,score_revision,scope_key,"
-            "score,scorer_fingerprint,manifest_ref,seq,created_at,scope_terminal) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?)",
+            "score,scorer_fingerprint,manifest_ref,scoring_job_id,seq,created_at,"
+            "scope_terminal) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
             (
                 outbox_id,
                 attempt_id,
@@ -276,6 +290,7 @@ def commit_scoring_result(
                 score_total,
                 fingerprint,
                 manifest_ref,
+                scoring_job_id,
                 sequence,
                 scored_at,
                 int(scope_terminal),

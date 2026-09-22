@@ -335,11 +335,23 @@ def record_judge_run(
                 (rubric_version,),
             ).fetchone()
             rubric_hash = rh[0] if rh else None
-        next_rev = conn.execute(
-            "SELECT COALESCE(MAX(score_revision),0)+1 FROM attempt_judge_runs "
+        # judge_runs 的 revision 对齐 outbox 最新 revision：每次评分 commit 先写
+        # outbox、judge_runs 紧跟，两者一一对应（正常路径 MAX(outbox)==
+        # MAX(judge_runs)）。同步评分路径（defer_scoring=False）的 attempt 有
+        # outbox rev1 却无 judge_runs 行：若只用 MAX(attempt_judge_runs)+1 会写
+        # rev1，与 outbox rev2 错位，历史 revision 全线偏移（审查 #4）。
+        # max(judge_runs+1, outbox)：无 outbox 行时（standalone/旧数据）仍递增。
+        judge_rev = conn.execute(
+            "SELECT COALESCE(MAX(score_revision),0) FROM attempt_judge_runs "
             "WHERE attempt_id=?",
             (attempt_id,),
         ).fetchone()[0]
+        outbox_rev = conn.execute(
+            "SELECT COALESCE(MAX(score_revision),0) FROM score_transition_outbox "
+            "WHERE attempt_id=?",
+            (attempt_id,),
+        ).fetchone()[0]
+        next_rev = max(int(judge_rev) + 1, int(outbox_rev))
         dimensions = [
             {"dimension": d[0], "value": d[1], "detail": d[2]} for d in dims
         ]
