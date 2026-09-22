@@ -134,6 +134,33 @@ the frontend is started separately from source or deployed elsewhere. See the to
 
 ---
 
+## Data governance (attempt_provenance)
+
+From new runs, each attempt gets a `attempt_provenance` row pinning the four version anchors
+needed to trust later statistics (registry / portfolio decisions):
+
+- **env** — content hash of the env's scoring contract (`meta.yaml`/`core.py`/`scorer.py`/
+  `tasks/`/`private/`/judge assets)
+- **task** — canonical task JSON hash
+- **agent** — agent name + host CLI version (`claude --version` / `codex --version`,
+  best-effort) + canonicalized model id
+- **judge** — judge model + prompt version (read back from `scoring-work/<job>/judge_result.json`)
+  + rubric hash/version
+
+Written in two idempotent stages: attempt creation (`runner._create_attempt_sync`) writes
+env/task/agent/input anchors (`provenance_complete=0`); scoring commit (`scoring_queue`)
+adds judge/manifest/cli anchors and sets `provenance_complete=1`. Both are best-effort and
+never block execution.
+
+**Existing attempts have no provenance rows** — they are treated as "pre-governance" data and
+must be excluded from anchored statistics (filter `provenance_complete=1`), or used with the
+caveat that version anchors were not frozen. The schema change is purely additive; no existing
+table or column is altered.
+
+Known limitations: 5 scenarios import framework `backend.*`, so `env_dir_hash` does not capture
+framework changes for those envs; judge anchors depend on `judge_result.json` surviving in
+`scoring-work`.
+
 ## Docs
 
 - [docs/architecture.md](docs/architecture.md) — architecture & data flow

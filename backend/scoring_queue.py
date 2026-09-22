@@ -499,6 +499,24 @@ async def _execute_job(
                 transport_status=attempt["transport_status"],
                 model=attempt["model"],
             )
+            # 数据治理锚(评分阶段补全):judge 锚 + manifest_ref + cli 版本,
+            # 置 provenance_complete=1。best-effort,失败不影响评分落库。
+            try:
+                from .provenance import finalize_attempt_provenance
+
+                await asyncio.to_thread(
+                    finalize_attempt_provenance,
+                    state.db_path,
+                    attempt_id=attempt_id,
+                    data_path=state.data_path,
+                    job_id=job_id,
+                )
+            except Exception as exc:  # noqa: BLE001 —— 治理锚缺失不阻塞评分
+                logger.warning(
+                    "attempt_provenance 评分阶段更新失败(不影响评分) attempt=%s: %s",
+                    attempt_id,
+                    exc,
+                )
             # Collect derived Product Judge evidence only after the immutable
             # snapshot was revalidated and the official score transaction committed.
             try:
