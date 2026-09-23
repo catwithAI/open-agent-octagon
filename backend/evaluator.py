@@ -152,10 +152,19 @@ def _extract_meta(env: Any) -> tuple[int, dict[str, int]]:
 # （"Blade judge 未配置" / "Blade LLM judge 未配置"），但都含「judge」与
 # 「未配置」；另收 judge 调用本身失败的几种写法。
 _JUDGE_INFRA_MARKERS = (
+    # judge 没起来
     "judge 未配置",
     "judge not configured",
     "judge 调用失败",
     "judge request failed",
+    # judge 起来了但没给出有效裁决：响应解析失败、rubric 项缺失。
+    # 2026-09-21 实测 `Blade judge response parse/validation failed:
+    # missing rubric item: <uuid>` —— judge 自己没产出合法结果，却被记成
+    # agent 得 0 分（3 个 attempt，failure_kind 全是 NULL）。
+    # 「judge 崩了」与「agent 做得差」必须分开，这是本检测的全部意义。
+    "judge response parse",
+    "parse/validation failed",
+    "missing rubric item",
 )
 
 
