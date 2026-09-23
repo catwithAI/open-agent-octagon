@@ -1,9 +1,16 @@
 """attempt 沙盒会话 → ATIF trajectory 的编排层。
 
 在 wire/insight 数据结构**之外**，直接从沙盒 HOME 里各家 CLI 的本地会话转录
-还原 ATIF-v1.7 对话流，用于归因。判 adapter：显式 ``agent_name`` 优先，否则按
-沙盒 home 推断（``.cc-iso-home`` → claude-code，``.codex-iso-home/sessions`` →
-codex）。源缺失（如 codex 历史单轮 ``--ephemeral`` 无会话）→ ``not_available``。
+还原 ATIF-v1.7 对话流，用于归因。源分两类：
+
+- **会话文件型**（claude-code / codex）：读 home 里的 CLI 自落盘转录
+  （``.cc-iso-home/.claude/projects`` / ``.codex-iso-home/sessions``，
+  沙箱模式为 ``sandbox_home`` 对应路径）；
+- **事件流型**（kimi-code / opencode / mimo-code）：读 attempt 目录的
+  ``events.jsonl``（adapter 逐行落盘的 CLI 事件流，与 Harbor 读的 stdout
+  文件同源）。这类无 home 标记可判别，须显式传 ``agent_name``。
+
+源缺失 → ``not_available``。
 """
 
 from __future__ import annotations
@@ -15,10 +22,17 @@ from typing import Any, Literal
 from .schema import Trajectory
 from .converters import claude_code as cc_converter
 from .converters import codex as codex_converter
+from .converters import kimi as kimi_converter
+from .converters import opencode as opencode_converter
 
 PRODUCER_VERSION = "octagon-atif-v1"
 
-_SUPPORTED_AGENTS = frozenset({"claude-code", "codex"})
+_SUPPORTED_AGENTS = frozenset(
+    {"claude-code", "codex", "kimi-code", "opencode", "mimo-code"}
+)
+
+#: 事件流型 agent：转换器读 attempt 目录 events.jsonl，不需 home 会话文件。
+_EVENTS_AGENTS = frozenset({"kimi-code", "opencode", "mimo-code"})
 
 
 @dataclass(frozen=True)
@@ -36,6 +50,7 @@ class EmitOutcome:
 _HOST_HOMES = {
     "claude-code": Path(".cc-iso-home"),
     "codex": Path(".codex-iso-home"),
+    "kimi-code": Path(".kimi-iso-home"),
 }
 
 #: 各 agent 在 home 根下的「存在即证明该 agent 跑过」的标记（沙箱/宿主机共用）。
@@ -44,6 +59,7 @@ _HOST_HOMES = {
 _SANDBOX_MARKERS = {
     "claude-code": ".claude/projects",
     "codex": "sessions",
+    "kimi-code": ".kimi",
 }
 
 
@@ -86,7 +102,9 @@ def emit_attempt_atif(
     参数：
     - ``attempt_dir``：attempt 数据目录（沙箱模式下含 ``sandbox_home``；
       host 模式含 ``.cc-iso-home`` / ``.codex-iso-home``）。
-    - ``agent_name``：显式指定 adapter（"claude-code" / "codex"）；缺省按 home 推断。
+    - ``agent_name``：显式指定 adapter（claude-code / codex / kimi-code /
+      opencode / mimo-code）。事件流型（kimi/opencode/mimo）**必须显式传**
+      ——它们读 attempt 目录 events.jsonl，无 home 标记可判别。
     - ``attempt_id``：产物 ``trajectory_id`` / ``session_id`` 兜底；缺省用目录名。
 
     返回：``ready`` 带校验过的 trajectory dict；``not_available`` 带原因。
@@ -106,6 +124,31 @@ def emit_attempt_atif(
             status="not_available",
             attempt_id=aid,
             reason=f"agent {agent!r} not supported (supported: {sorted(_SUPPORTED_AGENTS)})",
+        )
+
+    if agent in _EVENTS_AGENTS:
+        # 事件流型：读 attempt 目录 events.jsonl（adapter 逐行落盘的 CLI 流）。
+        if agent == "kimi-code":
+            events = kimi_converter.find_session_events(attempt_dir)
+            trajectory = kimi_converter.convert_events_to_trajectory(
+                events, attempt_id=aid
+            )
+        else:  # opencode / mimo-code 契约同构
+            events = opencode_converter.find_session_events(attempt_dir)
+            trajectory = opencode_converter.convert_events_to_trajectory(
+                events, attempt_id=aid, agent_name=agent
+            )
+        source_hint = "events.jsonl"
+        if trajectory is None:
+            return EmitOutcome(
+                status="not_available",
+                attempt_id=aid,
+                reason=f"no usable event transcript under {source_hint}",
+            )
+        return EmitOutcome(
+            status="ready",
+            attempt_id=aid,
+            trajectory=trajectory.to_json_dict(),
         )
 
     home = _resolve_home(attempt_dir, agent)
