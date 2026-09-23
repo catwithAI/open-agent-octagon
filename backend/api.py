@@ -1881,6 +1881,31 @@ def build_router() -> APIRouter:
             _list_judge_runs_sync, state.db_path, run_id, attempt_id
         )
 
+    @router.get("/runs/{run_id}/attempts/{attempt_id}/atif")
+    async def get_attempt_atif(run_id: str, attempt_id: str) -> dict[str, Any]:
+        """从沙盒本地会话还原 ATIF-v1.7 对话流（归因数据，独立于 wire/trajectory）。
+
+        只读、幂等。``not_available`` 返回 200 + 原因（如 codex 历史单轮
+        ``--ephemeral`` 无会话），不假装有数据。
+        """
+        from .atif.emitter import emit_attempt_atif
+
+        state = runtime_state.get()
+        attempt_dir = await asyncio.to_thread(
+            _artifact_attempt_dir,
+            data_path=state.data_path, db_path=state.db_path,
+            run_id=run_id, attempt_id=attempt_id,
+        )
+        outcome = await asyncio.to_thread(
+            emit_attempt_atif, attempt_dir, attempt_id=attempt_id
+        )
+        payload: dict[str, Any] = {"status": outcome.status, "attempt_id": attempt_id}
+        if outcome.trajectory is not None:
+            payload["trajectory"] = outcome.trajectory
+        if outcome.reason is not None:
+            payload["reason"] = outcome.reason
+        return payload
+
     @router.get("/runs/{run_id}/attempts/{attempt_id}/artifacts")
     async def list_artifacts(run_id: str, attempt_id: str) -> dict[str, Any]:
         state = runtime_state.get()

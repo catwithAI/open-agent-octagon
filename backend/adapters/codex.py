@@ -337,19 +337,21 @@ class CodexAdapter:
         def _build_cmd(turn: Any, *, is_first: bool) -> list[str]:
             """构造某一轮的 argv。
 
-            单轮保留 `--ephemeral`（不落 session 记录，与改造前一致）；多轮
-            **必须去掉**它——ephemeral 会话不落盘就无法 resume。
+            单轮**不再**插 `--ephemeral`：ephemeral 会话不落盘，沙盒里就没有
+            codex 的本地对话历史（threads 表空），ATIF 还原拿不到源。去掉后
+            codex 把 session rollout 写到 `.codex-iso-home/sessions/`，供
+            ``scripts/emit_atif.py`` / ``backend/atif`` 还原。**行为变更**：单轮
+            也会持久化会话（且会生成 codex_thread_id，不再是 None）。代价是
+            历史 attempt（改前单轮）没有会话文件，还原报 not_available。
+            多轮必须去掉 `--ephemeral`——ephemeral 会话不落盘就无法 resume。
             后续轮用 `codex exec resume <thread_id> <prompt>`，**禁止
             `--last`**：它挑"最近一次记录的会话"，并发多 attempt 时会 resume
             到别人的 thread 上。
             """
             turn_prompt = render_turn_prompt(task, turn, base_prompt=prompt)
             if not session_required:
-                # 单轮：在 common args 的 --json 之后插回 --ephemeral，
-                # argv 顺序与改造前逐位一致（向后兼容）。
-                args = _common_args()
-                args.insert(args.index("--skip-git-repo-check") + 1, "--ephemeral")
-                return [cli_path, "exec", *args, turn_prompt]
+                # 单轮：与多轮首轮同构，不插 --ephemeral。
+                return [cli_path, "exec", *_common_args(), turn_prompt]
             if is_first:
                 return [cli_path, "exec", *_common_args(), turn_prompt]
             if not codex_thread_id:
@@ -796,7 +798,7 @@ class CodexAdapter:
                 "cli_version": cli_version,
                 "model_used": self.model,
                 # 权威 thread ID（来自 thread.started）。多轮 resume 用它；
-                # 单轮 --ephemeral 不落 session，通常为 None。
+                # 单轮去掉 --ephemeral 后也会落盘会话，thread_id 正常非 None。
                 "codex_thread_id": codex_thread_id,
                 **iteration_refs,
                 # 稳定错误归因：泛化的 cli_error 无法区分 CLI 启动、
