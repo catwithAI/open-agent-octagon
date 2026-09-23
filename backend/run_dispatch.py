@@ -170,6 +170,7 @@ def _build_blade_config(
         inactivity_timeout_seconds=blade.inactivity_timeout_seconds,
         reconnect_timeout_seconds=blade.reconnect_timeout_seconds,
         progress_poll_interval_seconds=blade.progress_poll_interval_seconds,
+        answer_unexpected_interaction=blade.answer_unexpected_interaction,
     )
 
 

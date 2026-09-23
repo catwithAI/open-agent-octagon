@@ -74,6 +74,15 @@ BA 出了官方命令行 `blade-cli` 后，调用通道有两条，都打同一�
 `thinking_count` 恒为 0。**横评矩阵里 BA 的 token 成本列因此是空的——这是通道
 取舍，不是采集失败。** 需要 token 口径时把 transport 切回 `sdk`。
 
+**BA 提问的自动应答**：BA 在跑任务时可能提出未预声明的提问（`AskUserQuestion`，
+或 CLI 终态 `waiting_for_input`）。`blade.answer_unexpected_interaction`（默认
+true）打开时，两条通道都会自动回一句无信息量的拒绝话术「你自己看着办不要问我」
+把会话解出来继续跑——不判 `unexpected_interaction` 失败、也不替 agent 猜答案，
+防止 attempt 报废/挂死。应答次数记在 `external_refs["unexpected_interaction_auto_answered"]`，
+SDK 通道另写 `octagon:interaction_auto_answered` 事件。关闭开关恢复「未声明的
+提问即失败」语义（SDK 通道判 `unexpected_interaction`，CLI 通道 `waiting_for_input`
+视作本轮完成）。
+
 **恢复路径始终走 SDK**：`recover_existing` / `run(resume_session_id=...)` 是
 Socket.IO 独有能力，CLI 每次 `chat run` 都新建会话，没有对应语义。因此
 `recovery.py` 用 `build_blade_sdk_adapter()` 显式取 SDK adapter，与新 attempt
