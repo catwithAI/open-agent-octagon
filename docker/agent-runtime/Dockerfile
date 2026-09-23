@@ -141,14 +141,16 @@ ENV HOME=/home/agent \
     DSH_TELEMETRY_DISABLED=1
 
 # 镜像标签：后端启动检查 `docker image inspect` 读 octagon.agents 判断启用的
-# agent 是否都在，运行时把版本写进 security_meta。
+# agent 是否都在，运行时把版本写进 security_meta。mimo 走小米官方安装器、
+# 不可精确钉版本，标签如实标 unpinned（实际版本以装完 `mimo --version` 为准，
+# 不引用 versions.env 的 MIMO_VERSION）。
 LABEL org.opencontainers.image.title="octagon-agent-runtime" \
       octagon.agents="claude-code,codex,kimi-code,opencode,mimo-code,dsh" \
       octagon.agent.claude-code.version="${CLAUDE_VERSION}" \
       octagon.agent.codex.version="${CODEX_VERSION}" \
       octagon.agent.kimi-code.version="${KIMI_VERSION}" \
       octagon.agent.opencode.version="${OPENCODE_VERSION}" \
-      octagon.agent.mimo-code.version="${MIMO_VERSION}" \
+      octagon.agent.mimo-code.version="unpinned" \
       octagon.agent.dsh.version="${DSH_VERSION}"
 
 WORKDIR /home/agent
