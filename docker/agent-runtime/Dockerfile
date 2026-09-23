@@ -83,12 +83,23 @@ RUN test -n "${KIMI_VERSION}" \
     && pip3 install "kimi-cli==${KIMI_VERSION}" \
     && kimi --version | grep -F "${KIMI_VERSION}"
 
-# opencode / mimo-code：npm 全局包。
-RUN test -n "${OPENCODE_VERSION}" && test -n "${MIMO_VERSION}" \
-    && npm install -g "opencode-ai@${OPENCODE_VERSION}" "@mimo-ai/cli@${MIMO_VERSION}" \
+# opencode：npm 全局包。
+RUN test -n "${OPENCODE_VERSION}" \
+    && npm install -g "opencode-ai@${OPENCODE_VERSION}" \
     && npm cache clean --force \
-    && opencode --version | grep -F "${OPENCODE_VERSION}" \
-    && mimo --version | grep -F "${MIMO_VERSION}"
+    && opencode --version | grep -F "${OPENCODE_VERSION}"
+
+# mimo-code：小米官方安装器（与 Harbor 对齐）。npm 包 @mimo-ai/cli 无
+# versions.env 钉的 0.1.9（ETARGET），且小米官方渠道就是 `curl
+# https://mimo.xiaomi.com/install | bash`。该渠道**不可精确钉版本**——
+# 装完用 `mimo --version` 记录实际版本（smoke.sh 对 mimo 只验可运行、不比对
+# 钉点）。HOME 定向 /opt/mimo（仿 claude），确保非 root 运行时能读到二进制。
+RUN test -n "${MIMO_VERSION}" \
+    && mkdir -p /opt/mimo \
+    && HOME=/opt/mimo bash -c 'curl -fsSL https://mimo.xiaomi.com/install | bash' \
+    && ln -s /opt/mimo/.mimocode/bin/mimo /usr/local/bin/mimo \
+    && chmod -R a+rX /opt/mimo \
+    && mimo --version
 
 # dsh runtime：从 wheel 抽出 stdio JSON-RPC runtime 二进制到 /opt/dsh/runtime。
 RUN test -n "${DSH_VERSION}" \

@@ -22,7 +22,13 @@ check claude-code "$(label octagon.agent.claude-code.version)" claude --version
 check codex       "$(label octagon.agent.codex.version)"       codex --version
 check kimi-code   "$(label octagon.agent.kimi-code.version)"   kimi --version
 check opencode    "$(label octagon.agent.opencode.version)"    opencode --version
-check mimo-code   "$(label octagon.agent.mimo-code.version)"   mimo --version
+# mimo 走小米官方安装器、不可精确钉版本（见 versions.env）——只验二进制可运行。
+mimo_out="$(run mimo --version 2>&1 || true)"
+if [ -n "${mimo_out}" ]; then
+  echo "ok   mimo-code (unpinned, version: $(printf '%s' "${mimo_out}" | head -1))"
+else
+  echo "FAIL mimo-code: mimo --version 无输出" >&2; fail=1
+fi
 check dsh         "dsh-runtime"                                ls -l /opt/dsh/runtime/dsh-runtime
 
 mods="$(grep -hv '^\s*#' "${here}/requirements-base.txt" "${here}/requirements-envs.txt" \
