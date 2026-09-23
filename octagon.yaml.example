@@ -84,6 +84,12 @@ blade:
   reconnect_timeout_seconds: 30
   progress_poll_interval_seconds: 4
 
+  # BA 提出未预声明的提问（AskUserQuestion）时，自动回一句无信息的拒绝话术
+  # 「你自己看着办不要问我」续跑，而不是判 unexpected_interaction 失败。
+  # 话术刻意不给 agent 任何评测线索，只把会话从 WAITING_FOR_INPUT 解出来，
+  # 防止 attempt 报废/挂死。false 时恢复「未声明的提问即失败」语义。
+  answer_unexpected_interaction: true
+
 research_features:
   # Rollout: false (off) → 在隔离部署逐项 true (internal) → 验收后才改产品默认值。
   # Schema presence alone does not enable a writer。回滚只把对应 flag 改回 false；

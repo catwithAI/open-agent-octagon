@@ -126,6 +126,11 @@ _TERMINAL_SESSION_STATUSES = {
     "stopped",
 }
 
+#: BA 提出未预声明的提问时自动回的话术。刻意无信息量：不给 agent 任何评测
+#: 线索，只把会话从 WAITING_FOR_INPUT 解出来，防止 attempt 报废/挂死。
+#: blade_cli adapter 复用同一常量，保证两条通道口径一致。
+UNEXPECTED_INTERACTION_AUTO_ANSWER = "你自己看着办不要问我"
+
 
 def _is_not_found_error(exc: BaseException) -> bool:
     response = getattr(exc, "response", None)
@@ -380,6 +385,37 @@ def build_askuser_answer(
     return payload, answer_text
 
 
+def build_generic_askuser_answer(
+    pause_tool_data: dict[str, Any],
+) -> tuple[dict[str, Any], str]:
+    """未声明的 AskUserQuestion：回一句无信息的拒绝话术，不解任何选项。
+
+    一次提问可能带多个 question，每个都答同一句拒绝文案（custom 按 question
+    index 填）。不替 agent 猜答案、不泄漏任务/评测信息，只把会话从
+    WAITING_FOR_INPUT 解出来。payload 形状与 build_askuser_answer 一致
+    （tool_call_id 恒取运行时 pause_tool_data），server 侧同样按 custom 应答。
+    """
+    tool_call_id = str(pause_tool_data.get("tool_call_id") or "")
+    args = pause_tool_data.get("arguments")
+    questions = (
+        args.get("questions")
+        if isinstance(args, dict) and isinstance(args.get("questions"), list)
+        else []
+    )
+    custom = {
+        str(q_index): UNEXPECTED_INTERACTION_AUTO_ANSWER
+        for q_index in range(len(questions))
+    }
+    if not custom:
+        custom = {"0": UNEXPECTED_INTERACTION_AUTO_ANSWER}
+    payload = {
+        "tool_call_id": tool_call_id,
+        "selections": {},
+        "custom": custom,
+    }
+    return payload, UNEXPECTED_INTERACTION_AUTO_ANSWER
+
+
 def _session_create_error_detail(exc: Exception, entry: dict[str, Any]) -> str:
     """Preserve Blade's validation body instead of returning a generic 422."""
     response = getattr(exc, "response", None)
@@ -463,6 +499,8 @@ class BladeAdapterConfig:
     inactivity_timeout_seconds: float = 300.0
     reconnect_timeout_seconds: float = 30.0
     progress_poll_interval_seconds: float = 4.0
+    # BA 提出未预声明的提问时是否自动应答续跑（见 BladeSection 同名配置）。
+    answer_unexpected_interaction: bool = True
     # blade server 是否声明支持 session metadata 透传（协商产物）。
     # False 时收到非空 blade_session_metadata 只记 gap，不改任何请求。
     session_metadata_capability: bool = False
@@ -612,6 +650,9 @@ class BladeServiceAdapter:
         chat_end_pause_tool_data: dict[str, Any] | None = None
         interaction_answered_count = 0
         unexpected_interaction: dict[str, Any] | None = None
+        # 未声明的提问被自动拒绝话术应答的次数（answer_unexpected_interaction
+        # 打开时）。区别于 interaction_answered_count（场景声明轮的应答）。
+        interaction_auto_answered_count = 0
         error_message: str | None = None
         model_used: str | None = None
         last_activity_monotonic = time.monotonic()
@@ -1188,11 +1229,15 @@ class BladeServiceAdapter:
                         """消费本轮遗留的暂停信号。
 
                         chat:end status="paused" 说明 agent 在等交互应答。有场景
-                        预声明的 answer_interaction turn 就应答续跑，没有就判
-                        unexpected interaction 失败——不替 agent 猜答案，也不放任
-                        session 挂在 WAITING_FOR_INPUT。
+                        预声明的 answer_interaction turn 就按静态答案应答续跑；
+                        未声明的提问在 answer_unexpected_interaction 打开时回一句
+                        无信息的拒绝话术续跑（不判失败、不替 agent 猜答案、也不
+                        放任 session 挂在 WAITING_FOR_INPUT）；开关关闭才判
+                        unexpected interaction 失败。
                         """
-                        nonlocal interaction_answered_count, unexpected_interaction
+                        nonlocal interaction_answered_count
+                        nonlocal interaction_auto_answered_count
+                        nonlocal unexpected_interaction
                         nonlocal chat_end_pause_tool, chat_end_pause_tool_data
                         while (
                             not error_message
@@ -1205,6 +1250,42 @@ class BladeServiceAdapter:
                                 chat_end_pause_tool,
                             )
                             if matched is None:
+                                if self.config.answer_unexpected_interaction:
+                                    interaction_auto_answered_count += 1
+                                    answer_payload, answer_text = (
+                                        build_generic_askuser_answer(
+                                            chat_end_pause_tool_data
+                                        )
+                                    )
+                                    logger.warning(
+                                        "blade attempt=%s 收到未声明的交互请求 %s，"
+                                        "自动应答「%s」续跑",
+                                        task.attempt_id, chat_end_pause_tool,
+                                        UNEXPECTED_INTERACTION_AUTO_ANSWER,
+                                    )
+                                    _append_jsonl(events_path, with_turn_ext({
+                                        "kind": "octagon:interaction_auto_answered",
+                                        "timestamp": _now_iso(),
+                                        "raw": {
+                                            "turn_id": None,
+                                            "tool_call_id": answer_payload.get(
+                                                "tool_call_id"
+                                            ),
+                                            "pause_tool": chat_end_pause_tool,
+                                            "auto_answer": (
+                                                UNEXPECTED_INTERACTION_AUTO_ANSWER
+                                            ),
+                                        },
+                                        "source": "octagon",
+                                    }, current_turn_id, current_turn_index))
+                                    # 清空暂停状态：新一轮 chat:end 会重新填
+                                    # （可能再次暂停）。
+                                    chat_end_pause_tool = None
+                                    chat_end_pause_tool_data = None
+                                    await _await_chat_with_watchdog(
+                                        answer_text, askuser_answer=answer_payload,
+                                    )
+                                    continue
                                 unexpected_interaction = {
                                     "pause_tool": chat_end_pause_tool,
                                     "tool_call_id": chat_end_pause_tool_data.get(
@@ -1476,6 +1557,10 @@ class BladeServiceAdapter:
         external_refs["agent_stats"] = agent_stats
         if interaction_answered_count:
             external_refs["interaction_answered_count"] = interaction_answered_count
+        if interaction_auto_answered_count:
+            external_refs["unexpected_interaction_auto_answered"] = (
+                interaction_auto_answered_count
+            )
         if unexpected_interaction is not None:
             external_refs["unexpected_interaction"] = unexpected_interaction
             # 未声明的交互请求：agent 停在等待应答，任务不可能正常完成。

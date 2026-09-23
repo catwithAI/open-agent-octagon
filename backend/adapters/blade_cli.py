@@ -51,6 +51,7 @@ from .base import (
 )
 from .blade_service import (
     BLADE_SANDBOX_SECURITY_EXTRA,
+    UNEXPECTED_INTERACTION_AUTO_ANSWER,
     AdapterEnv,
     BladeAdapterConfig,
     _render_turn_prompt,
@@ -101,9 +102,11 @@ class BladeCliAdapter:
         execution_locus="docker-sandbox",
         network_required="local_service",
         system_requires=("blade",),
-        # CLI 的 AskUserQuestion 应答就是普通 `chat send`，但本版不接
-        # 交互应答编排，先如实声明 False（dispatch 会对含 answer_interaction
-        # 的 conversation fail fast，好过跑一半卡住）。
+        # CLI 的 AskUserQuestion 应答就是普通 `chat send`，但本版不接场景
+        # 预声明的结构化应答编排（无 askuser_answer 通道），先如实声明 False
+        # （dispatch 会对含 answer_interaction 的 conversation fail fast）。
+        # 未声明的提问则在本 adapter 内用 `chat send` 自动回一句拒绝话术续跑
+        # （见 _run_turn 的 waiting_for_input 循环）。
         interaction_answer=False,
         iterative_session=True,
     )
@@ -245,6 +248,8 @@ class BladeCliAdapter:
         status = "completed"
         error_code: str | None = None
         error_message: str | None = None
+        # 未声明的提问（waiting_for_input 终态）被自动拒绝话术应答的次数。
+        interaction_auto_answered_count = 0
 
         writer.conversation_started(
             turn_count=len(plan.turns),
@@ -257,8 +262,15 @@ class BladeCliAdapter:
 
             首轮 `chat run` 建会话，后续轮 `chat send` 复用同一 session——
             这是 CLI 通道能做到的「同一逻辑会话」的全部含义。
+
+            BA 可能在本轮中途提出未预声明的提问：chat run/send 阻塞到终态
+            waiting_for_input，说明 agent 在等用户应答。answer_unexpected_interaction
+            打开时自动 `chat send` 一句无信息的拒绝话术把会话解出来继续跑
+            （再次被提问则循环应答，由 deadline 兜底）；关闭时维持原语义：
+            waiting_for_input 视作本轮完成。
             """
             nonlocal session_id
+            nonlocal interaction_auto_answered_count
             prompt = _render_turn_prompt(task, turn, env, data_path)
             remaining = deadline.remaining()
 
@@ -286,6 +298,29 @@ class BladeCliAdapter:
                     code, ("cli_error", "blade_cli_error")
                 )
                 return turn_status, turn_error, (err or out).strip()[:2000]
+
+            # 自动应答未声明的提问：CLI 的终态 waiting_for_input 说明 agent 在
+            # 等应答，不续就会让 attempt 静默停在「没真正完成」。
+            while self.config.answer_unexpected_interaction and session_id is not None:
+                session_status = str(result.get("status") or "completed")
+                if session_status != "waiting_for_input":
+                    break
+                interaction_auto_answered_count += 1
+                logger.warning(
+                    "blade-cli attempt=%s 收到未声明的交互请求（waiting_for_input），"
+                    "自动应答「%s」续跑",
+                    task.attempt_id, UNEXPECTED_INTERACTION_AUTO_ANSWER,
+                )
+                remaining = deadline.remaining()
+                code, out, err = await self._chat_send(
+                    cli_path, session_id, UNEXPECTED_INTERACTION_AUTO_ANSWER, remaining
+                )
+                if code != 0:
+                    turn_status, turn_error = _EXIT_CODE_MAP.get(
+                        code, ("cli_error", "blade_cli_error")
+                    )
+                    return turn_status, turn_error, (err or out).strip()[:2000]
+                result = _parse_chat_result(out)
 
             session_status = str(result.get("status") or "completed")
             if session_status not in ("completed", "waiting_for_input"):
@@ -392,6 +427,11 @@ class BladeCliAdapter:
             )
             external_refs["artifact_sync"] = await self._recover_artifacts(
                 cli_path, session_id, workspace
+            )
+
+        if interaction_auto_answered_count:
+            external_refs["unexpected_interaction_auto_answered"] = (
+                interaction_auto_answered_count
             )
 
         return AdapterResult(
