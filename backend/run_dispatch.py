@@ -75,11 +75,15 @@ def _build_wire_sources(
     env_name: str, data_path: Any, mcp_server_names: tuple[str, ...] = (),
 ) -> list[Any]:
     """组装该 attempt 的 wire source：
-    - HttpProxySource：CC/Codex 且模型是命名第三方 provider；
+    - HttpProxySource：CC/Codex 且模型是命名第三方 provider（wire_capture_enabled
+      总开关关闭时不挂——agent 直连 provider，用于反代故障时绕过 / 明确不要采集）；
     - McpStdioSource：CC/Codex（仅包装场景显式提供的 MCP server）。
     blade attempt 一律不挂（走 SDK / Env Server HTTP，另有 source）。"""
     sources: list[Any] = []
-    if agent_name in _HTTP_PROXY_AGENTS and model:
+    if (
+        agent_name in _HTTP_PROXY_AGENTS and model
+        and settings.octagon.wire_capture_enabled
+    ):
         ref = parse_model_ref(model, settings.model_providers or {})
         if ref.provider is not None:
             from .wire.sources.http_proxy_source import HttpProxySource
