@@ -61,10 +61,33 @@ logger = logging.getLogger(__name__)
 # ---------- /agents -------------------------------------------------------
 
 
+def _sandbox_agent_status() -> tuple[bool, tuple[str, ...]]:
+    """沙箱模式下 agent 的可用性：CLI 在镜像里，宿主机 PATH 没有。
+
+    读 main.py 启动时缓存到 runtime_state 的 check_sandbox 结果；镜像
+    ``octagon.agents`` 标签列出的 agent 一律 available（locus=docker-sandbox）。
+    """
+    state = runtime_state.get()
+    sandbox = getattr(state, "sandbox_status", None)
+    if not (sandbox and getattr(sandbox, "enabled", False) and getattr(sandbox, "ok", False)):
+        return False, ()
+    image = getattr(sandbox, "image", None)
+    agents = tuple(getattr(image, "agents", ()) or ()) if image else ()
+    return True, agents
+
+
 def _list_agents(settings) -> list[dict[str, Any]]:
     agents = []
+    sandbox_ok, sandbox_agents = _sandbox_agent_status()
+
+    def _locus(name: str) -> dict[str, Any]:
+        # 只补 execution_locus：status/detail/cli_path 由各 entry 已按
+        # host 与沙箱两种判据算好，这里不能覆盖。
+        return {"locus": "docker-sandbox"} if (sandbox_ok and name in sandbox_agents) else {"locus": "host"}
+
     # blade-agent：默认通道是 blade-cli，除 api_key 外还要求 blade 二进制在位。
-    # 漏了这一条会让 /agents 报 available、真跑时才 cli_not_found。
+    # 漏了这一条会让 /agents 报 available、真跑时才 cli_not_found。blade 不在
+    # 沙箱围栏内（spec），判据不变。
     blade_detail: str | None = None
     blade_cli_path: str | None = None
     if not settings.blade.api_key:
@@ -78,48 +101,57 @@ def _list_agents(settings) -> list[dict[str, Any]]:
         "status": "available" if blade_detail is None else "not_configured",
         "detail": blade_detail,
         "cli_path": blade_cli_path,
+        "locus": "host",
     })
     # claude-code
     claude_path = shutil.which("claude")
     agents.append({
         "name": "claude-code",
-        "status": "available" if claude_path else "not_found",
+        "status": "available" if (claude_path or sandbox_ok and "claude-code" in sandbox_agents) else "not_found",
+        "detail": None if claude_path or (sandbox_ok and "claude-code" in sandbox_agents) else "claude CLI not found in PATH",
         "cli_path": claude_path,
+        **_locus("claude-code"),
     })
     # codex
     codex_path = shutil.which("codex")
     agents.append({
         "name": "codex",
-        "status": "available" if codex_path else "not_found",
-        "detail": None if codex_path else "codex CLI not found in PATH",
+        "status": "available" if (codex_path or sandbox_ok and "codex" in sandbox_agents) else "not_found",
+        "detail": None if codex_path or (sandbox_ok and "codex" in sandbox_agents) else "codex CLI not found in PATH",
         "cli_path": codex_path,
+        **_locus("codex"),
     })
     # kimi-code / opencode / mimo-code：可用性判据与 CC/codex 一致（CLI 在
-    # PATH 上即可用）。三者的模型必须显式配置到各自 provider，故 detail 里
-    # 不额外探测登录态——缺 key 由 adapter 启动前 fail fast 报 auth_failed。
+    # PATH 或沙箱镜像里即可用）。三者的模型必须显式配置到各自 provider，
+    # 缺 key 由 adapter 启动前 fail fast 报 auth_failed。
     for name, executable in (
         ("kimi-code", "kimi"),
         ("opencode", "opencode"),
         ("mimo-code", "mimo"),
     ):
         cli_path = shutil.which(executable)
+        available = bool(cli_path) or (sandbox_ok and name in sandbox_agents)
         agents.append({
             "name": name,
-            "status": "available" if cli_path else "not_found",
-            "detail": None if cli_path else f"{executable} CLI not found in PATH",
+            "status": "available" if available else "not_found",
+            "detail": None if available else f"{executable} CLI not found in PATH",
             "cli_path": cli_path,
+            **_locus(name),
         })
     # dsh：装的是 pip 包（deepseek-harness-sdk），PATH 上没有可执行文件，
     # 所以判据是模块能否被找到。共享实现与 experiments/protocol.py 同源。
     from .adapters.dsh_events import module_available
 
     dsh_installed = module_available("deepseek_harness")
+    dsh_available = dsh_installed or (sandbox_ok and "dsh" in sandbox_agents)
     agents.append({
         "name": "dsh",
-        "status": "available" if dsh_installed else "not_found",
-        "detail": None if dsh_installed else (
+        "status": "available" if dsh_available else "not_found",
+        "detail": None if dsh_available else (
             "deepseek-harness-sdk 未安装（uv pip install 'agent-octagon[dsh]'）"
+            + ("，或启用沙箱（镜像已含 dsh）" if sandbox_ok else "")
         ),
+        **_locus("dsh"),
     })
     return agents
 

@@ -33,13 +33,45 @@ class EmitOutcome:
         return PRODUCER_VERSION
 
 
+_HOST_HOMES = {
+    "claude-code": Path(".cc-iso-home"),
+    "codex": Path(".codex-iso-home"),
+}
+
+#: 各 agent 在 home 根下的「存在即证明该 agent 跑过」的标记（沙箱/宿主机共用）。
+#: codex 的 CODEX_HOME 指向 home 根，会话落在 ``<home>/sessions``；CC 的
+#: CLAUDE_CONFIG_DIR 默认 ``$HOME/.claude``，转录在 ``<home>/.claude/projects``。
+_SANDBOX_MARKERS = {
+    "claude-code": ".claude/projects",
+    "codex": "sessions",
+}
+
+
+def _resolve_home(attempt_dir: Path, agent: str) -> Path:
+    """agent 的 home 根：沙箱模式优先（``attempt_dir/sandbox_home``），
+    否则 host iso-home（``.cc-iso-home`` / ``.codex-iso-home``）。"""
+    sandbox = attempt_dir / "sandbox_home"
+    if sandbox.is_dir():
+        return sandbox
+    return attempt_dir / _HOST_HOMES.get(agent, Path(f".{agent}-iso-home"))
+
+
 def _infer_agent(attempt_dir: Path) -> str | None:
-    """按沙盒 home 推断 adapter。``.cc-iso-home/.claude/projects`` → claude-code；
-    ``.codex-iso-home``（含无 sessions 的历史单轮）→ codex。两者都无 → None。"""
-    if (attempt_dir / ".cc-iso-home" / ".claude" / "projects").is_dir():
-        return "claude-code"
+    """按 home 里的 agent 标记推断 adapter。
+
+    沙箱模式六个 agent 共用 ``sandbox_home``，故先查 ``sandbox_home`` 里的
+    标记（``.claude/projects`` → claude-code、``sessions`` → codex），再回退
+    host iso-home；最后按 host iso-home 目录存在兜底（历史 codex 单轮无
+    sessions 也算 codex，由 converter 报 not_available）。"""
+    for agent, marker in _SANDBOX_MARKERS.items():
+        if (attempt_dir / "sandbox_home" / marker).is_dir():
+            return agent
+        if (attempt_dir / _HOST_HOMES[agent] / marker).is_dir():
+            return agent
     if (attempt_dir / ".codex-iso-home").is_dir():
         return "codex"
+    if (attempt_dir / ".cc-iso-home" / ".claude" / "projects").is_dir():
+        return "claude-code"
     return None
 
 
@@ -52,8 +84,9 @@ def emit_attempt_atif(
     """把一个 attempt 目录还原成 ATIF trajectory。
 
     参数：
-    - ``attempt_dir``：attempt 数据目录（含 ``.cc-iso-home`` / ``.codex-iso-home``）。
-    - ``agent_name``：显式指定 adapter（"claude-code" / "codex"）；缺省按沙盒推断。
+    - ``attempt_dir``：attempt 数据目录（沙箱模式下含 ``sandbox_home``；
+      host 模式含 ``.cc-iso-home`` / ``.codex-iso-home``）。
+    - ``agent_name``：显式指定 adapter（"claude-code" / "codex"）；缺省按 home 推断。
     - ``attempt_id``：产物 ``trajectory_id`` / ``session_id`` 兜底；缺省用目录名。
 
     返回：``ready`` 带校验过的 trajectory dict；``not_available`` 带原因。
@@ -66,7 +99,7 @@ def emit_attempt_atif(
         return EmitOutcome(
             status="not_available",
             attempt_id=aid,
-            reason="no supported sandbox home found (.cc-iso-home / .codex-iso-home)",
+            reason="no supported agent home found (sandbox_home / .cc-iso-home / .codex-iso-home)",
         )
     if agent not in _SUPPORTED_AGENTS:
         return EmitOutcome(
@@ -75,16 +108,15 @@ def emit_attempt_atif(
             reason=f"agent {agent!r} not supported (supported: {sorted(_SUPPORTED_AGENTS)})",
         )
 
+    home = _resolve_home(attempt_dir, agent)
     if agent == "claude-code":
-        cc_home = attempt_dir / ".cc-iso-home"
-        events = cc_converter.find_session_events(cc_home, attempt_dir)
+        events = cc_converter.find_session_events(home, attempt_dir)
         trajectory = cc_converter.convert_events_to_trajectory(events, attempt_id=aid)
-        source_hint = ".cc-iso-home/.claude/projects"
+        source_hint = f"{home.name}/.claude/projects"
     else:
-        codex_home = attempt_dir / ".codex-iso-home"
-        events = codex_converter.find_session_events(codex_home)
+        events = codex_converter.find_session_events(home)
         trajectory = codex_converter.convert_events_to_trajectory(events, attempt_id=aid)
-        source_hint = ".codex-iso-home/sessions"
+        source_hint = f"{home.name}/sessions"
 
     if trajectory is None:
         return EmitOutcome(

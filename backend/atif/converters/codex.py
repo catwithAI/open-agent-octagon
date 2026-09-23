@@ -41,20 +41,23 @@ from ..schema import (
 
 
 def find_session_events(codex_home: Path) -> list[dict[str, Any]]:
-    """读 ``.codex-iso-home/sessions/<workspace>/*.jsonl``，返回有序事件。
+    """读 codex 会话 rollout，返回有序事件。
 
-    只取会话 rollout（非 ephemeral）文件；找不到返回 []。
+    会话在 ``$CODEX_HOME/sessions``；CODEX_HOME 由 adapter 指向 home 根
+    （沙箱：``sandbox_home``；宿主机：``.codex-iso-home``），个别配置也可能把
+    CODEX_HOME 设成 ``<home>/.codex``——两个位置都扫。找不到（如历史单轮
+    ``--ephemeral`` 无落盘）返回 []。
     """
-    sessions = codex_home / "sessions"
-    if not sessions.is_dir():
-        return []
-
+    roots = [codex_home / "sessions", codex_home / ".codex" / "sessions"]
     files: list[Path] = []
-    for workspace in sorted(sessions.iterdir()):
-        if workspace.is_dir():
-            files.extend(sorted(workspace.glob("*.jsonl")))
-        elif workspace.suffix == ".jsonl":
-            files.append(workspace)
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for workspace in sorted(root.iterdir()):
+            if workspace.is_dir():
+                files.extend(sorted(workspace.glob("*.jsonl")))
+            elif workspace.suffix == ".jsonl":
+                files.append(workspace)
     if not files:
         return []
 

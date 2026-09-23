@@ -134,10 +134,10 @@ def _cc_session() -> list[str]:
     ]
 
 
-def _write_cc_sandbox(data: Path, attempt_id: str, *, slug_ok: bool = True) -> Path:
-    """构造 .cc-iso-home/.claude/projects/<slug>/<session>.jsonl。"""
+def _write_cc_sandbox(data: Path, attempt_id: str, *, home_root: str = ".cc-iso-home") -> Path:
+    """构造 <home_root>/.claude/projects/<slug>/<session>.jsonl（沙箱 home_root=sandbox_home）。"""
     attempt_dir = _attempt_dir(data, attempt_id)
-    cc = attempt_dir / ".cc-iso-home" / ".claude" / "projects"
+    cc = attempt_dir / home_root / ".claude" / "projects"
     (attempt_dir / "skill_workspace").mkdir(parents=True, exist_ok=True)
     workspace = (attempt_dir / "skill_workspace").resolve().as_posix()
 
@@ -277,6 +277,33 @@ def test_emitter_cc_ready() -> None:
     validate_trajectory(out.trajectory)
 
 
+def test_emitter_discovers_sandbox_home_cc() -> None:
+    """沙箱模式：CC 转录在 sandbox_home/.claude/projects，emitter 应找到。"""
+    data = Path(tempfile.mkdtemp())
+    attempt_dir = _write_cc_sandbox(data, "att_sbx_cc", home_root="sandbox_home")
+    out = emit_attempt_atif(attempt_dir, attempt_id="att_sbx_cc")
+    assert out.status == "ready"
+    assert out.trajectory is not None
+    assert out.trajectory["agent"]["name"] == "claude-code"
+    assert len(out.trajectory["steps"]) >= 2
+
+
+def test_emitter_discovers_sandbox_home_codex() -> None:
+    """沙箱模式：codex 会话在 sandbox_home/sessions，emitter 应找到并推断 codex。"""
+    data = Path(tempfile.mkdtemp())
+    attempt_dir = _attempt_dir(data, "att_sbx_cx")
+    session = attempt_dir / "sandbox_home" / "sessions" / "w"
+    session.mkdir(parents=True, exist_ok=True)
+    (session / "rollout.jsonl").write_text(
+        "\n".join(json.dumps(e, ensure_ascii=False) for e in _codex_session())
+    )
+    out = emit_attempt_atif(attempt_dir, attempt_id="att_sbx_cx")
+    assert out.status == "ready"
+    assert out.trajectory is not None
+    assert out.trajectory["agent"]["name"] == "codex"
+    assert out.trajectory["steps"][0]["source"] == "agent"
+
+
 # ---------- API 路由 -----------------------------------------------------------
 
 
@@ -357,3 +384,57 @@ def test_api_atif_attempt_not_found() -> None:
     client = _atif_client(db, tmp)
     resp = client.get("/runs/run_1/attempts/att_missing/atif")
     assert resp.status_code == 404
+
+
+# ---------- /agents 沙箱感知 ---------------------------------------------------
+
+
+class _BladeStub:
+    api_key = "sk-blade-x"
+    transport = "cli"
+    cli_path = None
+
+
+class _SettingsStub:
+    blade = _BladeStub()
+
+
+def _fake_sandbox_status(agent_tuple: tuple[str, ...]) -> Any:
+    Image = type("Image", (), {"agents": agent_tuple})
+    return type("Status", (), {"enabled": True, "ok": True, "image": Image()})()
+
+
+def test_list_agents_sandbox_aware(monkeypatch) -> None:
+    """沙箱 ok 时 6 个 agent 报 available（CLI 在镜像里，宿主机 PATH 没有）。"""
+    import backend.api as api
+
+    agents = ("claude-code", "codex", "kimi-code", "opencode", "mimo-code", "dsh")
+    monkeypatch.setattr(
+        api.runtime_state, "get",
+        lambda: type("S", (), {"sandbox_status": _fake_sandbox_status(agents)})(),
+    )
+    listing = api._list_agents(_SettingsStub())
+    by_name = {a["name"]: a for a in listing}
+    for name in agents:
+        assert by_name[name]["status"] == "available", name
+        assert by_name[name]["locus"] == "docker-sandbox", name
+    # blade 不在沙箱围栏内：transport=cli 且无 blade 二进制 → not_configured
+    assert by_name["blade-agent"]["status"] == "not_configured"
+
+
+def test_list_agents_sandbox_off_falls_back_to_host(monkeypatch) -> None:
+    """沙箱未开/不可用：走宿主机 PATH 判据。"""
+    import backend.api as api
+
+    class _Status:
+        enabled = False
+        ok = False
+        image = None
+
+    monkeypatch.setattr(api.runtime_state, "get", lambda: type("S", (), {"sandbox_status": _Status()})())
+    listing = api._list_agents(_SettingsStub())
+    by_name = {a["name"]: a for a in listing}
+    # 宿主机缺 kimi/opencode/mimo → not_found
+    for name in ("kimi-code", "opencode", "mimo-code"):
+        assert by_name[name]["status"] == "not_found", name
+        assert by_name[name]["locus"] == "host"
