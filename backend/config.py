@@ -119,6 +119,14 @@ class BladeSection(BaseModel):
     # Socket 断开后 SDK 自动重连、续订和补放事件的宽限。
     reconnect_timeout_seconds: float = Field(default=30.0, gt=0)
     progress_poll_interval_seconds: float = Field(default=4.0, gt=0)
+    # 调用 BA 的通道："cli" 走 blade-cli 子进程（默认），"sdk" 走
+    # blade_agent_kit + Socket.IO 的老 adapter。
+    # 差异见 backend/adapters/blade_cli.py 模块 docstring：CLI 通道不采集
+    # token usage，也没有实时事件流（events.jsonl 是事后从 session history
+    # 重建的）。需要 token 口径或断点恢复时切回 "sdk"。
+    transport: Literal["cli", "sdk"] = "cli"
+    # blade 可执行文件路径；不填则在 PATH 里找 `blade`。
+    cli_path: str | None = None
 
 
 class SandboxLimits(BaseModel):
@@ -166,23 +174,41 @@ class SandboxSection(BaseModel):
     # spec 原列的 lo/loroot/sysroot/apt/fonts 合计仅 1.1G（3%）——镜像里
     # 根本没装 LibreOffice；保留它们只作无害兜底。
     #
-    # **`.config` 与 `.claude` 刻意不在列**：沙盒模式下 `host_home()` 返回的
-    # 就是 `sandbox_home`，adapter 在**容器启动前**把 agent 配置写进
-    # `sandbox_home/.config`（opencode 的 XDG_CONFIG_HOME）与
-    # `sandbox_home/.claude`（CLAUDE_CONFIG_DIR）。盖住它们 = agent 读不到
-    # 自己的配置。省 5.35G 换 agent 起不来，不划算。
-    # `.local` 收录：实测 6.28G 是 lib（运行期装的 Python 包）、1.66G 是
-    # share（mamba/mimocode），bin 全空——都是容器内重建即得的东西。
+    # **凡是 adapter 在容器启动前写过的目录，一律不能收**：沙盒模式下
+    # `host_home()` 返回的就是 `sandbox_home`，那些文件写在宿主机侧，一旦被
+    # 匿名卷盖住，agent 启动时读到的是空目录。实测确认必须排除：
+    #   `.claude`       claude-code 的 CLAUDE_CONFIG_DIR（宿主机 mkdir + 写
+    #                   settings.json）
+    #   `config`        opencode/kimi/mimo 的 <PREFIX>_CONFIG_DIR（宿主机 mkdir）
+    #   `.config`       opencode 的 XDG_CONFIG_HOME
+    #   `.local`        opencode 的 XDG_DATA_HOME / XDG_STATE_HOME
+    #   `.dsh`          dsh 的 DSH_HOME（宿主机 mkdir）
+    #   `.agents`       dsh 的 DSH_AGENTS_HOME（宿主机 mkdir）
+    #   `dsh_sessions`  dsh 的 DSH_SESSION_ROOT——**会话 jsonl 证据**，盖住就
+    #                   随容器一起销毁，后端再也读不到
+    # 合计约 18G 放弃不收。换的是「agent 能不能起来 / 证据在不在」，不能省。
+    #
+    # 注意沙盒模式下 `host_home()` **忽略**传入的 `.xxx-iso-home` 默认值、
+    # 一律返回 sandbox_home 本身，所以上面这些路径就落在家目录第一层；
+    # kimi 的 `config.toml`/`mcp.json` 甚至直接落在家目录根上（含 API key），
+    # 这也是 `/home/agent` 本身绝不能挂 tmpfs 的原因。
+    #
+    # 剩下的 `.npm`/`.cache`/`.tmp` 是纯运行期缓存（_cacache、插件），
+    # 没有任何 adapter 预写，实测合计约 12G，可安全挡在 bind mount 之外。
     ephemeral_home_dirs: list[str] = Field(
         default_factory=lambda: [
-            ".local", ".npm", ".cache", ".tmp", "config",
+            ".npm", ".cache", ".tmp",
             "lo", "loroot", "sysroot", "apt", "fonts", ".fonts",
         ]
     )
     # 其中用 tmpfs（走内存）的子集。评测机内存有限（14G / 并发 6），
-    # 只有小而热的缓存值得放内存，其余走匿名卷落 docker 存储层。
-    # 注意 .npm/.local 单个 attempt 可到近 1G，**不能**放 tmpfs。
-    tmpfs_home_dirs: list[str] = Field(default_factory=lambda: ["apt", ".cache"])
+    # 只有**确定很小**的目录才值得放内存，其余走匿名卷落 docker 存储层。
+    #
+    # `.cache` 曾在这里，已移出：实测 presentbench 场景下 mimo-code /
+    # claude-code 会把 ms-playwright 的浏览器二进制（658MB）下到 `.cache`，
+    # 512m tmpfs 直接 ENOSPC，而且并发 6 时要吃掉 4G 内存。
+    # `.npm` 同理（_cacache 可到近 100M）。两者都走匿名卷。
+    tmpfs_home_dirs: list[str] = Field(default_factory=lambda: ["apt"])
     # 单个 tmpfs 的上限。并发 6 时最坏占用 = 该值 × tmpfs 目录数 × 并发数，
     # 必须留足余量，别把评测机的内存打爆。
     tmpfs_size: str = "512m"
@@ -210,6 +236,25 @@ class SandboxSection(BaseModel):
         parts = urlsplit(public_base_url)
         port = parts.port or (443 if parts.scheme == "https" else 80)
         return f"{parts.scheme or 'http'}://host.docker.internal:{port}"
+
+
+class JudgeSection(BaseModel):
+    """评分后端开关：internal=agent-octagon 内置 env scorer（默认，行为不变）；
+    evals=调 octagon-evals 的 ``/evaluate`` 做 LLM-as-judge。
+
+    ``evals`` 模式只替换 judge 环节：每个维度打包成 EvaluateRequest 送 evals，
+    返回的 [0,1] 标量转回维度分后，commit / outbox / leader / provenance 全链路
+    不变。deterministic 检查类维度在 evals 侧也走其内置 checker，语义不漂移。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    backend: Literal["internal", "evals"] = "internal"
+    # evals 服务的 HTTP 入口（octagon-evals 的 start.sh 默认 8000）。
+    evals_base_url: str = "http://127.0.0.1:8000"
+    # 单次 /evaluate 的调用超时（秒）。与 octagon.scoring_deadline_seconds 的
+    # 关系：wait_for 的硬上限在 agent-octagon 侧，这里只兜住 evals 的响应。
+    evals_timeout: float = Field(default=300.0, gt=0)
 
 
 class SameModelSection(BaseModel):
@@ -329,6 +374,7 @@ class Settings(BaseModel):
     insights: InsightsSection = Field(default_factory=InsightsSection)
     cost: CostSection = Field(default_factory=CostSection)
     sandbox: SandboxSection = Field(default_factory=SandboxSection)
+    judge: JudgeSection = Field(default_factory=JudgeSection)
     # CC/Codex 的第三方模型 provider（blade 的模型列表走 /api/blade/models 实时查，
     # 不在这里配）。api key 解析见 resolve_api_key：api_key_env 指向的环境变量
     # 优先，回落到 api_key 直填（octagon.yaml 已 gitignore）；load_settings 会把
@@ -382,6 +428,10 @@ def _apply_env_overrides(data: dict[str, Any]) -> dict[str, Any]:
         blade["reconnect_timeout_seconds"] = v
     if v := os.environ.get("BLADE_PROGRESS_POLL_INTERVAL_SECONDS"):
         blade["progress_poll_interval_seconds"] = v
+    if v := os.environ.get("BLADE_TRANSPORT"):
+        blade["transport"] = v
+    if v := os.environ.get("BLADE_CLI_PATH"):
+        blade["cli_path"] = v
     data["blade"] = blade
 
     same_model = dict(data.get("same_model") or {})
@@ -403,6 +453,15 @@ def _apply_env_overrides(data: dict[str, Any]) -> dict[str, Any]:
     if v := os.environ.get("OCTAGON_SANDBOX_ENV_BASE_URL"):
         sandbox["env_base_url"] = v
     data["sandbox"] = sandbox
+
+    judge = dict(data.get("judge") or {})
+    if v := os.environ.get("OCTAGON_JUDGE_BACKEND"):
+        judge["backend"] = v
+    if v := os.environ.get("OCTAGON_EVALS_BASE_URL"):
+        judge["evals_base_url"] = v
+    if v := os.environ.get("OCTAGON_EVALS_TIMEOUT"):
+        judge["evals_timeout"] = v
+    data["judge"] = judge
 
     insights = dict(data.get("insights") or {})
     if v := os.environ.get("INSIGHTS_PROVIDER"):

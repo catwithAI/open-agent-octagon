@@ -63,12 +63,21 @@ logger = logging.getLogger(__name__)
 
 def _list_agents(settings) -> list[dict[str, Any]]:
     agents = []
-    # blade-agent
-    blade_available = bool(settings.blade.api_key)
+    # blade-agent：默认通道是 blade-cli，除 api_key 外还要求 blade 二进制在位。
+    # 漏了这一条会让 /agents 报 available、真跑时才 cli_not_found。
+    blade_detail: str | None = None
+    blade_cli_path: str | None = None
+    if not settings.blade.api_key:
+        blade_detail = "blade.api_key not set"
+    elif settings.blade.transport == "cli":
+        blade_cli_path = settings.blade.cli_path or shutil.which("blade")
+        if not blade_cli_path:
+            blade_detail = "blade CLI not found in PATH (blade.transport=cli)"
     agents.append({
         "name": "blade-agent",
-        "status": "available" if blade_available else "not_configured",
-        "detail": None if blade_available else "blade.api_key not set",
+        "status": "available" if blade_detail is None else "not_configured",
+        "detail": blade_detail,
+        "cli_path": blade_cli_path,
     })
     # claude-code
     claude_path = shutil.which("claude")
@@ -672,6 +681,33 @@ def _read_security_meta(data_path: Path, attempt_id: str) -> dict[str, Any]:
         )
     except (OSError, json.JSONDecodeError):
         return {}
+
+
+def _list_judge_runs_sync(db_path: Path, run_id: str, attempt_id: str) -> dict[str, Any]:
+    """Read append-only judge history (attempt_judge_runs), latest revision first."""
+    with _open_sync(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        owned = conn.execute(
+            "SELECT 1 FROM attempts WHERE id=? AND run_id=?", (attempt_id, run_id)
+        ).fetchone()
+        if owned is None:
+            raise HTTPException(status_code=404, detail="attempt not found")
+        rows = conn.execute(
+            "SELECT id, score_revision, score_total, status, judge_model,"
+            " judge_prompt_version, rubric_version, manifest_ref, scoring_job_id,"
+            " dimensions_json, created_at FROM attempt_judge_runs"
+            " WHERE attempt_id=? ORDER BY score_revision DESC",
+            (attempt_id,),
+        ).fetchall()
+    items: list[dict[str, Any]] = []
+    for row in rows:
+        item = dict(row)
+        try:
+            item["dimensions"] = json.loads(item.pop("dimensions_json") or "[]")
+        except json.JSONDecodeError:
+            item["dimensions"] = []
+        items.append(item)
+    return {"attempt_id": attempt_id, "items": items}
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -1794,6 +1830,56 @@ def build_router() -> APIRouter:
         if scoring_error is not None:
             payload["scoring_cancel_persist_error"] = scoring_error
         return payload
+
+    @router.post("/runs/{run_id}/attempts/{attempt_id}/rejudge")
+    async def rejudge_attempt_route(run_id: str, attempt_id: str) -> dict[str, Any]:
+        """重评单个 attempt：清旧 job/分数投影，按当前 rubric 重新排队评分。
+
+        历史评分保留在 ``attempt_judge_runs``（append-only），绝不清除。
+        """
+        from .run_dispatch import _refresh_run_status
+        from .scoring_queue import RejudgeError, _prepare_rejudge, enqueue_scoring_job
+
+        state = runtime_state.get()
+        settings = getattr(state, "settings", None)
+        capacity = int(
+            getattr(getattr(settings, "octagon", None), "max_active_scoring_jobs", 2)
+        )
+        try:
+            prepared = await asyncio.to_thread(
+                _prepare_rejudge, state, attempt_id, run_id, capacity
+            )
+        except RejudgeError as exc:
+            raise HTTPException(
+                status_code=exc.status_code,
+                detail={"code": exc.code, "message": exc.message},
+            ) from exc
+        # enqueue_scoring_job 内部会 schedule_scoring_job → asyncio.create_task，
+        # 必须在事件循环线程调用（与 runner 一致），不能包进 to_thread。
+        try:
+            job_id = enqueue_scoring_job(**prepared)
+        except sqlite3.IntegrityError as exc:
+            # 并发 rejudge TOCTOU：两次请求都通过 scoring_in_flight 检查，第二个
+            # enqueue 撞 UNIQUE(attempt_id, scorer_version)。route 只 catch
+            # RejudgeError 会把它漏成 500，预期是 409（审查 #5）。
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "scoring_in_flight",
+                    "message": "concurrent rejudge for the same attempt",
+                },
+            ) from exc
+        # 把 run 从 completed 拉回 scoring：runs.status='scoring', ended_at=NULL。
+        # 否则 SSE 流在 stream:end 后已关闭、新评分永远不会被前端看到。
+        await asyncio.to_thread(_refresh_run_status, state.db_path, attempt_id)
+        return {"job_id": job_id, "attempt_id": attempt_id, "status": "queued"}
+
+    @router.get("/runs/{run_id}/attempts/{attempt_id}/judge-runs")
+    async def list_attempt_judge_runs(run_id: str, attempt_id: str) -> dict[str, Any]:
+        state = runtime_state.get()
+        return await asyncio.to_thread(
+            _list_judge_runs_sync, state.db_path, run_id, attempt_id
+        )
 
     @router.get("/runs/{run_id}/attempts/{attempt_id}/artifacts")
     async def list_artifacts(run_id: str, attempt_id: str) -> dict[str, Any]:

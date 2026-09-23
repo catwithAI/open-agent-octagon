@@ -40,6 +40,12 @@ export const MESSAGES_G3: Record<string, Message> = {
   "sameModel.uploadFailed": { zh: "上传失败: {status}", en: "Upload failed: {status}" },
   "sameModel.submitting": { zh: "提交中...", en: "Submitting..." },
   "sameModel.runSameModel": { zh: "运行同模型对比", en: "Run same-model comparison" },
+  "sameModel.bladeModelsTitle": { zh: "Blade 可用模型（自动发现）", en: "Blade available models (auto-discovered)" },
+  "sameModel.bladeModelsSearch": { zh: "搜索 Blade 模型（共 {n} 个）…", en: "Search Blade models ({n} total)…" },
+  "sameModel.bladeModelsSearchEmpty": { zh: "Blade 模型列表不可用…", en: "Blade model list unavailable…" },
+  "sameModel.bladeModelsUnavailable": { zh: "Blade 模型列表不可用（可手填模型 ID）", en: "Blade model list unavailable (you can still type a model ID)" },
+  "sameModel.bladeDefault": { zh: "默认", en: "default" },
+  "sameModel.bladeNotInCatalog": { zh: "⚠ “{model}”不在 Blade 可用目录中，blade-agent 将以 upstream/{model} 直传、可能 422 不可用。建议从上方 Blade 模型列表选择。", en: "⚠ “{model}” is not in Blade's available catalog; blade-agent will pass upstream/{model} directly and may get 422. Pick from the Blade model list above." },
 
   // ---- ConversationPanel ----
   "conversationPanel.aria.turns": { zh: "对话轮次", en: "Conversation turns" },

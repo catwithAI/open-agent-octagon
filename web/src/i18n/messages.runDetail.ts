@@ -484,6 +484,17 @@ export const MESSAGES_RUN_DETAIL: Record<string, Message> = {
 
   // ---- main page: header + help ----
   "runDetail.page.stopAll": { zh: "停止全部", en: "Stop all" },
+  // ---- judge 重评 + 评分历史（append-only attempt_judge_runs，最新在前）----
+  "runDetail.rejudge.button": { zh: "重新评分", en: "Re-judge" },
+  "runDetail.rejudge.title": { zh: "重新跑一次 judge 评分（消耗 judge token）；历史评分保留，页面直接展示最新分。", en: "Re-run the judge for this attempt (consumes judge tokens); history is kept, the latest score is shown directly." },
+  "runDetail.rejudge.confirm": { zh: "确认重评？", en: "Confirm re-judge?" },
+  "runDetail.rejudge.cancel": { zh: "取消", en: "Cancel" },
+  "runDetail.rejudge.busy": { zh: "重评中…", en: "Re-judging…" },
+  "runDetail.rejudge.disabledScoring": { zh: "评分中", en: "Scoring" },
+  "runDetail.rejudge.history": { zh: "评分历史 ({n})", en: "Judge history ({n})" },
+  "runDetail.rejudge.historyEmpty": { zh: "暂无评分记录", en: "No judge runs yet" },
+  "runDetail.rejudge.rev": { zh: "第 {n} 次", en: "Rev {n}" },
+  "runDetail.rejudge.errorTitle": { zh: "重评失败", en: "Re-judge failed" },
   "runDetail.page.noAttempts": { zh: "暂无尝试", en: "No attempts yet" },
   "runDetail.page.helpSummary": { zh: "这个页面是什么？（概念说明）", en: "What is this page? (concept overview)" },
   "runDetail.page.helpP1": { zh: "运行详情页展示一次 Run 里每个 ", en: "The run detail page shows the " },

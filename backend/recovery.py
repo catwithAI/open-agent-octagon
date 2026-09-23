@@ -32,7 +32,7 @@ from .run_dispatch import (
     _build_blade_adapter_env,
     _refresh_run_status,
     _resolve_scorer,
-    build_adapter,
+    build_blade_sdk_adapter,
 )
 from .runner import _finalize_no_score, run_attempt
 
@@ -75,7 +75,8 @@ async def _retry_pending_blade_cleanup(
                 refs = json.loads(checkpoint_path.read_text(encoding="utf-8"))
                 if not isinstance(refs, dict):
                     return
-                adapter = build_adapter("blade-agent", settings)
+                # 清理既有 blade session 要用 SDK client，CLI 无此通道。
+                adapter = build_blade_sdk_adapter(settings)
                 async with adapter._new_client() as client:
                     if settings.blade.keep_blade_session:
                         cleaned = await adapter._cleanup(
@@ -384,13 +385,10 @@ async def _recover_blade_attempt(
         )
         return
 
-    adapter = build_adapter(
-        "blade-agent",
-        settings,
-        model=row.get("model"),
-        compare_mode="multi-agent",
-    )
-    assert isinstance(adapter, BladeServiceAdapter)
+    # 恢复既有 blade session 只有 SDK 通道能做（resume_session_id /
+    # recover_existing 是 Socket.IO 独有能力），与新 attempt 的 transport
+    # 配置无关——即便新 attempt 默认走 blade-cli，这里也必须是 SDK adapter。
+    adapter = build_blade_sdk_adapter(settings, model=row.get("model"))
     if refs.get("blade_base_url"):
         adapter.config.base_url = str(refs["blade_base_url"])
 

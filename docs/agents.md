@@ -54,7 +54,37 @@ env trace（工具调用）不由 adapter 返回——它由 env attempt server 
 
 ## blade-agent 接入
 
-### 原则
+### 两条通道：blade-cli（默认）与 SDK
+
+BA 出了官方命令行 `blade-cli` 后，调用通道有两条，都打同一个 blade server，
+由 `settings.blade.transport` 选择（`BLADE_TRANSPORT` 可覆盖）：
+
+| | `transport: cli`（默认） | `transport: sdk` |
+|---|---|---|
+| adapter | `adapters/blade_cli.py` | `adapters/blade_service.py` |
+| 通道 | `blade` 子进程 | `blade_agent_kit` + Socket.IO |
+| 轨迹 | 事后 `blade session history` 重建 | 实时事件流 |
+| token usage | **不采集**（字段留空） | 采集 |
+| 断点恢复 | 不支持 | 支持 |
+
+**CLI 通道的已知数据缺口**：blade-cli 只在一轮跑完后吐终态
+`{session_id, status, messages[]}`，不暴露 token usage，也没有实时事件时序。
+因此 `events.jsonl` 是事后从 `session history --json` 重建的历史节点
+（每行带 `source: "blade_cli_history"`），`token_usage` 恒为空、
+`thinking_count` 恒为 0。**横评矩阵里 BA 的 token 成本列因此是空的——这是通道
+取舍，不是采集失败。** 需要 token 口径时把 transport 切回 `sdk`。
+
+**恢复路径始终走 SDK**：`recover_existing` / `run(resume_session_id=...)` 是
+Socket.IO 独有能力，CLI 每次 `chat run` 都新建会话，没有对应语义。因此
+`recovery.py` 用 `build_blade_sdk_adapter()` 显式取 SDK adapter，与新 attempt
+的 transport 配置无关。
+
+**可用性判据**：`transport=cli` 时除 `blade.api_key` 外还要求 `blade` 二进制在
+PATH（或配 `blade.cli_path`）。`/agents` 与实验目录的 availability 都已覆盖这
+一条——漏了会变成「实验建得出来、跑起来才 cli_not_found」，整批 attempt 作废还
+会被误读成 agent 能力问题。二进制构建：`cd builtin/clis/blade-cli && make build`。
+
+### 原则（SDK 通道）
 
 - 不在 Octagon 进程内创建 `Engine`，不 import `blade_agent.host`
 - 通过 `blade_agent_kit.BladeAgentClient` 调用已运行的 blade-agent server

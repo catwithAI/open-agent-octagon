@@ -5,11 +5,13 @@ from __future__ import annotations
 import errno
 import hashlib
 import json
+import logging
 import os
 import shutil
 import sqlite3
 import stat
 import threading
+import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,6 +19,8 @@ from typing import Any
 
 from .artifact_scope import ARTIFACT_SKIP_DIRS
 from .experiments.hashing import canonical_hash
+
+logger = logging.getLogger(__name__)
 
 SNAPSHOT_SCHEMA_VERSION = "octagon-scoring-snapshot-v1"
 
@@ -39,15 +43,36 @@ class ScoringSnapshot:
 _link_stats = threading.local()
 
 
-def _link_or_copy(src: str, dst: str) -> None:
-    """优先硬链接；跨设备或不支持硬链接时回落复制。
+# 仍在被写入的文件：硬链接会让后续写入**穿透进快照**，快照哈希随之改变，
+# 判分前的 `verify_scoring_snapshot` 就报 scoring_input_mismatch。
+#
+# 2026-09-21 实测：wire capture 在 attempt 结束后仍异步 finalize，
+# `wire-sources/capture-events.jsonl.partial` 在建完快照后继续增长
+# （2712 → 3608 字节）并被 rename 成正式名，于是**全部 7 个 attempt 判分失败**。
+#
+# 容器虽已 kill（sandbox spec D-11 保证 agent 不再写），但平台自己的后处理
+# 还在写——这是原设计假设里漏掉的一类写入方。这类文件必须真复制。
+_STILL_WRITING_SUFFIXES = (".partial", ".tmp", ".lock", "-wal", "-shm", "-journal")
 
-    快照的语义是「判分期间产物不可再变」，而不是「产物有独立的第二份字节」。
-    硬链接同样满足：判分前容器已被 kill（sandbox spec D-11），没有写入方，
-    且 `_make_read_only` 把快照置为只读。源文件此后被删除也不影响快照——
-    硬链接持有 inode 引用。省下的是整整一份 attempt 树的磁盘（实测 32G）。
+
+def _is_still_writing(src: str) -> bool:
+    name = Path(src).name
+    return any(name.endswith(suffix) for suffix in _STILL_WRITING_SUFFIXES)
+
+
+def _link_or_copy(src: str, dst: str) -> None:
+    """优先硬链接；跨设备、不支持硬链接、或文件仍在被写时回落复制。
+
+    快照的语义是「产物在判分期间不可再变」，而不是「产物有独立的第二份字节」。
+    硬链接在**没有写入方**时同样满足前者，省下整整一份 attempt 树的磁盘
+    （实测 32G）；但只要还有人在写，硬链接就会把写入透进快照——所以
+    `_is_still_writing` 的文件一律真复制。
     """
     stats = _link_stats.__dict__
+    if _is_still_writing(src):
+        shutil.copy2(src, dst)
+        stats["copied"] = stats.get("copied", 0) + 1
+        return
     try:
         os.link(src, dst)
     except OSError as exc:
@@ -60,6 +85,45 @@ def _link_or_copy(src: str, dst: str) -> None:
         stats["copied"] = stats.get("copied", 0) + 1
     else:
         stats["linked"] = stats.get("linked", 0) + 1
+
+
+def _break_links_for_mutating_files(copied: Path) -> None:
+    """把「还在被写」的硬链接解成真副本。
+
+    判据是**同一文件两次观测之间 size/mtime 有变化**，不是猜文件名——后缀
+    清单只能挡住已知的那几个（`.partial` 等），平台后处理还可能以别的形式写。
+    共享 inode 时快照侧看到的就是源的实时状态，所以直接观测快照侧即可。
+
+    只扫 `st_nlink > 1` 的文件，开销与快照大小无关，只与链接数量有关。
+    """
+    candidates: dict[Path, tuple[int, int]] = {}
+    for path in copied.rglob("*"):
+        if path.is_symlink() or not path.is_file():
+            continue
+        try:
+            info = path.lstat()
+        except OSError:
+            continue
+        if info.st_nlink >= 2:
+            candidates[path] = (info.st_size, info.st_mtime_ns)
+    if not candidates:
+        return
+    # 给后处理一个可观测的时间窗；这点延迟远小于一次整树复制。
+    time.sleep(0.2)
+    for path, before in candidates.items():
+        try:
+            after = path.lstat()
+            if (after.st_size, after.st_mtime_ns) == before:
+                continue
+            temp = path.with_name(path.name + ".unlinking")
+            shutil.copy2(path, temp)
+            os.replace(temp, path)
+        except OSError:
+            continue
+        stats = _link_stats.__dict__
+        stats["linked"] = max(stats.get("linked", 0) - 1, 0)
+        stats["copied"] = stats.get("copied", 0) + 1
+        logger.warning("快照解链仍在变动的文件：%s", path.name)
 
 
 def _link_mode(stats: dict[str, int]) -> str:
@@ -265,6 +329,10 @@ def create_scoring_snapshot(*, data_path: Path, attempt_id: str) -> ScoringSnaps
         # env.db 必须先解链再重建：`_stabilize_env_db` 写的是一份事务一致的
         # backup，若沿用硬链接就会写穿到 attempt 目录里的活动数据库。
         _stabilize_env_db(source, copied_attempt)
+        # 后缀清单只能挡住「叫得出名字」的那些；平台后处理还可能以别的形式
+        # 继续写。这里做一次结构性保险：把仍与源共享 inode、且源仍在变动的
+        # 文件解链成真副本。代价只有这几个文件的一次复制。
+        _break_links_for_mutating_files(copied_attempt)
         link_mode = _link_mode(dict(_link_stats.__dict__))
         input_hash, manifest = _snapshot_hash(copied_attempt)
         destination = snapshots / input_hash.removeprefix("sha256:")

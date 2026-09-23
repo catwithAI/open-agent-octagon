@@ -39,6 +39,16 @@ class ScoringDeadlineExceeded(RuntimeError):
     """
 
 
+class RejudgeError(RuntimeError):
+    """重评校验失败。``status_code`` 直接映射 HTTP 响应。"""
+
+    def __init__(self, status_code: int, code: str, message: str) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.code = code
+        self.message = message
+
+
 # 未声明 env 专属版本时使用的兼容默认值。判分方式变化必须升版；
 # 具体 env 可通过 scorer.py 的
 # `__octagon_scorer_version__` 声明自己的口径版本，避免一个 env 改评分方式却
@@ -71,8 +81,17 @@ def enqueue_scoring_job(
     stats: dict[str, Any],
     security_meta: dict[str, Any],
     capacity: int,
+    execution_ended_at: str | None = None,
+    rejudge_prev: dict[str, Any] | None = None,
 ) -> str:
-    """Atomically persist execution output and its scoring job, then schedule it."""
+    """Atomically persist execution output and its scoring job, then schedule it.
+
+    ``execution_ended_at`` 仅供重评传入原执行结束时间：否则 UPDATE 会把
+    execution_ended_at 写成重评时刻，误标成"重评瞬间刚结束执行"。
+
+    ``rejudge_prev`` 仅供重评传入原分数/状态：失败路径据此恢复，否则一次
+    失败的重评会永久摧毁最后一次成功评分（审查 #1）。
+    """
     state = runtime_state.get()
     snapshot = create_scoring_snapshot(
         data_path=state.data_path,
@@ -87,6 +106,8 @@ def enqueue_scoring_job(
         "security_meta": security_meta,
         "snapshot_ref": snapshot.relative_path,
     }
+    if rejudge_prev is not None:
+        config["rejudge"] = rejudge_prev
     refs = dict(stats.get("external_refs") or {})
     if adapter_status != "completed":
         refs.update(
@@ -119,7 +140,7 @@ def enqueue_scoring_job(
             "failure_kind=? WHERE id=?",
             (
                 _execution_status(adapter_status),
-                now,
+                execution_ended_at or now,
                 adapter_error_code,
                 adapter_error_message,
                 now,
@@ -151,6 +172,102 @@ def enqueue_scoring_job(
         conn.commit()
     schedule_scoring_job(job_id, capacity=capacity)
     return job_id
+
+
+def _read_security_meta(data_path: Path, attempt_id: str) -> dict[str, Any]:
+    """Read the adapter's security_meta snapshot for an attempt (best-effort)."""
+    try:
+        return json.loads(
+            (Path(data_path) / "attempts" / attempt_id / "security_meta.json").read_text(
+                encoding="utf-8"
+            )
+        )
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _prepare_rejudge(state: Any, attempt_id: str, run_id: str, capacity: int) -> dict[str, Any]:
+    """校验 + 清理旧评分投影，返回 ``enqueue_scoring_job`` 需要的全部入参。
+
+    同步函数（内部是 SQLite + 文件检查），由路由经 ``asyncio.to_thread`` 调用。
+    校验失败抛 :class:`RejudgeError`。**不删** ``score_transition_outbox`` 行：
+    ``leader_events.source_outbox_id`` 外键引用 + ``replay_leader_events`` 重放
+    都依赖它；重评 commit 由 ``_next_score_revision`` 在下一 revision 追加。
+    """
+    with _open_sync(state.db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        attempt = conn.execute(
+            "SELECT * FROM attempts WHERE id=?", (attempt_id,)
+        ).fetchone()
+        if attempt is None or str(attempt["run_id"]) != run_id:
+            raise RejudgeError(404, "attempt_not_found", "attempt not found for run")
+        exec_status = attempt["execution_status"] or ""
+        # 白名单而不是黑名单：cancelled（用户手动 stop）和 NULL（脏旧数据）
+        # 都不能重评——否则 _execution_status 的 catch-all 会把 cancelled 转成
+        # failed，重评成功后用户的中止操作从记录里被抹掉（审查 #2）。
+        if exec_status not in {"completed", "timeout", "failed"}:
+            raise RejudgeError(409, "attempt_not_terminal", "execution has not terminated")
+        inflight = conn.execute(
+            "SELECT id FROM scoring_jobs WHERE attempt_id=? "
+            "AND status IN ('queued','running')",
+            (attempt_id,),
+        ).fetchone()
+        if inflight is not None or attempt["scoring_status"] in {"queued", "running"}:
+            raise RejudgeError(409, "scoring_in_flight", "scoring already in flight for this attempt")
+        # rejudge 用**当前** env 的 rubric：attempts.rubric_version 是创建时冻结
+        # 的旧值，不更新的话 record_judge_run 会把新分归到旧 rubric 名下
+        # （审查 #6）。best-effort——active_rubrics 无当前版本时保持原值。
+        active_rubric = conn.execute(
+            "SELECT rubric_version FROM active_rubrics WHERE env_name=?",
+            (attempt["env_name"],),
+        ).fetchone()
+        if active_rubric is not None and active_rubric[0]:
+            conn.execute(
+                "UPDATE attempts SET rubric_version=? WHERE id=?",
+                (str(active_rubric[0]), attempt_id),
+            )
+        # 保存 rejudge 前的分数：rejudge 失败时恢复到原分，否则 attempt 永久
+        # 显示 NULL 而 leaderboard（outbox rev1）仍显示旧分，两者不一致且不可
+        # 恢复（审查 #1）。历史分（attempt_judge_runs）和 outbox 行绝不动。
+        rejudge_prev = {
+            "score_total": attempt["score_total"],
+            "status": attempt["status"],
+        }
+        # 清理旧评分投影：旧 scoring_jobs 行必须删（UNIQUE(attempt_id,
+        # scorer_version) 会拦第二次入队）；scores 是当前维度的投影，清了让
+        # commit_scoring_result 重写。attempt_judge_runs 是 append-only 历史，
+        # 绝不动。
+        conn.execute("DELETE FROM scoring_jobs WHERE attempt_id=?", (attempt_id,))
+        conn.execute("DELETE FROM scores WHERE attempt_id=?", (attempt_id,))
+        conn.commit()
+    # 快照源目录必须在盘上（create_scoring_snapshot 会 copytree + hash）
+    attempt_dir = Path(state.data_path) / "attempts" / attempt_id
+    if not attempt_dir.is_dir():
+        raise RejudgeError(409, "attempt_dir_missing", "attempt artifact directory no longer exists")
+    # env 必须已加载（_execute_job 里 env is None 会 RuntimeError → job failed）
+    if state.envs.get(str(attempt["env_name"])) is None:
+        raise RejudgeError(409, "env_unavailable", "environment is not loaded")
+    return {
+        "attempt_id": attempt_id,
+        "adapter_status": exec_status,  # completed/timeout/failed 即 adapter_status
+        "adapter_error_code": attempt["execution_error_code"],
+        "adapter_error_message": attempt["execution_error_message"],
+        "stats": {
+            "external_refs": json.loads(attempt["external_refs_json"] or "{}"),
+            "event_count": int(attempt["event_count"] or 0),
+            "last_event_at": attempt["last_event_at"],
+            "thinking_count": int(attempt["thinking_count"] or 0),
+            "tool_call_count": int(attempt["tool_call_count"] or 0),
+            "token_usage": json.loads(attempt["token_usage_json"] or "{}"),
+            "cost_estimate": attempt["cost_estimate"],
+            "duration_ms": int(attempt["duration_ms"] or 0),
+            "transport_status": attempt["transport_status"] or "unknown",
+        },
+        "security_meta": _read_security_meta(state.data_path, attempt_id),
+        "capacity": capacity,
+        "execution_ended_at": attempt["execution_ended_at"],
+        "rejudge_prev": rejudge_prev,
+    }
 
 
 def _scoring_semaphore(capacity: int) -> asyncio.Semaphore:
@@ -231,6 +348,21 @@ def _job_cancelled(db_path: Path, job_id: str) -> bool:
     return row is None or row[0] is not None or row[1] == "cancelled"
 
 
+def _job_already_committed(db_path: Path, job_id: str) -> bool:
+    """该 scoring job 是否已 commit 过（crash 重跑幂等）。
+
+    commit_scoring_result 按 ``scoring_job_id`` 写 outbox；同一 job 若已成功
+    commit 过（进程在标记 job completed 前崩溃，启动恢复重跑），这里命中，
+    _execute_job 直接标记完成、**不再重复跑 judge**——否则会错误地 append
+    一条重新 judge 过的虚假 rejudge 并覆盖 score_total（审查 #3）。
+    """
+    with _open_sync(db_path) as conn:
+        row = conn.execute(
+            "SELECT 1 FROM score_transition_outbox WHERE scoring_job_id=?", (job_id,)
+        ).fetchone()
+    return row is not None
+
+
 #: execution 终态 → 顶层 status 的投影。
 #: 执行成功的（completed）保留 completed；执行本身就失败/超时的沿用原状态；
 #: 拿不到执行结论时才回落 scoring_failed。
@@ -290,11 +422,22 @@ def _finish_failure(
     failure_kind = "cancelled" if status == "cancelled" else "scoring"
     with _open_sync(db_path) as conn:
         row = conn.execute(
-            "SELECT attempt_id FROM scoring_jobs WHERE id=?", (job_id,)
+            "SELECT attempt_id, scorer_config_json FROM scoring_jobs WHERE id=?",
+            (job_id,),
         ).fetchone()
         if row is None:
             return
         attempt_id = row[0]
+        # rejudge 失败恢复：job config 里带 rejudge_prev 时，score_total 回退到
+        # rejudge 前最后一次成功评分（审查 #1）。否则 attempt 永久 NULL 而
+        # leaderboard（outbox 旧 revision）仍显示旧分，两边不一致且不可恢复。
+        prev_score_total = None
+        try:
+            _cfg = json.loads(row[1] or "{}")
+            _prev = (_cfg.get("rejudge") or {}) if isinstance(_cfg, dict) else {}
+            prev_score_total = _prev.get("score_total")
+        except (TypeError, ValueError):
+            prev_score_total = None
         conn.execute(
             "UPDATE scoring_jobs SET status=?,ended_at=?,error_code=?,error_message=? "
             "WHERE id=?",
@@ -302,10 +445,10 @@ def _finish_failure(
         )
         conn.execute(
             "UPDATE attempts SET status=?,scoring_status=?,scoring_ended_at=?,"
-            "scoring_error_code=?,scoring_error_message=?,score_total=NULL,"
+            "scoring_error_code=?,scoring_error_message=?,score_total=?,"
             "error_code=?,error_message=?,failure_kind=?,ended_at=? WHERE id=?",
             (
-                legacy, status, now, code, message, code, message,
+                legacy, status, now, code, message, prev_score_total, code, message,
                 failure_kind, now, attempt_id,
             ),
         )
@@ -347,6 +490,23 @@ async def _execute_job(
                     message="用户手动停止评分",
                 )
                 return
+            # crash 重跑幂等：commit 已写过 outbox（进程在标记 completed 前崩溃）
+            # → 直接标记完成，不重复跑 judge（审查 #3）。
+            if _job_already_committed(state.db_path, job_id):
+                logger.info(
+                    "scoring job already committed, skipping re-run job=%s", job_id
+                )
+                with _open_sync(state.db_path) as conn:
+                    conn.execute(
+                        "UPDATE scoring_jobs SET status='completed',ended_at=?,"
+                        "heartbeat_at=? WHERE id=?",
+                        (_now_iso(), _now_iso(), job_id),
+                    )
+                    conn.commit()
+                from .run_dispatch import _refresh_run_status
+
+                _refresh_run_status(state.db_path, attempt_id)
+                return
             with _open_sync(state.db_path) as conn:
                 conn.row_factory = sqlite3.Row
                 attempt = conn.execute(
@@ -370,6 +530,20 @@ async def _execute_job(
                 judge_infrastructure_error,
             )
             scorer = _resolve_scorer(env)
+            # settings.judge.backend="evals"：judge 环节换成 octagon-evals 的
+            # /evaluate。dimensions 从 env meta.yaml 打包（维度 ID=维度名，
+            # 与内置 scorer 的输出形状一致），commit/outbox/leader 全链路复用。
+            judge_cfg = getattr(getattr(state, "settings", None), "judge", None)
+            if judge_cfg is not None and judge_cfg.backend == "evals":
+                from .evals_scorer import EvalsJudgeError, make_evals_scorer
+
+                scorer = make_evals_scorer(
+                    env=env,
+                    base_url=judge_cfg.evals_base_url,
+                    timeout=judge_cfg.evals_timeout,
+                    data_path=state.data_path,
+                    job_id=job_id,
+                )
             if scorer is None:
                 raise ScorerUnavailableError(f"env {attempt['env_name']} missing scorer")
             frozen_input = resolve_attempt_input(
@@ -498,7 +672,26 @@ async def _execute_job(
                 duration_ms=int(attempt["duration_ms"]),
                 transport_status=attempt["transport_status"],
                 model=attempt["model"],
+                scoring_job_id=job_id,
             )
+            # 数据治理锚(评分阶段补全):judge 锚 + manifest_ref + cli 版本,
+            # 置 provenance_complete=1。best-effort,失败不影响评分落库。
+            try:
+                from .provenance import finalize_attempt_provenance
+
+                await asyncio.to_thread(
+                    finalize_attempt_provenance,
+                    state.db_path,
+                    attempt_id=attempt_id,
+                    data_path=state.data_path,
+                    job_id=job_id,
+                )
+            except Exception as exc:  # noqa: BLE001 —— 治理锚缺失不阻塞评分
+                logger.warning(
+                    "attempt_provenance 评分阶段更新失败(不影响评分) attempt=%s: %s",
+                    attempt_id,
+                    exc,
+                )
             # Collect derived Product Judge evidence only after the immutable
             # snapshot was revalidated and the official score transaction committed.
             try:
@@ -595,6 +788,23 @@ async def _execute_job(
             )
             # 请求 scorer 收手，避免 judge 子进程在后台继续跑。
             _invoke_scorer_cancel_hook(state, attempt_id)
+            from .run_dispatch import _refresh_run_status
+
+            _refresh_run_status(state.db_path, attempt_id)
+        except EvalsJudgeError as exc:
+            # 外部 evals judge 环节失败（服务不可达/响应非法）：记
+            # scoring_failed + judge_unavailable，score_total 保持 NULL——
+            # 与 judge_infrastructure_error 同一语义，不落业务 0 分。
+            logger.error(
+                "evals judge failed job=%s attempt=%s: %s", job_id, attempt_id, exc
+            )
+            _finish_failure(
+                state.db_path,
+                job_id,
+                status="scoring_failed",
+                code="judge_unavailable",
+                message=str(exc)[:500],
+            )
             from .run_dispatch import _refresh_run_status
 
             _refresh_run_status(state.db_path, attempt_id)

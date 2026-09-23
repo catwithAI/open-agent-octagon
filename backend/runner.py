@@ -232,6 +232,34 @@ def _create_attempt_sync(
         insert_snapshot(conn, snapshot)
         conn.commit()
 
+    # 数据治理锚(从新 run 开始):env/task/agent/model/input。best-effort——
+    # provenance 写失败不影响 attempt 创建,只记日志。
+    try:
+        from .provenance import record_attempt_creation
+
+        record_attempt_creation(
+            db_path,
+            attempt_id=attempt_id,
+            env_name=env_name,
+            task={
+                "id": task_id,
+                "env_name": row[0],
+                "prompt": row[1],
+                "context": json.loads(row[2] or "{}"),
+                "constraints": json.loads(row[3] or "{}"),
+                "timeout_seconds": row[4],
+            },
+            agent_name=agent_name,
+            model=model_name,
+            input_snapshot_ref=snapshot.content_hash,
+        )
+    except Exception as exc:  # noqa: BLE001 —— 治理锚缺失不阻塞执行
+        logger.warning(
+            "attempt_provenance 写入失败(不影响 attempt 创建) attempt=%s: %s",
+            attempt_id,
+            exc,
+        )
+
     model = AttemptModel(
         id=attempt_id,
         run_id=run_id,

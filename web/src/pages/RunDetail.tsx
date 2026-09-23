@@ -5,6 +5,7 @@ import { api, type AttemptDetail, type AttemptMoney, type AttemptSecurity, type 
 import { curveSegments, deriveWireView, splitMatched, usageValue, type WireGap } from "../wire/curve";
 import { ConversationPanel } from "./ConversationPanel";
 import { NormalizedOutputPanel } from "../components/NormalizedOutputPanel";
+import { ReJudgePanel } from "../components/ReJudgePanel";
 import { AGENT_COLORS } from "../agents";
 import { useI18n } from "../i18n";
 
@@ -3166,6 +3167,9 @@ export function RunDetail() {
   const [officeSheet, setOfficeSheet] = useState(0);
   const [err, setErr] = useState("");
   const [searchParams] = useSearchParams();
+  // 重评后重启 SSE：后端把 run 拉回 scoring，新流保持打开并推送后续更新。
+  const [streamEpoch, setStreamEpoch] = useState(0);
+  const handleRejudged = useCallback(() => setStreamEpoch((n) => n + 1), []);
   // 只在首次拿到 run 时应用一次深链定位；之后 SSE 刷新不再打扰用户操作。
   const deepLinkRef = useRef({
     attempt: searchParams.get("attempt"),
@@ -3249,7 +3253,7 @@ export function RunDetail() {
       source.close();
       stopFallback();
     };
-  }, [runId]);
+  }, [runId, streamEpoch]);
 
   useEffect(() => {
     const link = deepLinkRef.current;
@@ -3380,6 +3384,12 @@ export function RunDetail() {
                 )}
               </div>
               <ScoreBar score={att.score_total} />
+              <ReJudgePanel
+                runId={run.id}
+                attemptId={att.id}
+                scoringStatus={att.scoring_status}
+                onRejudged={handleRejudged}
+              />
               <div className="agent-summary-stats">
                 {att.model_used && <span className="font-mono">{att.model_used}</span>}
                 <span>{t("runDetail.page.duration", { v: fmt(att.duration_ms) })}</span>

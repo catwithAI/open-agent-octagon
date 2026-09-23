@@ -72,6 +72,43 @@ logger = logging.getLogger(__name__)
 _CC_SESSION_NAMESPACE = uuid.UUID("6f9d3a4e-6d0f-4a1e-9a5a-2f6b1c8d7e30")
 
 
+#: cli 版本探测缓存：(cli_path, mtime) → version | None。每次 attempt 都跑
+#: `claude --version` 是高频开销,版本随二进制替换才变,按路径+mtime 缓存。
+_CLI_VERSION_CACHE: dict[tuple[str, float], str | None] = {}
+
+
+def _detect_cli_version(cli_path: str) -> str | None:
+    """best-effort 探测 host CLI 版本,失败/超时返回 None(不阻塞)。
+
+    只对宿主机 CLI 路径探测;沙盒/docker 镜像的 agent 版本由 launcher 记
+    (security_meta.agent_version),不走这里。缓存按 (cli_path, mtime),
+    每个二进制只探测一次。
+    """
+    try:
+        stat = Path(cli_path).stat()
+    except OSError:
+        return None
+    key = (cli_path, stat.st_mtime)
+    if key in _CLI_VERSION_CACHE:
+        return _CLI_VERSION_CACHE[key]
+    version: str | None = None
+    try:
+        import subprocess
+
+        proc = subprocess.run(
+            [cli_path, "--version"],
+            capture_output=True,
+            timeout=3.0,
+        )
+        text = proc.stdout.decode("utf-8", errors="replace").strip().splitlines()
+        if text:
+            version = text[0].strip()
+    except Exception:  # noqa: BLE001 —— best-effort 探测
+        version = None
+    _CLI_VERSION_CACHE[key] = version
+    return version
+
+
 
 def _clear_stale_cc_session(iso_home: Path, session_id: str) -> None:
     """删掉隔离 home 里该 session ID 的残留记录（同 attempt 重跑用）。
@@ -180,6 +217,8 @@ class ClaudeCodeAdapter:
                 error_code="claude_not_in_path",
                 error_message="claude CLI not found in PATH",
             )
+        # 版本锚(host CLI):一次缓存探测,best-effort,None 表示探测失败。
+        cli_version = _detect_cli_version(cli_path)
 
         # mcp_config 落到只读交付目录：宿主机执行就是 attempt 根（与历史一致），
         # 沙盒执行是 sandbox_ro/（容器内 /attempt），路径经 sandbox.path 翻译。
@@ -670,6 +709,7 @@ class ClaudeCodeAdapter:
                 external_refs={
                     "session_id": None if not session_required else cc_session_id,
                     "cli_path": cli_path,
+                    "cli_version": cli_version,
                     "model_used": model_used or self.model,
                     "iteration_error_status": failure_status,
                     "iteration_error_code": failure_code,
@@ -716,6 +756,7 @@ class ClaudeCodeAdapter:
                     else (None if not session_required else cc_session_id)
                 ),
                 "cli_path": cli_path,
+                "cli_version": cli_version,
                 "token_usage_estimated": token_usage_estimated,
                 "model_used": model_used or self.model,
                 **iteration_refs,

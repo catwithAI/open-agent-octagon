@@ -282,12 +282,14 @@ sandbox:
   # 家目录里「可重建」的子目录：LibreOffice 运行时、apt 缓存、字体等。
   # 挂成匿名卷 / tmpfs，容器销毁即释放，不再穿透 bind mount 堆进 attempt
   # 目录——330 个 attempt 曾因此攒下 33G。
-  # 实测（2026-09-21，330 attempt / 32.8G sandbox_home）：.local 7.95G、
-  # .npm 5.77G、config 5.35G、.tmp 3.95G、.cache 2.43G 是真正的大头。
-  # .config / .claude 刻意不在列——adapter 在容器启动前把 agent 配置写在
-  # 那里，盖住会让 agent 读不到自己的配置。
-  ephemeral_home_dirs: [.local, .npm, .cache, .tmp, config, lo, loroot, sysroot, apt, fonts, .fonts]
-  # 其中走内存的子集；其余落 docker 存储层。评测机内存有限，别放太多。
-  tmpfs_home_dirs: [apt, .cache]
+  # 实测（2026-09-21，330 attempt / 32.8G sandbox_home）。**只收纯运行期
+  # 缓存**：.npm 5.77G、.tmp 3.95G、.cache 2.43G。
+  # .config / .claude / config / .local 刻意不在列——adapter 在容器启动前
+  # 把 provider 配置与凭据写在那里，盖住会让 agent 直接跑不起来。
+  ephemeral_home_dirs: [.npm, .cache, .tmp, lo, loroot, sysroot, apt, fonts, .fonts]
+  # 其中走内存的子集；其余落 docker 存储层。只放**确定很小**的目录：
+  # .cache 里 presentbench 会下 658MB 的 ms-playwright 浏览器，放 tmpfs 会
+  # ENOSPC 且并发 6 时吃 4G 内存，必须走匿名卷。
+  tmpfs_home_dirs: [apt]
   # 单个 tmpfs 的上限。最坏占用 = 该值 × tmpfs 目录数 × 并发数。
   tmpfs_size: 512m

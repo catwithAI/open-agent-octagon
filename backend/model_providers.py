@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 from typing import Literal
 
@@ -109,6 +110,50 @@ def parse_model_ref(
         if prefix in providers:
             return ModelRef(raw=raw, provider=prefix, model=rest)
     return ModelRef(raw=raw, provider=None, model=raw)
+
+
+#: 已知的传输/网关别名前缀。`canonical_model` 会剥掉它们，
+#: 让同一模型的不同入口写法归一到同一个 id（仅写 provenance，不改存储原串）。
+_TRANSPORT_ALIAS_PREFIXES = frozenset({"upstream", "openai", "anthropic", "google"})
+
+
+def canonical_model(raw: str | None, providers: dict[str, ModelProviderSection] | None = None) -> str | None:
+    """把模型标识符归一到「实际模型 id」。
+
+    仅用于数据治理锚（attempt_provenance.model_canonical），**不改** runs.model /
+    attempts.model 里存的原串（展示与路由仍用 raw）。
+
+    归一规则（顺序）：
+    1. 剥掉合成前缀 `provider-<hex>::`（匿名 provider 的运行时 id）。
+    2. 剥掉传输别名前缀（upstream/openai/anthropic/google）。
+    3. 若首段是配置过的 provider key（or-cc / or-codex / blade / z-ai …），剥掉它，
+       只留 provider 内的模型名。
+
+    反例（不剥）：`deepseek/deepseek-v4-flash` 的 `deepseek` 是模型 id 的一部分
+    （OpenRouter 双段 id），不是配置的 provider 时保持原样。
+    """
+    if not raw:
+        return raw
+    value = raw.strip()
+    if not value:
+        return value
+    # 1) 合成 provider 前缀 provider-<hex>::（OpenRouter / 匿名 key 生成的运行时 id）
+    value = _STRIP_SYNTHETIC_PREFIX_RE.sub("", value)
+    # 2) 传输别名前缀
+    if "/" in value:
+        prefix, rest = value.split("/", 1)
+        if prefix in _TRANSPORT_ALIAS_PREFIXES:
+            value = rest
+    # 3) 配置过的 provider key
+    if providers and "/" in value:
+        prefix, rest = value.split("/", 1)
+        if prefix in providers:
+            value = rest
+    return value
+
+
+#: 匿名 provider 的运行时 id 形如 `provider-<hex>::`，剥掉后才是真实模型 id。
+_STRIP_SYNTHETIC_PREFIX_RE = re.compile(r"^provider-[0-9a-fA-F]{8,}::")
 
 
 def resolve_api_key(provider: ModelProviderSection) -> str | None:

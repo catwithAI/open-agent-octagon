@@ -2820,6 +2820,10 @@ class BladeServiceAdapter:
             priority_missing.extend(missing)
             downloaded.extend(got)
 
+        # 优先阶段已落地的路径，BFS 阶段跳过（list 查找是 O(n)，500 个文件
+        # 逐个扫会变成 O(n²)，这里固化成 set）。
+        priority_done = set(priority_downloaded)
+
         queue: list[tuple[str, int]] = [(".", 0)]
         seen_files = 0
         while queue:
@@ -2847,7 +2851,10 @@ class BladeServiceAdapter:
                     break
                 listing.append({"path": rel})
                 target = download_root / rel
-                if rel in priority_set:
+                # 优先阶段已经拉到的不再重拉：BFS 是兜底，重复下载既浪费
+                # 带宽，又可能用一个「候选前缀猜错」的版本覆盖掉优先阶段
+                # 已经校验过内容的正确版本。
+                if rel in priority_done:
                     continue
                 if (
                     staging_dir is None

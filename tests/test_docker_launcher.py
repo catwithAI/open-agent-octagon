@@ -131,15 +131,18 @@ def test_ephemeral_home_dirs_stay_off_the_bind_mount(tmp_path: Path) -> None:
 
     anonymous = set(_mount_targets(argv, "-v"))
     tmpfs = " ".join(_mount_targets(argv, "--tmpfs"))
-    # 实测占大头的几项必须被挡住，且没有一项带宿主机路径。
-    for name in (".local", ".npm", ".tmp", "config", "lo", "loroot", "sysroot", "fonts"):
+    # 纯运行期缓存必须被挡住，且没有一项带宿主机路径。
+    for name in (".npm", ".tmp", "lo", "loroot", "sysroot", "fonts"):
         assert f"{HOME_MOUNT}/{name}" in anonymous
-    # `.config` / `.claude` 刻意不挡：adapter 在容器启动前把 agent 配置写在
-    # 那里（XDG_CONFIG_HOME / CLAUDE_CONFIG_DIR），盖住会让 agent 读不到配置。
-    assert f"{HOME_MOUNT}/.config" not in anonymous
-    assert f"{HOME_MOUNT}/.claude" not in anonymous
-    for name in ("apt", ".cache"):
-        assert f"{HOME_MOUNT}/{name}:rw,size=512m" in tmpfs
+    # adapter 在容器启动前写过的目录一律不挡——盖住会让 agent 读不到自己的
+    # provider 配置/凭据，直接跑不起来（见 test_adapter_written_dirs_...）。
+    for name in (".config", ".claude", "config", ".local"):
+        assert f"{HOME_MOUNT}/{name}" not in anonymous
+    assert f"{HOME_MOUNT}/apt:rw,size=512m" in tmpfs
+    # `.cache` 必须走匿名卷而不是 tmpfs：presentbench 下 ms-playwright 的
+    # 浏览器二进制有 658MB，512m tmpfs 会 ENOSPC，并发 6 还要吃 4G 内存。
+    assert f"{HOME_MOUNT}/.cache" in anonymous
+    assert f"{HOME_MOUNT}/.cache" not in tmpfs
     assert str(tmp_path / "h") not in tmpfs
 
 
@@ -558,4 +561,33 @@ def test_dockerfile_precreates_every_ephemeral_dir() -> None:
     missing = [d for d in defaults if f"/home/agent/{d}" not in dockerfile]
     assert not missing, (
         f"这些 ephemeral 目录没在 Dockerfile 里预建，匿名卷会不可写：{missing}"
+    )
+
+
+def test_adapter_written_dirs_are_never_ephemeral() -> None:
+    """adapter 在容器启动前写过的家目录子目录，绝不能挂成匿名卷。
+
+    沙盒模式下 `host_home()` 返回的就是 `sandbox_home`，这些文件写在宿主机
+    侧；被匿名卷盖住后 agent 启动时读到的是空目录 —— provider 配置、API key、
+    模型路由全部消失，agent 直接跑不起来。
+
+    对照 adapter 里的实际写入点（沙盒模式下 host_home() 忽略传入的
+    `.xxx-iso-home`，一律返回 sandbox_home 本身，所以这些路径就落在家目录一级）：
+      claude_code.py:212/219   .claude            CLAUDE_CONFIG_DIR（宿主机 mkdir + 写 settings.json）
+      opencode_family.py:430   config             <PREFIX>_CONFIG_DIR（宿主机 mkdir）
+      opencode_family.py:434   .config            XDG_CONFIG_HOME
+      opencode_family.py:435/437 .local           XDG_DATA_HOME / XDG_STATE_HOME
+      dsh.py:591               .dsh               DSH_HOME（宿主机 mkdir）
+      dsh.py:591               .agents            DSH_AGENTS_HOME（宿主机 mkdir）
+      dsh.py:591               dsh_sessions       DSH_SESSION_ROOT——**会话 jsonl 证据**，
+                                                  盖住就随容器销毁，后端再也读不到
+    """
+    forbidden = {
+        ".config", ".claude", "config", ".local",
+        ".dsh", ".agents", "dsh_sessions",
+    }
+    defaults = set(Settings().sandbox.ephemeral_home_dirs)
+    leaked = forbidden & defaults
+    assert not leaked, (
+        f"这些目录被 adapter 在容器启动前写入，挂匿名卷会让 agent 读不到配置：{leaked}"
     )
