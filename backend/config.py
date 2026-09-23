@@ -44,6 +44,10 @@ class OctagonSection(BaseModel):
     # 交集。默认 metadata（只记 size/timing，不落 body）；专用 benchmark 部署可提到
     # full 才允许落脱敏后的协议原文。None = 不额外收紧（由请求侧决定，仍受 off 默认）。
     wire_capture_max_policy: Literal["off", "metadata", "parsed", "full"] | None = None
+    # 总开关：false 时完全不挂 HttpProxySource（agent 直连 provider，wire 不采集
+    # LLM 通信、也不做模型完整性校验）。默认 true。需要反代故障时临时绕过、
+    # 或部署方明确不想要 LLM 通信采集时关掉。
+    wire_capture_enabled: bool = True
     # 单个 attempt 的评分硬上限。checklist judge 数量多时，整体评分可能长时间
     # 挂起，最终以 scorer_unavailable 结束且没有得分。
     # 到点即终止评分并记 timed_out（与设施缺失的 scorer_unavailable 区分），
@@ -408,6 +412,8 @@ def _apply_env_overrides(data: dict[str, Any]) -> dict[str, Any]:
         octagon["profiles_path"] = v
     if v := os.environ.get("OCTAGON_PUBLIC_BASE_URL"):
         octagon["public_base_url"] = v
+    if v := os.environ.get("OCTAGON_WIRE_CAPTURE_ENABLED"):
+        octagon["wire_capture_enabled"] = v.strip().lower() in ("1", "true", "yes", "on")
     if v := os.environ.get("OCTAGON_MAX_ACTIVE_ATTEMPTS"):
         octagon["max_active_attempts"] = v
     if v := os.environ.get("OCTAGON_MAX_ACTIVE_SCORING_JOBS"):

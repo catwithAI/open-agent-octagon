@@ -83,12 +83,23 @@ RUN test -n "${KIMI_VERSION}" \
     && pip3 install "kimi-cli==${KIMI_VERSION}" \
     && kimi --version | grep -F "${KIMI_VERSION}"
 
-# opencode / mimo-code：npm 全局包。
-RUN test -n "${OPENCODE_VERSION}" && test -n "${MIMO_VERSION}" \
-    && npm install -g "opencode-ai@${OPENCODE_VERSION}" "@mimo-ai/cli@${MIMO_VERSION}" \
+# opencode：npm 全局包。
+RUN test -n "${OPENCODE_VERSION}" \
+    && npm install -g "opencode-ai@${OPENCODE_VERSION}" \
     && npm cache clean --force \
-    && opencode --version | grep -F "${OPENCODE_VERSION}" \
-    && mimo --version | grep -F "${MIMO_VERSION}"
+    && opencode --version | grep -F "${OPENCODE_VERSION}"
+
+# mimo-code：小米官方安装器（与 Harbor 对齐）。npm 包 @mimo-ai/cli 无
+# versions.env 钉的 0.1.9（ETARGET），且小米官方渠道就是 `curl
+# https://mimo.xiaomi.com/install | bash`。该渠道**不可精确钉版本**——
+# 装完用 `mimo --version` 记录实际版本（smoke.sh 对 mimo 只验可运行、不比对
+# 钉点）。HOME 定向 /opt/mimo（仿 claude），确保非 root 运行时能读到二进制。
+RUN test -n "${MIMO_VERSION}" \
+    && mkdir -p /opt/mimo \
+    && HOME=/opt/mimo bash -c 'curl -fsSL https://mimo.xiaomi.com/install | bash' \
+    && ln -s /opt/mimo/.mimocode/bin/mimo /usr/local/bin/mimo \
+    && chmod -R a+rX /opt/mimo \
+    && mimo --version
 
 # dsh runtime：从 wheel 抽出 stdio JSON-RPC runtime 二进制到 /opt/dsh/runtime。
 RUN test -n "${DSH_VERSION}" \
@@ -130,14 +141,16 @@ ENV HOME=/home/agent \
     DSH_TELEMETRY_DISABLED=1
 
 # 镜像标签：后端启动检查 `docker image inspect` 读 octagon.agents 判断启用的
-# agent 是否都在，运行时把版本写进 security_meta。
+# agent 是否都在，运行时把版本写进 security_meta。mimo 走小米官方安装器、
+# 不可精确钉版本，标签如实标 unpinned（实际版本以装完 `mimo --version` 为准，
+# 不引用 versions.env 的 MIMO_VERSION）。
 LABEL org.opencontainers.image.title="octagon-agent-runtime" \
       octagon.agents="claude-code,codex,kimi-code,opencode,mimo-code,dsh" \
       octagon.agent.claude-code.version="${CLAUDE_VERSION}" \
       octagon.agent.codex.version="${CODEX_VERSION}" \
       octagon.agent.kimi-code.version="${KIMI_VERSION}" \
       octagon.agent.opencode.version="${OPENCODE_VERSION}" \
-      octagon.agent.mimo-code.version="${MIMO_VERSION}" \
+      octagon.agent.mimo-code.version="unpinned" \
       octagon.agent.dsh.version="${DSH_VERSION}"
 
 WORKDIR /home/agent
