@@ -388,6 +388,12 @@ class CodexAdapter:
             **os.environ,
             "CODEX_HOME": sandbox.path(iso_codex_home),
         }
+        # adapter 显式注入、必须进容器的变量名（见 ExecSpec.env_keep）。
+        # codex 的 provider key 靠 `-c model_providers.*.env_key` 在子进程环境里
+        # 按名查找，值又常常就来自宿主机同名变量——不声明所有权会被沙盒的
+        # 「值等于宿主机 → 不透传」规则丢掉，表现为容器内 Missing environment
+        # variable。
+        owned_env: set[str] = set()
         # Codex 的 MCP 配置经 argv 传入，secret 不可写进 -c；仅场景确实提供 MCP
         # 时才让 stdio child 从父进程环境继承 attempt 凭据。
         if task.mcp_servers:
@@ -419,15 +425,18 @@ class CodexAdapter:
                 )
             if provider.api_key_env and api_key:
                 subprocess_env[provider.api_key_env] = api_key
+                owned_env.add(provider.api_key_env)
         # wire injection 消费点：provider/MCP -c 参数已在 cmd 构造时应用，
         # 这里最后合并 process_env（表 Codex 行）。
         if task.wire_injection.enabled:
             subprocess_env.update(task.wire_injection.process_env)
+            owned_env.update(task.wire_injection.process_env)
             # capture token：走 injection 专用字段，adapter 注入子进程。
             if task.wire_injection.capture_token:
                 subprocess_env["OCTAGON_WIRE_CAPTURE_TOKEN"] = (
                     task.wire_injection.capture_token
                 )
+                owned_env.add("OCTAGON_WIRE_CAPTURE_TOKEN")
 
         # attempt 总 deadline：多轮共享一个预算。单轮时与改造前的
         # wait_for(timeout=task.timeout_seconds) 等价。
@@ -562,6 +571,7 @@ class CodexAdapter:
                     cwd=str(workspace),
                     env=subprocess_env,
                     turn_id=getattr(turn, "turn_id", None),
+                    env_keep=frozenset(owned_env),
                 )) as proc:
                     turn_proc = proc
                     try:

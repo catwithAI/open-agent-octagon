@@ -204,10 +204,6 @@ def build_adapter(
 
         return FakeAgentAdapter()
 
-    # 本机 CLI agent 的进程启动层。沙盒（docker）接入后按 settings.sandbox
-    # 在这里换成 DockerLauncher；adapter 自身不感知执行场合。
-    launcher = _build_launcher(settings, agent_name)
-
     if agent_name == "blade-agent":
         config = _build_blade_config(
             settings, model=model, blade_enable_thinking=blade_enable_thinking
@@ -220,6 +216,15 @@ def build_adapter(
 
             return BladeCliAdapter(config, cli_path=settings.blade.cli_path)
         return BladeServiceAdapter(config)
+
+    # 本机 CLI agent 的进程启动层。沙盒（docker）接入后按 settings.sandbox
+    # 在这里换成 DockerLauncher；adapter 自身不感知执行场合。
+    #
+    # **必须在 blade-agent 分支之后**：blade-agent 是远端 REST agent，不启动
+    # 任何本机进程，也就不在 agent 运行时镜像的 `octagon.agents` 标签里。放在
+    # 前面会让沙盒 preflight 对它报 sandbox_agent_missing，把一个根本不用沙盒
+    # 的 agent 挡在门外。
+    launcher = _build_launcher(settings, agent_name)
 
     if agent_name == "claude-code":
         from .adapters.claude_code import ClaudeCodeAdapter
