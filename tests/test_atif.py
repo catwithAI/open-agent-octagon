@@ -438,3 +438,81 @@ def test_list_agents_sandbox_off_falls_back_to_host(monkeypatch) -> None:
     for name in ("kimi-code", "opencode", "mimo-code"):
         assert by_name[name]["status"] == "not_found", name
         assert by_name[name]["locus"] == "host"
+
+
+# ---------- opencode / mimo / kimi 事件流型转换器 ----------------------------
+
+
+def _write_events(attempt_dir: Path, events: list[dict]) -> Path:
+    (attempt_dir / "events.jsonl").write_text(
+        "\n".join(json.dumps(e, ensure_ascii=False) for e in events)
+    )
+    return attempt_dir
+
+
+def test_opencode_converter_groups_steps() -> None:
+    data = Path(tempfile.mkdtemp())
+    ad = _attempt_dir(data, "att_oc1")
+    _write_events(ad, [
+        {"type": "user", "sessionID": "ses_1", "payload": {"prompt": "sort numbers"}},
+        {"type": "step_start", "sessionID": "ses_1", "timestamp": 1700000000000},
+        {"type": "reasoning", "sessionID": "ses_1", "part": {"type": "reasoning", "text": "need bash"}},
+        {"type": "tool_use", "sessionID": "ses_1", "part": {
+            "type": "tool", "tool": "Bash", "callID": "c1",
+            "state": {"input": {"command": "ls"}, "output": "file.txt"}}},
+        {"type": "text", "sessionID": "ses_1", "part": {"type": "text", "text": "done"}},
+        {"type": "step_finish", "sessionID": "ses_1", "part": {
+            "tokens": {"input": 100, "output": 20, "cache": {"read": 5}}, "cost": 0.01}},
+    ])
+    out = emit_attempt_atif(ad, agent_name="opencode", attempt_id="att_oc1")
+    assert out.status == "ready"
+    steps = out.trajectory["steps"]
+    assert [s["source"] for s in steps] == ["user", "agent"]
+    assert steps[1]["reasoning_content"] == "need bash"
+    assert steps[1]["tool_calls"][0]["function_name"] == "Bash"
+    assert steps[1]["observation"]["results"][0]["content"] == "file.txt"
+    assert steps[1]["metrics"]["prompt_tokens"] == 105  # 100 input + 5 cache read
+    assert out.trajectory["final_metrics"]["total_cost_usd"] == 0.01
+
+
+def test_opencode_converter_mimo_name() -> None:
+    data = Path(tempfile.mkdtemp())
+    ad = _attempt_dir(data, "att_m1")
+    _write_events(ad, [
+        {"type": "step_start", "sessionID": "ses_m", "timestamp": 1700000000000},
+        {"type": "text", "sessionID": "ses_m", "part": {"type": "text", "text": "hi"}},
+        {"type": "step_finish", "sessionID": "ses_m", "part": {}},
+    ])
+    out = emit_attempt_atif(ad, agent_name="mimo-code", attempt_id="att_m1")
+    assert out.status == "ready"
+    assert out.trajectory["agent"]["name"] == "mimo-code"
+
+
+def test_kimi_converter_role_content() -> None:
+    data = Path(tempfile.mkdtemp())
+    ad = _attempt_dir(data, "att_k1")
+    _write_events(ad, [
+        {"role": "user", "content": "compute sum"},
+        {"role": "meta", "type": "session.resume_hint", "session_id": "k_ses"},
+        {"role": "thinking", "content": "use bash"},
+        {"role": "assistant", "content": "checking",
+         "tool_calls": [{"id": "t1", "name": "Bash", "arguments": {"command": "echo 1"}}]},
+        {"role": "assistant", "content": "answer: 385"},
+    ])
+    out = emit_attempt_atif(ad, agent_name="kimi-code", attempt_id="att_k1")
+    assert out.status == "ready"
+    steps = out.trajectory["steps"]
+    assert [s["source"] for s in steps] == ["user", "agent", "agent"]
+    assert steps[1]["reasoning_content"] == "use bash"
+    assert steps[1]["tool_calls"][0]["function_name"] == "Bash"
+    assert steps[2]["message"] == "answer: 385"
+    assert out.trajectory["session_id"] == "k_ses"
+
+
+def test_events_agent_requires_explicit_agent_name() -> None:
+    """kimi/opencode/mimo 读 events.jsonl，无 home 标记可判别 → 必须显式 agent。"""
+    data = Path(tempfile.mkdtemp())
+    ad = _attempt_dir(data, "att_anon")
+    _write_events(ad, [{"type": "step_start", "sessionID": "s", "timestamp": 1700000000000}])
+    out = emit_attempt_atif(ad, attempt_id="att_anon")  # 不传 agent_name
+    assert out.status == "not_available"
