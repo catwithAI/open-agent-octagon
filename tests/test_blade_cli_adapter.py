@@ -46,9 +46,24 @@ if group == "chat" and verb in ("run", "send"):
         # adapter 必须据此仍去回收轨迹和产物。
         print(json.dumps({"session_id": "sess-1"}))
         sys.exit(code)
+    # 状态序列：BLADE_STUB_STATUS_SEQ="a,b,c" 按 chat 调用次序逐个吐，
+    # 耗尽后保持最后一个（用于模拟「提问后再完成」）；不设则读单值。
+    seq = os.environ.get("BLADE_STUB_STATUS_SEQ")
+    if seq:
+        counter = os.environ.get("BLADE_STUB_CHAT_COUNT")
+        consumed = 0
+        if counter and os.path.exists(counter):
+            consumed = int(open(counter).read() or "0")
+        statuses = [s.strip() for s in seq.split(",")]
+        status = statuses[consumed] if consumed < len(statuses) else statuses[-1]
+        if counter:
+            with open(counter, "w") as f:
+                f.write(str(consumed + 1))
+    else:
+        status = os.environ.get("BLADE_STUB_STATUS", "completed")
     print(json.dumps({
         "session_id": "sess-1",
-        "status": os.environ.get("BLADE_STUB_STATUS", "completed"),
+        "status": status,
         "messages": [{"id": "m2", "content": "done", "tool_calls": [
             {"id": "t1", "function": {"name": "write_file", "arguments": "{}"}}]}],
     }))
@@ -290,6 +305,67 @@ def test_non_terminal_session_status_is_not_completed(
     result = _run(_adapter(stub_cli), _task(tmp_path), _env(), tmp_path / "data")
     assert result.status == "chat_failed"
     assert result.error_code == "blade_session_failed"
+
+
+def test_waiting_for_input_is_auto_answered(
+    tmp_path: Path, stub_cli: Path, argv_log: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BA 停在 waiting_for_input（未声明的提问）时自动补一句拒绝话术续跑。
+
+    开关默认开：会话先停在等待，auto chat send 一句后 agent 完成——
+    attempt 按 completed 收，而不是静默停在「没真正完成」或报废。
+    """
+    counter = tmp_path / "chat.count"
+    monkeypatch.setenv("BLADE_STUB_STATUS_SEQ", "waiting_for_input,completed")
+    monkeypatch.setenv("BLADE_STUB_CHAT_COUNT", str(counter))
+    result = _run(_adapter(stub_cli), _task(tmp_path), _env(), tmp_path / "data")
+
+    assert result.status == "completed"
+    assert result.external_refs["unexpected_interaction_auto_answered"] == 1
+
+    chat_calls = [c for c in _argv_lines(argv_log) if c[:1] == ["chat"]]
+    # 首轮 chat run 建会话；自动应答走 chat send，内容是无信息量的拒绝话术。
+    assert chat_calls[0][:2] == ["chat", "run"]
+    assert chat_calls[1][:3] == ["chat", "send", "sess-1"]
+    assert chat_calls[1][3] == "你自己看着办不要问我"
+
+
+def test_waiting_for_input_auto_answer_loops_on_repeat_questions(
+    tmp_path: Path, stub_cli: Path, argv_log: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """连续多次提问都自动应答，直到 agent 真正完成。"""
+    counter = tmp_path / "chat.count"
+    monkeypatch.setenv(
+        "BLADE_STUB_STATUS_SEQ", "waiting_for_input,waiting_for_input,completed"
+    )
+    monkeypatch.setenv("BLADE_STUB_CHAT_COUNT", str(counter))
+    result = _run(_adapter(stub_cli), _task(tmp_path), _env(), tmp_path / "data")
+
+    assert result.status == "completed"
+    assert result.external_refs["unexpected_interaction_auto_answered"] == 2
+
+    chat_calls = [c for c in _argv_lines(argv_log) if c[:1] == ["chat"]]
+    assert len(chat_calls) == 3
+    assert chat_calls[0][:2] == ["chat", "run"]
+    assert [c[:3] for c in chat_calls[1:]] == [
+        ["chat", "send", "sess-1"],
+        ["chat", "send", "sess-1"],
+    ]
+
+
+def test_waiting_for_input_toggle_off_keeps_completed(
+    tmp_path: Path, stub_cli: Path, argv_log: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """answer_unexpected_interaction=false 恢复原语义：waiting_for_input 视作
+    本轮完成、不自动应答（适配要能关回旧行为）。"""
+    monkeypatch.setenv("BLADE_STUB_STATUS", "waiting_for_input")
+    adapter = _adapter(stub_cli, answer_unexpected_interaction=False)
+    result = _run(adapter, _task(tmp_path), _env(), tmp_path / "data")
+
+    assert result.status == "completed"
+    assert "unexpected_interaction_auto_answered" not in result.external_refs
+    chat_calls = [c for c in _argv_lines(argv_log) if c[:1] == ["chat"]]
+    assert len(chat_calls) == 1
 
 
 def test_cli_not_found_is_terminal_not_crash(tmp_path: Path) -> None:

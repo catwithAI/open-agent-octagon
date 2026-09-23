@@ -127,6 +127,11 @@ class BladeSection(BaseModel):
     transport: Literal["cli", "sdk"] = "cli"
     # blade 可执行文件路径；不填则在 PATH 里找 `blade`。
     cli_path: str | None = None
+    # BA 提出未预声明的提问（AskUserQuestion）时，自动回一句无信息的拒绝话术
+    # 续跑，而不是判 unexpected_interaction 失败。话术刻意不给任何评测线索，
+    # 只把会话从 WAITING_FOR_INPUT 解出来防止 attempt 报废/挂死。关掉后恢复
+    # 「未声明的提问即失败」语义，适合把提问当成可观测信号的实验。
+    answer_unexpected_interaction: bool = True
 
 
 class SandboxLimits(BaseModel):
