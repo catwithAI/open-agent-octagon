@@ -76,15 +76,22 @@ class EvidencePolicy:
     allowed_sources: frozenset[str] = SOURCES
 
 
-def _legacy_id(path: Path, line_index: int) -> str:
-    return f"legacy:{hashlib.sha256(path.read_bytes()).hexdigest()[:20]}:{line_index}"
+def _legacy_id(digest: str, line_index: int) -> str:
+    return f"legacy:{digest}:{line_index}"
 
 
 def _jsonl_records(path: Path) -> list[tuple[str, dict[str, Any], int]]:
     if not path.is_file():
         return []
+    # 文件摘要**每个文件只算一次**。此前是每条缺 record_id 的记录都重读整个
+    # 文件做一次 sha256，复杂度 O(行数 × 文件大小)：实测 exp_b60f56e2301c4108b27d
+    # 的 35 个 attempt 合计要哈希 4.73 TB（单个 events.jsonl 11MB × 38908 行
+    # = 443 GB），一次 generate 挂在事件循环上 10 分钟仍未跑完。
+    # 摘要只依赖文件内容，与行号无关，提到循环外取值完全一致。
+    raw = path.read_bytes()
+    digest: str | None = None
     result: list[tuple[str, dict[str, Any], int]] = []
-    for index, line in enumerate(path.read_text(encoding="utf-8").splitlines()):
+    for index, line in enumerate(raw.decode("utf-8").splitlines()):
         try:
             record = json.loads(line)
         except json.JSONDecodeError:
@@ -92,7 +99,13 @@ def _jsonl_records(path: Path) -> list[tuple[str, dict[str, Any], int]]:
         if not isinstance(record, dict):
             continue
         stable = record.get("record_id") or record.get("id") or record.get("canonical_id")
-        record_id = str(stable) if stable else _legacy_id(path, index)
+        if stable:
+            record_id = str(stable)
+        else:
+            # 惰性计算：整份都带稳定 ID 的文件（如 canonical wire）不必哈希。
+            if digest is None:
+                digest = hashlib.sha256(raw).hexdigest()[:20]
+            record_id = _legacy_id(digest, index)
         result.append((record_id, record, index))
     return result
 
