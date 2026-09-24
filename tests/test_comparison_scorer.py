@@ -32,7 +32,13 @@ class FakeEnv:
     meta = {"schema_version": "1.0"}
 
 
+POINTWISE = {"id": "official_rubric_judge", "method": "agent_judge_agentic",
+             "weight": 100, "role": "scored", "question": "q"}
+
+# 送给 start_run 的是**完整 plan**：evals 的 validate_plan 要求至少有一个
+# role=scored 且权重 > 0 的维度，而比较维度恒为 diagnostic/weight=0。
 DIMENSIONS = [
+    POINTWISE,
     {"id": "solution_elegance", "method": "pairwise_judge_agentic",
      "weight": 0, "role": "diagnostic", "question": "哪个更贴合既有抽象",
      "comparison": {"strategy": "round_robin", "conversion": "win_count",
@@ -258,3 +264,23 @@ def test_start_run_failure_records_all_dimensions_failed(monkeypatch):
     job = list_comparison_jobs(db, "run1")[0]
     assert job["status"] == "failed"
     assert job["error_code"] == "start_run_failed"
+
+
+def test_plan_carries_scored_dimensions_not_just_comparison(monkeypatch):
+    """evals 的 validate_plan 要求至少一个 role=scored 且权重 > 0 的维度。
+    只送比较维度（恒为 diagnostic/weight=0）会被 500 PlanError 拒掉。"""
+    db = _db([("att_a", "completed"), ("att_b", "completed")])
+    _, calls = _run(db, monkeypatch)
+    sent = next(c for c in calls if c[0].endswith("/runs"))[1]["dimensions"]
+    assert any(d.get("role") == "scored" and d.get("weight", 0) > 0 for d in sent)
+    # 但只有比较维度会去调 /compare
+    compares = [c for c in calls if c[0].endswith("/compare")]
+    assert {c[1]["dimension_id"] for c in compares} == {"solution_elegance"}
+
+
+def test_pointwise_only_plan_short_circuits(monkeypatch):
+    """plan 里没有比较维度 —— 不发任何请求。"""
+    db = _db([("att_a", "completed"), ("att_b", "completed")])
+    out, calls = _run(db, monkeypatch, dimensions=[POINTWISE])
+    assert out["reason"] == "no_comparison_dimensions"
+    assert calls == []

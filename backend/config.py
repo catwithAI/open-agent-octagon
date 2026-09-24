@@ -270,6 +270,17 @@ class JudgeSection(BaseModel):
     # 单次 /evaluate 的调用超时（秒）。与 octagon.scoring_deadline_seconds 的
     # 关系：wait_for 的硬上限在 agent-octagon 侧，这里只兜住 evals 的响应。
     evals_timeout: float = Field(default=300.0, gt=0)
+    # 把所有 pointwise 维度强制成同一方法，不改共享 env 仓库。空=按 env
+    # meta.yaml（缺省 agent_judge）。
+    #
+    # 何时需要：env 的维度绑定了自己的私有资产——GDPval 的官方 59 条 rubric
+    # 在 <env_dir>/private/，参考与专家工作簿是 xlsx。非 agentic 的 judge 只
+    # 拿得到 prompt 里的 JSON，读不了 xlsx、也看不到 rubric，只能判「无法
+    # 核验」给 0 分；而那个 0 与「agent 真的做得差」在库里无法区分。这类 env
+    # 整体需要 agent_judge_agentic（pi 带 read/bash 自取 evidence.env_dir）。
+    evals_method_override: Literal[
+        "", "deterministic", "agent_judge", "agent_judge_agentic", "jev_judge"
+    ] = ""
 
     # ---- 归因（evals /attribute）----------------------------------------
     # 默认关：每个维度一次 agentic pi 会话，4 维 × 7 agent 的 run 就是 28 次。

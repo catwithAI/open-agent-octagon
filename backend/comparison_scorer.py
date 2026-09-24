@@ -6,7 +6,7 @@ evals 的 ``/evaluate`` 是单次 attempt 入口，按方法白名单会 409 拒
 这是对的，所以这条链走流程式 API：
 
     ① POST /experiments/{run_id}/runs   ×N   每个 attempt 一个 evals run，
-                                             共享同一份（只含比较维度的）EvalPlan
+                                             共享同一份**完整** EvalPlan
     ② POST /experiments/{run_id}/compare     每个比较维度一次，返回每-attempt 标量
     ③ 回写 scores 表（role=diagnostic，weight=0，不进 score_total）
 
@@ -29,6 +29,7 @@ from typing import Any
 import httpx
 
 from .db import _now_iso, _open_sync
+from .evals_scorer import COMPARISON_METHODS
 
 logger = logging.getLogger(__name__)
 
@@ -228,12 +229,28 @@ def run_comparisons(
 ) -> dict[str, Any]:
     """对一个 run 跑完全部比较维度，逐维记账并回写 scores。
 
+    ``dimensions`` 是**完整的 plan 维度集**（pointwise + 比较式），不是只有
+    比较式那几个：evals 的 ``validate_plan`` 要求 plan 里至少有一个
+    ``role=scored`` 且权重 > 0 的维度，而比较维度恒为 diagnostic/weight=0——
+    只送比较维度会被 ``PlanError: scored weights must sum to > 0`` 拒掉。
+    这条规则本身是对的（一个什么都不评的 plan 没有意义），而且完整 plan 也更
+    贴合 ``plan_hash`` 的语义：它冻结的是这个实验的全部维度。
+
+    实际只对其中的比较式维度调 ``/compare``；pointwise 维度在这条链上只是
+    plan 的一部分，不在这里评。
+
     单维失败不打断其余维度。返回 ``{"run_id", "candidates", "results": [...]}``，
     每个 result 是 ``{dimension, status, values?, error?}``。
     """
-    if not dimensions:
+    plan_dimensions = list(dimensions or [])
+    comparison_dims = [
+        d for d in plan_dimensions
+        if str(d.get("method", "")) in COMPARISON_METHODS
+    ]
+    if not comparison_dims:
         return {"run_id": run_id, "candidates": [], "results": [],
                 "reason": "no_comparison_dimensions"}
+    dimensions = comparison_dims
 
     base_url = str(base_url).rstrip("/")
     candidates = list_candidates(db_path, run_id)
@@ -257,10 +274,34 @@ def run_comparisons(
         return {"run_id": run_id, "candidates": candidate_ids, "results": [],
                 "reason": "insufficient_candidates"}
 
-    evidence_by_attempt = {
-        aid: {"attempt_dir": str(Path(data_path) / "attempts" / aid)}
-        for aid in candidate_ids
-    }
+    # 比较式判定同样要给归一化轨迹：raw events.jsonl 是各家 adapter 的原始格式，
+    # 六个 agent 体积差 74 倍（见 atif_evidence 模块注释），拿它排序会被证据形态
+    # 本身带偏，而不是被交付物质量带偏。路径必须绝对——judge 在自己的临时工作区
+    # 里执行，相对路径它找不到，也不会报错，只会开始满盘乱找。
+    from .atif_evidence import materialize_atif
+    from .evals_scorer import judge_visible_path
+
+    evidence_by_attempt: dict[str, dict[str, Any]] = {}
+    for aid in candidate_ids:
+        item: dict[str, Any] = {
+            "attempt_dir": judge_visible_path(data_path, "attempts", aid),
+        }
+        atif = materialize_atif(Path(data_path), aid)
+        item["atif_trajectory_path"] = (
+            judge_visible_path(atif) if atif is not None else None
+        )
+        evidence_by_attempt[aid] = item
+    missing_atif = sorted(
+        aid for aid, item in evidence_by_attempt.items()
+        if item["atif_trajectory_path"] is None
+    )
+    if missing_atif:
+        # 证据形态不对等会直接影响排序公平性，必须说出来而不是埋掉。
+        logger.warning(
+            "比较式评分 run=%s：%d/%d 个候选没有 ATIF 轨迹（%s），"
+            "它们与其余候选的证据形态不对等",
+            run_id, len(missing_atif), len(candidate_ids), ", ".join(missing_atif),
+        )
 
     # ① 注册候选。所有 attempt 必须送完全相同的 dimensions——evals 用 plan_hash
     #    锁住「一个 experiment 的所有 run 共享同一份冻结计划」，不一致会 409。
@@ -269,7 +310,7 @@ def run_comparisons(
         for attempt in candidates:
             plan_hash = _start_candidate(
                 base_url=base_url, timeout=timeout, run_id=run_id, attempt=attempt,
-                env=env, task=task, dimensions=dimensions,
+                env=env, task=task, dimensions=plan_dimensions,
             )
     except ComparisonError as exc:
         for dim in dimensions:

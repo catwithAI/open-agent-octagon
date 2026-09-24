@@ -1738,10 +1738,15 @@ def build_router() -> APIRouter:
                 detail=f"env 未加载，无法取维度定义: {run.get('env_name')}",
             )
         from .comparison_scorer import ComparisonError, run_comparisons
-        from .evals_scorer import comparison_dimensions_from_env
+        from .evals_scorer import _dimensions_from_env, comparison_dimensions_from_env
 
-        dimensions = comparison_dimensions_from_env(env)
-        if not dimensions:
+        # 送**完整 plan**：evals 的 validate_plan 要求至少有一个 role=scored
+        # 且权重 > 0 的维度，只送比较维度（恒为 diagnostic/weight=0）会被拒。
+        comparison_dims = comparison_dimensions_from_env(env)
+        dimensions = _dimensions_from_env(
+            env, method_override=judge_cfg.evals_method_override or None
+        ) + comparison_dims
+        if not comparison_dims:
             return {
                 "run_id": run_id, "candidates": [], "results": [],
                 "reason": "no_comparison_dimensions",
@@ -1798,14 +1803,19 @@ def build_router() -> APIRouter:
                 status_code=422, detail="attempt 尚无分数，无从归因"
             )
         from .attribution_client import attribute_attempt
-        from .evals_scorer import _dimensions_from_env
-        from .evaluator import load_final_state, load_trace
+        from .evals_scorer import _dimensions_from_env, build_evidence
 
-        evidence = {
-            "final_state": load_final_state(state.data_path, attempt_id),
-            "trace": load_trace(state.data_path, attempt_id),
-            "attempt_dir": str(state.data_path / "attempts" / attempt_id),
-        }
+        # 与评分共用同一套证据组装：归因用的是 agentic judge（pi + read/bash），
+        # 所以走指针形态——绝对路径 + ATIF 轨迹，不内联 trace/events。
+        evidence = build_evidence(
+            data_path=state.data_path,
+            attempt_id=attempt_id,
+            env=env,
+            trace=[],
+            final_state={},
+            events=[],
+            agentic=True,
+        )
         return await asyncio.to_thread(
             attribute_attempt,
             data_path=state.data_path,
