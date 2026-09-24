@@ -534,16 +534,9 @@ async def _execute_job(
             # /evaluate。dimensions 从 env meta.yaml 打包（维度 ID=维度名，
             # 与内置 scorer 的输出形状一致），commit/outbox/leader 全链路复用。
             judge_cfg = getattr(getattr(state, "settings", None), "judge", None)
-            if judge_cfg is not None and judge_cfg.backend == "evals":
-                from .evals_scorer import EvalsJudgeError, make_evals_scorer
-
-                scorer = make_evals_scorer(
-                    env=env,
-                    base_url=judge_cfg.evals_base_url,
-                    timeout=judge_cfg.evals_timeout,
-                    data_path=state.data_path,
-                    job_id=job_id,
-                )
+            use_evals = judge_cfg is not None and judge_cfg.backend == "evals"
+            if use_evals:
+                from .evals_scorer import EvalsJudgeError
             if scorer is None:
                 raise ScorerUnavailableError(f"env {attempt['env_name']} missing scorer")
             frozen_input = resolve_attempt_input(
@@ -564,6 +557,24 @@ async def _execute_job(
                 expected_hash=input_hash,
                 job_id=job_id,
             )
+            if use_evals:
+                # **必须在物化之后构造**：被评的交付物在冻结快照里，不在实时
+                # attempt 目录。内置 scorer 由 evaluate(data_path=
+                # scoring_data_path) 天然拿到快照；evals 适配器是把路径交给
+                # 跨进程 judge 自取，所以要显式把 input_path 传进去。指向实时
+                # 目录的后果不是报错——judge 找不到交付物会开始满盘搜索，最后
+                # 判「无法核验」给 0 分（2026-09-24 实测）。
+                from .evals_scorer import make_evals_scorer
+
+                scorer = make_evals_scorer(
+                    env=env,
+                    base_url=judge_cfg.evals_base_url,
+                    timeout=judge_cfg.evals_timeout,
+                    data_path=state.data_path,
+                    input_path=scoring_data_path,
+                    job_id=job_id,
+                    method_override=judge_cfg.evals_method_override or None,
+                )
             # judge 成本：本 run 的评分共用一把 judge key，与 agent
             # 执行隔离——ppt-visual-repair 那类多模态 judge 可能与执行同量级，
             # 混进 agent 的账会污染性价比横向比较。

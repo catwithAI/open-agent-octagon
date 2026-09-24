@@ -260,10 +260,46 @@ class JudgeSection(BaseModel):
 
     backend: Literal["internal", "evals"] = "internal"
     # evals 服务的 HTTP 入口（octagon-evals 的 start.sh 默认 8000）。
+    #
+    # **必须与 agent-octagon 同机、同文件系统。** agentic 方法（agent_judge_agentic /
+    # *_agentic / 归因）把 ``attempt_dir`` 当**路径字符串**塞进 evidence，evals 侧
+    # 只把这个字符串写成工作区里的一个文件，真正的深度取证靠 pi 的 bash 去读那个
+    # 真实目录。把 evals 拆到别的容器/主机上，这些方法不会报错——它们会静默退化成
+    # 「只看 evidence.json 里那点摘要」，分数照出，质量暗降。
     evals_base_url: str = "http://127.0.0.1:8000"
     # 单次 /evaluate 的调用超时（秒）。与 octagon.scoring_deadline_seconds 的
     # 关系：wait_for 的硬上限在 agent-octagon 侧，这里只兜住 evals 的响应。
     evals_timeout: float = Field(default=300.0, gt=0)
+    # 把所有 pointwise 维度强制成同一方法，不改共享 env 仓库。空=按 env
+    # meta.yaml（缺省 agent_judge）。
+    #
+    # 何时需要：env 的维度绑定了自己的私有资产——GDPval 的官方 59 条 rubric
+    # 在 <env_dir>/private/，参考与专家工作簿是 xlsx。非 agentic 的 judge 只
+    # 拿得到 prompt 里的 JSON，读不了 xlsx、也看不到 rubric，只能判「无法
+    # 核验」给 0 分；而那个 0 与「agent 真的做得差」在库里无法区分。这类 env
+    # 整体需要 agent_judge_agentic（pi 带 read/bash 自取 evidence.env_dir）。
+    evals_method_override: Literal[
+        "", "deterministic", "agent_judge", "agent_judge_agentic", "jev_judge"
+    ] = ""
+
+    # ---- 归因（evals /attribute）----------------------------------------
+    # 默认关：每个维度一次 agentic pi 会话，4 维 × 7 agent 的 run 就是 28 次。
+    # 打开后也只在 API 手动触发时调用，不挂自动——归因是派生投影，绝不回写分数。
+    attribution_enabled: bool = False
+    # 只归因低于此分（0-100 标度）的维度。100=全评。
+    attribution_score_threshold: int = Field(default=60, ge=0, le=100)
+    # 单个 attempt 最多归因几个维度（按分数升序取）。兜住成本上限。
+    attribution_max_dimensions: int = Field(default=3, ge=1)
+    # 单次 /attribute 的调用超时（秒）。agentic 取证比 pointwise 慢。
+    attribution_timeout: float = Field(default=600.0, gt=0)
+
+    # ---- 比较式评分（pairwise / listwise，run 级）------------------------
+    # 默认关：round_robin 下 N 个候选是 N(N-1)/2 次裁决，7 个 agent 就是 21 次。
+    # 打开后经 API 手动触发（POST /api/runs/{id}/compare）。比较维度恒为
+    # diagnostic、weight=0，产物不进 score_total。
+    comparison_enabled: bool = False
+    # 一次 run 级比较（注册候选 + 全部维度裁决）的总超时（秒）。
+    comparison_timeout: float = Field(default=1800.0, gt=0)
 
 
 class SameModelSection(BaseModel):

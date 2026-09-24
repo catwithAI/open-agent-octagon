@@ -299,3 +299,49 @@ sandbox:
   tmpfs_home_dirs: [apt]
   # 单个 tmpfs 的上限。最坏占用 = 该值 × tmpfs 目录数 × 并发数。
   tmpfs_size: 512m
+
+# ---------------------------------------------------------------------------
+# 评分后端。internal=内置 env scorer（默认，行为与本功能不存在时完全一致）；
+# evals=把 judge 环节交给 octagon-evals。
+#
+# evals 模式只替换 judge 环节：每个维度打包送 evals，返回的 [0,1] 标量转回
+# 0-100 维度分，commit / outbox / leader / provenance 全链路不变。
+judge:
+  backend: internal          # internal | evals；env: OCTAGON_JUDGE_BACKEND
+
+  # evals 服务的 HTTP 入口。
+  #
+  # **必须与 agent-octagon 同机、同文件系统。** agentic 方法（agent_judge_agentic /
+  # *_agentic / 归因）把 attempt_dir、env_dir 当**路径**交给 evals 侧的 pi，靠它
+  # 的 read/bash 自取证据。拆到别的容器/主机上这些方法不会报错——它们会静默
+  # 退化成「只看 evidence.json 里那点摘要」，分数照出，质量暗降。
+  evals_base_url: "http://127.0.0.1:8000"   # env: OCTAGON_EVALS_BASE_URL
+  evals_timeout: 900                         # env: OCTAGON_EVALS_TIMEOUT
+
+  # 把所有 pointwise 维度强制成同一方法，不改共享 env 仓库。空=按 env meta.yaml。
+  #
+  # 何时需要：env 的维度绑定了自己的私有资产——GDPval 的官方 59 条 rubric 在
+  # <env_dir>/private/，参考与专家工作簿是 xlsx。非 agentic 的 judge 只拿得到
+  # prompt 里的 JSON，读不了 xlsx、也看不到 rubric，只能判「无法核验」给 0 分；
+  # 而那个 0 与「agent 真的做得差」在库里无法区分。这类 env 整体需要
+  # agent_judge_agentic。
+  evals_method_override: ""   # "" | deterministic | agent_judge | agent_judge_agentic | jev_judge
+
+  # 比较式评分（pairwise / listwise，run 级）。经 API 手动触发：
+  #   POST /api/runs/{run_id}/compare
+  #   GET  /api/runs/{run_id}/comparisons
+  # 比较维度恒为 role=diagnostic、weight=0，**不进 score_total**——它的分依赖
+  # 同组其他 attempt，进总分就让单个 attempt 的成绩随同伴变化，无法单独重放。
+  # 默认关：round_robin 下 N 个候选是 N(N-1)/2 次裁决，7 个 agent 就是 21 次。
+  comparison_enabled: false
+  comparison_timeout: 1800
+
+  # 归因（evals POST /attribute）。经 API 手动触发：
+  #   POST /api/runs/{run_id}/attempts/{attempt_id}/attribute
+  # 产物落 data/attempts/<id>/attribution/<dimension>.json，恒为 status=candidate
+  # 供人工复核；不写 scores、不动 score_total、不改 attempt 状态。
+  # 默认关：每维一次 agentic pi 会话，4 维 × 7 agent 就是 28 次。
+  attribution_enabled: false
+  attribution_score_threshold: 60   # 只归因低于此分（0-100）的维度
+  attribution_max_dimensions: 3     # 单个 attempt 最多归因几维（按分数升序）
+  attribution_timeout: 600

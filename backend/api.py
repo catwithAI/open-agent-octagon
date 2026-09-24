@@ -679,6 +679,11 @@ def _get_attempt_detail_sync(db_path: Path, attempt_id: str) -> dict[str, Any] |
     from .automation.diagnostics import read_diagnosis
 
     detail["diagnosis"] = read_diagnosis(db_path.parent, attempt_id)
+    # 归因：手动触发后落盘的候选分析。与 diagnosis 并列——都是派生投影，
+    # 都不参与 score_total。没触发过就是空列表。
+    from .attribution_client import read_attributions
+
+    detail["attribution"] = read_attributions(db_path.parent, attempt_id)
     detail["scores"] = [dict(s) for s in scores]
     from .rubric_evolution.store import list_score_revisions_sync
 
@@ -1041,6 +1046,21 @@ def _artifact_attempt_dir(
     if row is None:
         raise HTTPException(status_code=404, detail="artifact not found")
     return data_path / "attempts" / attempt_id
+
+
+
+def _attempt_agent_name(*, db_path: Path, attempt_id: str) -> str | None:
+    """attempt 记录里的 agent 名。
+
+    ATIF emitter 缺省会按沙盒 home 里的标记目录反推 adapter；但 agent 名在库里
+    是现成的**权威值**，没有理由去猜。随着支持的 agent 变多（标记目录互相接近、
+    同一 sandbox_home 里可能留下不止一种痕迹），推断只会越来越脆。
+    """
+    with _open_sync(db_path) as conn:
+        row = conn.execute(
+            "SELECT agent_name FROM attempts WHERE id=?", (attempt_id,)
+        ).fetchone()
+    return row[0] if row and row[0] else None
 
 
 _TRUSTED_PREVIEW_PAGE_BYTES = 4 * 1024 * 1024
@@ -1679,6 +1699,137 @@ def build_router() -> APIRouter:
             },
         )
 
+    @router.get("/runs/{run_id}/comparisons")
+    async def get_run_comparisons(run_id: str) -> dict[str, Any]:
+        """run 级比较式评分的作业记录。
+
+        ``candidate_ids`` / ``conversion`` / ``conversion_version`` 是结果可比性
+        的前提：同一个 attempt 在不同候选集或不同转换算法下的分数不能混排。
+        """
+        state = runtime_state.get()
+        if _get_run_sync(state.db_path, run_id) is None:
+            raise HTTPException(status_code=404, detail=f"run not found: {run_id}")
+        from .comparison_scorer import list_comparison_jobs
+
+        return {"run_id": run_id, "jobs": list_comparison_jobs(state.db_path, run_id)}
+
+    @router.post("/runs/{run_id}/compare")
+    async def compare_run_dimensions(run_id: str) -> dict[str, Any]:
+        """手动触发 run 级比较式评分（pairwise / listwise）。
+
+        比较维度是 diagnostic、weight=0：结果写进 scores 表供展示与排序，
+        **不参与 score_total**——它的分依赖同组其他 attempt，进总分就让单个
+        attempt 的成绩随同伴变化，也就无法单独重放。
+        """
+        state = runtime_state.get()
+        run = _get_run_sync(state.db_path, run_id)
+        if run is None:
+            raise HTTPException(status_code=404, detail=f"run not found: {run_id}")
+        judge_cfg = getattr(state.settings, "judge", None)
+        if judge_cfg is None or not judge_cfg.comparison_enabled:
+            raise HTTPException(
+                status_code=409,
+                detail="比较式评分未启用：设置 judge.comparison_enabled=true",
+            )
+        env = state.envs.get(run.get("env_name"))
+        if env is None:
+            raise HTTPException(
+                status_code=409,
+                detail=f"env 未加载，无法取维度定义: {run.get('env_name')}",
+            )
+        from .comparison_scorer import ComparisonError, run_comparisons
+        from .evals_scorer import _dimensions_from_env, comparison_dimensions_from_env
+
+        # 送**完整 plan**：evals 的 validate_plan 要求至少有一个 role=scored
+        # 且权重 > 0 的维度，只送比较维度（恒为 diagnostic/weight=0）会被拒。
+        comparison_dims = comparison_dimensions_from_env(env)
+        dimensions = _dimensions_from_env(
+            env, method_override=judge_cfg.evals_method_override or None
+        ) + comparison_dims
+        if not comparison_dims:
+            return {
+                "run_id": run_id, "candidates": [], "results": [],
+                "reason": "no_comparison_dimensions",
+            }
+        try:
+            return await asyncio.to_thread(
+                run_comparisons,
+                db_path=state.db_path,
+                data_path=state.data_path,
+                run_id=run_id,
+                env=env,
+                task=run.get("task") or {},
+                dimensions=dimensions,
+                base_url=judge_cfg.evals_base_url,
+                timeout=judge_cfg.comparison_timeout,
+            )
+        except ComparisonError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    @router.post("/runs/{run_id}/attempts/{attempt_id}/attribute")
+    async def attribute_attempt_dimensions(
+        run_id: str, attempt_id: str
+    ) -> dict[str, Any]:
+        """手动触发归因：低分维度 → evals /attribute → 落盘候选分析。
+
+        刻意不挂自动钩子。每个维度一次 agentic pi 会话，一个 4 维 × 7 agent
+        的 run 自动化就是 28 次；先让人按需要触发。
+
+        归因是派生投影：不写 scores、不动 score_total、不改 attempt 状态。
+        调用失败只影响本次响应。
+        """
+        state = runtime_state.get()
+        detail = _get_attempt_detail_sync(state.db_path, attempt_id)
+        if detail is None or detail.get("run_id") != run_id:
+            raise HTTPException(
+                status_code=404,
+                detail=f"attempt not found under run={run_id}: {attempt_id}",
+            )
+        judge_cfg = getattr(state.settings, "judge", None)
+        if judge_cfg is None or not judge_cfg.attribution_enabled:
+            raise HTTPException(
+                status_code=409,
+                detail="归因未启用：设置 judge.attribution_enabled=true",
+            )
+        env = state.envs.get(detail.get("env_name"))
+        if env is None:
+            raise HTTPException(
+                status_code=409,
+                detail=f"env 未加载，无法取维度定义: {detail.get('env_name')}",
+            )
+        scores = detail.get("scores") or []
+        if not scores:
+            raise HTTPException(
+                status_code=422, detail="attempt 尚无分数，无从归因"
+            )
+        from .attribution_client import attribute_attempt
+        from .evals_scorer import _dimensions_from_env, build_evidence
+
+        # 与评分共用同一套证据组装：归因用的是 agentic judge（pi + read/bash），
+        # 所以走指针形态——绝对路径 + ATIF 轨迹，不内联 trace/events。
+        evidence = build_evidence(
+            data_path=state.data_path,
+            attempt_id=attempt_id,
+            env=env,
+            trace=[],
+            final_state={},
+            events=[],
+            agentic=True,
+        )
+        return await asyncio.to_thread(
+            attribute_attempt,
+            data_path=state.data_path,
+            attempt_id=attempt_id,
+            job_id=run_id,
+            dimensions=_dimensions_from_env(env),
+            scores=scores,
+            evidence=evidence,
+            base_url=judge_cfg.evals_base_url,
+            timeout=judge_cfg.attribution_timeout,
+            threshold=judge_cfg.attribution_score_threshold,
+            max_dimensions=judge_cfg.attribution_max_dimensions,
+        )
+
     @router.get("/runs/{run_id}/attempts/{attempt_id}")
     async def get_attempt(
         run_id: str,
@@ -1928,8 +2079,12 @@ def build_router() -> APIRouter:
             data_path=state.data_path, db_path=state.db_path,
             run_id=run_id, attempt_id=attempt_id,
         )
+        agent_name = await asyncio.to_thread(
+            _attempt_agent_name, db_path=state.db_path, attempt_id=attempt_id
+        )
         outcome = await asyncio.to_thread(
-            emit_attempt_atif, attempt_dir, attempt_id=attempt_id
+            emit_attempt_atif, attempt_dir,
+            agent_name=agent_name, attempt_id=attempt_id,
         )
         payload: dict[str, Any] = {"status": outcome.status, "attempt_id": attempt_id}
         if outcome.trajectory is not None:

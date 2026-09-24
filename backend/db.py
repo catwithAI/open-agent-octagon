@@ -708,6 +708,36 @@ CREATE TABLE IF NOT EXISTS attempt_judge_runs (
 );
 CREATE INDEX IF NOT EXISTS idx_attempt_judge_runs_attempt
     ON attempt_judge_runs(attempt_id);
+
+-- run 级比较式评分（pairwise / listwise）的作业记录。
+--
+-- 比较维度与 pointwise 维度的根本差别：它的分**依赖同组其他 attempt**。
+-- 因此必须记下参与比较的候选集——win_count 是「胜场 ÷ 该候选实际参赛场次」
+-- (evals comparison.py 的 _convert_win_count)，同一个 attempt 在 3 人组和
+-- 7 人组里的分数不可比。没有 candidate_ids_json，两个分数能不能放一起看
+-- 就无从判断。
+--
+-- conversion / conversion_version 同理入账：换了转换算法的结果不能与旧结果
+-- 混排。UNIQUE(run_id, dimension, plan_hash) 保证同一计划下不重复评。
+CREATE TABLE IF NOT EXISTS run_comparison_jobs (
+    id                  TEXT PRIMARY KEY,       -- 'cmp_<hex>'
+    run_id              TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    dimension           TEXT NOT NULL,
+    method              TEXT NOT NULL,          -- pairwise_judge* / listwise_judge*
+    plan_hash           TEXT NOT NULL DEFAULT '',
+    conversion          TEXT NOT NULL DEFAULT 'win_count',
+    conversion_version  TEXT NOT NULL DEFAULT '1',
+    candidate_ids_json  TEXT NOT NULL DEFAULT '[]',  -- 参与比较的 attempt_id 列表
+    status              TEXT NOT NULL,          -- queued|running|completed|failed|skipped
+    result_json         TEXT NOT NULL DEFAULT '{}',  -- {attempt_id: value(0-100)}
+    error_code          TEXT,
+    error_message       TEXT,
+    created_at          TEXT NOT NULL,
+    ended_at            TEXT,
+    UNIQUE(run_id, dimension, plan_hash)
+);
+CREATE INDEX IF NOT EXISTS idx_run_comparison_jobs_run
+    ON run_comparison_jobs(run_id);
 """
 
 
