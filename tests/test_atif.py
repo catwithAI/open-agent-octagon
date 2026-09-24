@@ -846,3 +846,106 @@ def test_emitter_explicit_agent_name_wins_over_inference() -> None:
     # 传一个该目录里没有痕迹的 agent：不应被目录标记"纠正"回 kimi。
     other = emit_attempt_atif(data / "attempts" / "att_km6", agent_name="codex")
     assert other.status == "not_available"
+
+
+# ---------- blade-agent --------------------------------------------------------
+
+
+def _blade_events(*, no_assistant: bool = False, only_context: bool = False) -> list[dict]:
+    """一段最小但结构真实的 blade-agent 会话（对齐 att_8455a549f371 的实际形态）。"""
+    if only_context:
+        return [
+            {"timestamp": "2026-09-23T08:54:26.486637+00:00", "type": "context",
+             "role": "user", "content": "<platform-services>…"},
+            {"timestamp": "2026-09-23T08:54:26.487068+00:00", "type": "memory_inject",
+             "role": "user", "content": "…"},
+        ]
+    events: list[dict] = [
+        # 平台注入的上下文快照：不是 agent 的行为，不该计入步骤
+        {"timestamp": "2026-09-23T08:54:26.486637+00:00", "type": "context",
+         "role": "user", "content": "<network-reach>…"},
+        {"timestamp": "2026-09-23T08:54:26.489047+00:00", "type": "message",
+         "role": "user", "content": "Prepare a structured Excel profit and loss report."},
+    ]
+    if no_assistant:
+        return events
+    events += [
+        {"timestamp": "2026-09-23T08:54:30.239269+00:00", "type": "message",
+         "role": "assistant", "content": "I'll examine the reference file.",
+         "tool_calls": [{"id": "call_a", "function": {
+             "name": "Bash", "arguments": '{"command":"ls -la","description":"列目录"}'}}]},
+        {"timestamp": "2026-09-23T08:54:30.748333+00:00", "type": "message",
+         "role": "tool",
+         "content": '{"command":"ls -la","exit_code":0,"output":"total 28"}'},
+        {"timestamp": "2026-09-23T08:54:40.000000+00:00", "type": "message",
+         "role": "assistant", "content": "Report written.",
+         "tool_calls": [{"id": "call_b", "function": {
+             "name": "Write", "arguments": "not-json-at-all"}}]},
+        {"timestamp": "2026-09-23T08:54:41.000000+00:00", "type": "message",
+         "role": "tool", "content": '{"exit_code":0,"output":"ok"}'},
+    ]
+    return events
+
+
+def test_blade_agent_converter_builds_steps() -> None:
+    from backend.atif.converters.blade_agent import convert_events_to_trajectory
+
+    t = convert_events_to_trajectory(_blade_events(), attempt_id="att_b1")
+    assert t is not None
+    assert [s.source for s in t.steps] == ["user", "agent", "agent"]
+    assert t.agent.name == "blade-agent"
+    assert t.final_metrics.total_steps == 3
+    # step_id 连续
+    assert [s.step_id for s in t.steps] == [1, 2, 3]
+
+
+def test_blade_agent_context_events_are_not_behavior() -> None:
+    """平台注入的 context / memory_inject 是注入，不是 agent 做的事。"""
+    from backend.atif.converters.blade_agent import convert_events_to_trajectory
+
+    t = convert_events_to_trajectory(_blade_events(), attempt_id="att_b2")
+    assert all("network-reach" not in (s.message or "") for s in t.steps)
+
+
+def test_blade_agent_pairs_tool_results_by_order() -> None:
+    """结果事件不带 tool_call_id —— 按顺序与上一步的调用配对。"""
+    from backend.atif.converters.blade_agent import convert_events_to_trajectory
+
+    t = convert_events_to_trajectory(_blade_events(), attempt_id="att_b3")
+    first_agent = t.steps[1]
+    assert first_agent.tool_calls[0].function_name == "Bash"
+    assert first_agent.tool_calls[0].arguments["command"] == "ls -la"
+    assert first_agent.observation.results[0].source_call_id == "call_a"
+    assert "total 28" in first_agent.observation.results[0].content
+
+
+def test_blade_agent_tolerates_unparsable_arguments() -> None:
+    """arguments 解不开就原样留着 —— 丢掉这次调用比留个原始串更糟。"""
+    from backend.atif.converters.blade_agent import convert_events_to_trajectory
+
+    t = convert_events_to_trajectory(_blade_events(), attempt_id="att_b4")
+    assert t.steps[2].tool_calls[0].arguments == {"_raw": "not-json-at-all"}
+
+
+def test_emitter_blade_agent_ready(tmp_path) -> None:
+    attempt_dir = tmp_path / "attempts" / "att_b5"
+    attempt_dir.mkdir(parents=True)
+    (attempt_dir / "events.jsonl").write_text(
+        "\n".join(json.dumps(e, ensure_ascii=False) for e in _blade_events()),
+        encoding="utf-8")
+    out = emit_attempt_atif(attempt_dir, agent_name="blade-agent", attempt_id="att_b5")
+    assert out.status == "ready", out.reason
+    assert out.trajectory["agent"]["name"] == "blade-agent"
+
+
+def test_emitter_blade_agent_reports_real_reason(tmp_path) -> None:
+    """「转录在但没 agent 行为」不能说成「没有转录」。"""
+    attempt_dir = tmp_path / "attempts" / "att_b6"
+    attempt_dir.mkdir(parents=True)
+    (attempt_dir / "events.jsonl").write_text(
+        "\n".join(json.dumps(e) for e in _blade_events(only_context=True)),
+        encoding="utf-8")
+    out = emit_attempt_atif(attempt_dir, agent_name="blade-agent", attempt_id="att_b6")
+    assert out.status == "not_available"
+    assert "无 message 事件" in out.reason
+    assert "no usable event transcript" not in out.reason

@@ -25,19 +25,24 @@ from .schema import Trajectory
 from .converters import claude_code as cc_converter
 from .converters import codex as codex_converter
 from .converters import dsh as dsh_converter
+from .converters import blade_agent as blade_converter
 from .converters import kimi_code as kimi_converter
 from .converters import opencode as opencode_converter
 
 PRODUCER_VERSION = "octagon-atif-v1"
 
 _SUPPORTED_AGENTS = frozenset(
-    {"claude-code", "codex", "dsh", "kimi-code", "opencode", "mimo-code"}
+    {"blade-agent", "claude-code", "codex", "dsh", "kimi-code", "opencode", "mimo-code"}
 )
 
 #: 事件流型 agent：转换器读 attempt 目录 events.jsonl，不需 home 会话文件。
 #: kimi-code **不在此列**——沙箱里的 1.50 会把带时间戳、带分步 token 的
 #: wire.jsonl 落在 ``.kimi/sessions``，比 events.jsonl 的 role/content 流信息多。
-_EVENTS_AGENTS = frozenset({"opencode", "mimo-code"})
+#:
+#: blade-agent 在此列但**契约与 opencode 族不同**（OpenAI 风格 role/message，
+#: 非 opencode 的 part/state 流），故单独一个转换器。把它排除在 ATIF 之外会让
+#: 它在同场竞技里证据形态与其余六家不对等——比较式评分尤其吃这个亏。
+_EVENTS_AGENTS = frozenset({"blade-agent", "opencode", "mimo-code"})
 
 
 @dataclass(frozen=True)
@@ -138,18 +143,28 @@ def emit_attempt_atif(
         )
 
     if agent in _EVENTS_AGENTS:
-        # 事件流型：读 attempt 目录 events.jsonl（adapter 逐行落盘的 CLI 流）。
-        # opencode / mimo-code 契约同构，共用一个转换器。
-        events = opencode_converter.find_session_events(attempt_dir)
-        trajectory = opencode_converter.convert_events_to_trajectory(
-            events, attempt_id=aid, agent_name=agent
-        )
+        # 事件流型：读 attempt 目录 events.jsonl（adapter 逐行落盘的流）。
         source_hint = "events.jsonl"
+        if agent == "blade-agent":
+            events = blade_converter.find_session_events(attempt_dir)
+            trajectory = blade_converter.convert_events_to_trajectory(
+                events, attempt_id=aid
+            )
+            detail = blade_converter.describe_empty(events) if trajectory is None else None
+        else:  # opencode / mimo-code 契约同构，共用一个转换器
+            events = opencode_converter.find_session_events(attempt_dir)
+            trajectory = opencode_converter.convert_events_to_trajectory(
+                events, attempt_id=aid, agent_name=agent
+            )
+            detail = None
         if trajectory is None:
             return EmitOutcome(
                 status="not_available",
                 attempt_id=aid,
-                reason=f"no usable event transcript under {source_hint}",
+                reason=(
+                    f"{detail} (source: {source_hint})" if detail
+                    else f"no usable event transcript under {source_hint}"
+                ),
             )
         return EmitOutcome(
             status="ready",
