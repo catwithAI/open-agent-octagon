@@ -27,25 +27,92 @@ class EvalsJudgeError(RuntimeError):
     """
 
 
-def _dimensions_from_env(env: Any) -> list[dict[str, Any]]:
-    """env meta.yaml 的 dimensions → evals EvalPlan dimensions。
+#: evals 的比较式方法（models.COMPARISON_METHODS）。这些维度是 **run 级**的——
+#: 要把同一个 run 下的多个 attempt 聚成一组候选才能裁决，而 /evaluate 是
+#: attempt 级单次入口，送进去会被整体 409（api.py 的 method 白名单）。故
+#: pointwise 打包时必须先滤掉，否则一个比较维度会让同 env 的所有维度都评不成。
+COMPARISON_METHODS = frozenset({
+    "pairwise_judge", "pairwise_judge_agentic",
+    "listwise_judge", "listwise_judge_agentic",
+})
+
+#: /evaluate 接受的 pointwise 方法白名单。env 写了白名单外的方法 → 按缺省
+#: agent_judge 处理并告警，不让一个拼错的方法名把整批评分带崩。
+_POINTWISE_METHODS = frozenset({
+    "deterministic", "agent_judge", "agent_judge_agentic", "jev_judge",
+})
+
+DEFAULT_METHOD = "agent_judge"
+
+
+def _dimension_from_meta(item: dict[str, Any]) -> dict[str, Any]:
+    """meta.yaml 的一个维度块 → evals Dimension dict。
 
     维度 ID 直接取 dimension.name：evals 返回的 ``dimension_id`` 即维度名，
     agent-octagon 的 scores.dimension 用它落库，两侧 ID 天然对齐。
+
+    ``method`` / ``role`` / ``anchors`` / ``comparison`` 原样透传给 evals，
+    由那边的 ``Dimension`` / ``ComparisonConfig`` 负责校验——这里不重复建模，
+    免得两侧的合法取值各自漂移。
     """
+    name = str(item["name"])
+    method = str(item.get("method") or DEFAULT_METHOD)
+    dim: dict[str, Any] = {
+        "id": name,
+        "version": int(item.get("version", 1)),
+        "weight": int(item.get("weight", 1)),
+        "method": method,
+        "question": str(item.get("description") or name),
+    }
+    # 比较维度默认 diagnostic：它的分依赖同组其他 attempt，进了 score_total
+    # 就让单个 attempt 的总分随同伴变化，也就没法单独重放。要进总分必须在
+    # meta.yaml 里显式写 role: scored。
+    default_role = "diagnostic" if method in COMPARISON_METHODS else "scored"
+    dim["role"] = str(item.get("role") or default_role)
+    if dim["role"] == "diagnostic":
+        # 权重强制归零，而不只是靠「不进 scores 列表」。_aggregate_total 是按
+        # `weights.get(dimension)` 查权重、`if w > 0` 才计入的——权重为 0 就
+        # 保证了即便将来有人改成从 DB 的 scores 表重算总分，diagnostic 维度
+        # 也不会被算进去。这是一道结构性的闸，不依赖调用顺序。
+        dim["weight"] = 0
+    if item.get("anchors"):
+        dim["anchors"] = item["anchors"]
+    if item.get("comparison"):
+        dim["comparison"] = item["comparison"]
+    return dim
+
+
+def _iter_meta_dimensions(env: Any):
     meta = getattr(env, "meta", {}) or {}
-    dims: list[dict[str, Any]] = []
     for item in meta.get("dimensions") or []:
         if not isinstance(item, dict) or not item.get("name"):
             continue
-        name = str(item["name"])
-        dims.append({
-            "id": name,
-            "version": 1,
-            "weight": int(item.get("weight", 1)),
-            "method": "agent_judge",
-            "question": str(item.get("description") or name),
-        })
+        yield item
+
+
+def comparison_dimensions_from_env(env: Any) -> list[dict[str, Any]]:
+    """env 里的比较式维度（run 级，由 run_comparison 那条链消费）。"""
+    return [
+        _dimension_from_meta(item)
+        for item in _iter_meta_dimensions(env)
+        if str(item.get("method") or DEFAULT_METHOD) in COMPARISON_METHODS
+    ]
+
+
+def _dimensions_from_env(env: Any) -> list[dict[str, Any]]:
+    """env meta.yaml 的 dimensions → evals EvalPlan dimensions（仅 pointwise）。"""
+    dims: list[dict[str, Any]] = []
+    for item in _iter_meta_dimensions(env):
+        method = str(item.get("method") or DEFAULT_METHOD)
+        if method in COMPARISON_METHODS:
+            continue
+        if method not in _POINTWISE_METHODS:
+            logger.warning(
+                "env %s 维度 %s 的 method=%r 不被 /evaluate 支持，按 %s 处理",
+                getattr(env, "name", "?"), item["name"], method, DEFAULT_METHOD,
+            )
+            item = {**item, "method": DEFAULT_METHOD}
+        dims.append(_dimension_from_meta(item))
     return dims
 
 
@@ -110,6 +177,15 @@ def make_evals_scorer(
             "events": kwargs.get("events") or [],
             "attempt_dir": str(Path(data_path) / "attempts" / attempt_id),
         }
+        if not dimensions:
+            # env 只配了比较式维度：pointwise 无可评，直接返回空而不是发一个
+            # dimensions=[] 的请求（evals 侧 min_length=1 会 422）。这些维度的
+            # 分由 run 级比较链在全部 attempt 评完后回填。
+            logger.info(
+                "env %s 无 pointwise 维度，跳过 /evaluate attempt=%s",
+                getattr(env, "name", "?"), attempt_id,
+            )
+            return []
         payload = {
             "evaluation_id": f"{job_id}:{attempt_id}",
             "run_id": attempt_id,
