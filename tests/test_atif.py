@@ -413,6 +413,11 @@ def test_list_agents_sandbox_aware(monkeypatch) -> None:
         api.runtime_state, "get",
         lambda: type("S", (), {"sandbox_status": _fake_sandbox_status(agents)})(),
     )
+    # cli_path=None 时 _list_agents 回落到 shutil.which("blade")（api.py:96），
+    # 读的是**真实 PATH**——评测机上装了 blade 二进制，blade-agent 就被判成
+    # available，下面那条断言随之落空。桩掉 which，让本用例只测判定逻辑、
+    # 不测跑在哪台机器上。
+    monkeypatch.setattr(api.shutil, "which", lambda _name: None)
     listing = api._list_agents(_SettingsStub())
     by_name = {a["name"]: a for a in listing}
     for name in agents:
@@ -432,6 +437,8 @@ def test_list_agents_sandbox_off_falls_back_to_host(monkeypatch) -> None:
         image = None
 
     monkeypatch.setattr(api.runtime_state, "get", lambda: type("S", (), {"sandbox_status": _Status()})())
+    # 同上：宿主机 PATH 上真有什么二进制，不该决定这个用例的成败。
+    monkeypatch.setattr(api.shutil, "which", lambda _name: None)
     listing = api._list_agents(_SettingsStub())
     by_name = {a["name"]: a for a in listing}
     # 宿主机缺 kimi/opencode/mimo → not_found
@@ -440,7 +447,7 @@ def test_list_agents_sandbox_off_falls_back_to_host(monkeypatch) -> None:
         assert by_name[name]["locus"] == "host"
 
 
-# ---------- opencode / mimo / kimi 事件流型转换器 ----------------------------
+# ---------- opencode / mimo 事件流型转换器 -----------------------------------
 
 
 def _write_events(attempt_dir: Path, events: list[dict]) -> Path:
@@ -488,31 +495,354 @@ def test_opencode_converter_mimo_name() -> None:
     assert out.trajectory["agent"]["name"] == "mimo-code"
 
 
-def test_kimi_converter_role_content() -> None:
-    data = Path(tempfile.mkdtemp())
-    ad = _attempt_dir(data, "att_k1")
-    _write_events(ad, [
-        {"role": "user", "content": "compute sum"},
-        {"role": "meta", "type": "session.resume_hint", "session_id": "k_ses"},
-        {"role": "thinking", "content": "use bash"},
-        {"role": "assistant", "content": "checking",
-         "tool_calls": [{"id": "t1", "name": "Bash", "arguments": {"command": "echo 1"}}]},
-        {"role": "assistant", "content": "answer: 385"},
-    ])
-    out = emit_attempt_atif(ad, agent_name="kimi-code", attempt_id="att_k1")
-    assert out.status == "ready"
-    steps = out.trajectory["steps"]
-    assert [s["source"] for s in steps] == ["user", "agent", "agent"]
-    assert steps[1]["reasoning_content"] == "use bash"
-    assert steps[1]["tool_calls"][0]["function_name"] == "Bash"
-    assert steps[2]["message"] == "answer: 385"
-    assert out.trajectory["session_id"] == "k_ses"
-
-
 def test_events_agent_requires_explicit_agent_name() -> None:
-    """kimi/opencode/mimo 读 events.jsonl，无 home 标记可判别 → 必须显式 agent。"""
+    """opencode/mimo 读 events.jsonl，无 home 标记可判别 → 必须显式 agent。"""
     data = Path(tempfile.mkdtemp())
     ad = _attempt_dir(data, "att_anon")
     _write_events(ad, [{"type": "step_start", "sessionID": "s", "timestamp": 1700000000000}])
     out = emit_attempt_atif(ad, attempt_id="att_anon")  # 不传 agent_name
     assert out.status == "not_available"
+
+
+# ---------- dsh ----------------------------------------------------------------
+
+
+def _dsh_session(*, turn_failed: bool = False, no_steps: bool = False) -> list[dict]:
+    """一段最小但结构真实的 dsh 会话（对齐 att_24a673bb5a23 的实际形态）。"""
+    events: list[dict] = [
+        {"type": "session", "version": 0, "id": "octagon-att_dsh1",
+         "createdAt": 1790153666682, "cwd": "/w/skill_workspace", "delegationDepth": 0},
+        {"type": "turn/start", "seq": 1, "time": 1790153666687, "data": {"turn": 1}},
+        {"type": "request/header", "seq": 6, "time": 1790153666713, "data": {"header": {
+            "config": {"provider": "octagon", "model": "deepseek-4.1-flash", "maxTokens": 32768},
+            "system": "You are an AI agent powered by DeepSeek Harness.",
+            "tools": [{"name": "bash", "description": "run a command"}]}}},
+        {"type": "request/context", "seq": 7, "time": 1790153666713,
+         "data": {"provider": "octagon", "model": "deepseek-4.1-flash", "contextWindow": 200000}},
+        {"type": "user/message", "seq": 4, "time": 1790153666710,
+         "data": {"content": [{"type": "text", "text": "do the thing"}]}},
+    ]
+    if not no_steps:
+        events += [
+            {"type": "step/start", "seq": 3, "time": 1790153666710, "data": {"turn": 1, "step": 1}},
+            # 流式增量：转换器必须忽略，否则内容会和 assistant/message 重复一遍。
+            {"type": "reasoning-chunks", "seq0": 9, "time0": 1790153667925,
+             "data": {"turn": 1, "step": 1, "texts": ["think", "ing"]}},
+            {"type": "text-chunks", "seq0": 10, "time0": 1790153667926,
+             "data": {"turn": 1, "step": 1, "texts": ["say", "ing"]}},
+            {"type": "assistant/message", "seq": 127, "time": 1790153669948, "data": {
+                "turn": 1, "step": 1, "usage": {"inputTokens": 100, "outputTokens": 40},
+                "message": {"role": "assistant", "id": "m1", "content": [
+                    {"type": "reasoning", "text": "thinking"},
+                    {"type": "text", "text": "saying"},
+                    {"type": "tool-call", "id": "call_1", "name": "bash",
+                     "arguments": '{"command":"ls -la"}'}]}}},
+            {"type": "tool/call", "seq": 128, "time": 1790153669949, "data": {
+                "turn": 1, "step": 1, "callId": "call_1", "name": "bash",
+                "arguments": '{"command":"ls -la"}'}},
+            {"type": "tool/result", "seq": 129, "time": 1790153670394, "data": {
+                "turn": 1, "step": 1, "message": {
+                    "source": {"kind": "tool", "callId": "call_1"},
+                    "content": [{"type": "tool-result", "toolCallId": "call_1",
+                                 "content": [{"type": "text", "text": "total 0"}]}]}}},
+            {"type": "step/end", "seq": 132, "time": 1790153670405, "data": {"turn": 1, "step": 1}},
+        ]
+    reason = ({"kind": "error", "error": {"message": "404: model_not_found"}}
+              if turn_failed else {"kind": "completed"})
+    events.append({"type": "turn/end", "seq": 999, "time": 1790153919354,
+                   "data": {"turn": 1, "reason": reason}})
+    return events
+
+
+def _write_dsh_session(data: Path, attempt_id: str, events: list[dict], *,
+                       sandbox: bool = True) -> Path:
+    attempt_dir = _attempt_dir(data, attempt_id)
+    root = attempt_dir / ("sandbox_home" if sandbox else ".")
+    session = root / "dsh_sessions" / "--w-skill_workspace--" / f"octagon-{attempt_id}"
+    session.mkdir(parents=True, exist_ok=True)
+    (session / "session.jsonl").write_text(
+        "\n".join(json.dumps(e, ensure_ascii=False) for e in events), encoding="utf-8")
+    return attempt_dir
+
+
+def test_dsh_converter_builds_steps() -> None:
+    data = Path(tempfile.mkdtemp())
+    attempt_dir = _write_dsh_session(data, "att_dsh1", _dsh_session())
+
+    from backend.atif.converters.dsh import (
+        convert_events_to_trajectory,
+        find_session_events,
+    )
+
+    events = find_session_events(attempt_dir / "sandbox_home", "att_dsh1")
+    trajectory = convert_events_to_trajectory(events, attempt_id="att_dsh1")
+    assert trajectory is not None
+    Trajectory.model_validate(trajectory.to_json_dict())
+
+    assert trajectory.agent.name == "dsh"
+    assert trajectory.agent.model_name == "deepseek-4.1-flash"
+    assert trajectory.agent.tool_definitions == [{"name": "bash", "description": "run a command"}]
+    assert trajectory.agent.extra["provider"] == "octagon"
+
+    assert len(trajectory.steps) == 1
+    step = trajectory.steps[0]
+    assert step.source == "agent"
+    # 流式 chunk 被忽略：内容只来自 assistant/message，没有重复。
+    assert step.reasoning_content == "thinking"
+    assert step.message == "saying"
+    assert step.tool_calls is not None and len(step.tool_calls) == 1
+    assert step.tool_calls[0].function_name == "bash"
+    # arguments 是 JSON 字符串，必须解析成 dict（schema 要求）。
+    assert step.tool_calls[0].arguments == {"command": "ls -la"}
+    assert step.observation is not None
+    assert step.observation.results[0].source_call_id == "call_1"
+    assert step.observation.results[0].content == "total 0"
+    assert step.metrics is not None and step.metrics.prompt_tokens == 100
+    assert trajectory.final_metrics.total_completion_tokens == 40
+
+
+def test_dsh_converter_keys_steps_by_turn_and_step() -> None:
+    """step 编号在每个 turn 内从 1 重来——只按 step 归并会把两轮并成一步。"""
+    data = Path(tempfile.mkdtemp())
+    events = _dsh_session()
+    second_turn = [
+        {"type": "step/start", "seq": 200, "time": 1790153680000, "data": {"turn": 2, "step": 1}},
+        {"type": "assistant/message", "seq": 201, "time": 1790153680001, "data": {
+            "turn": 2, "step": 1, "usage": {"inputTokens": 7, "outputTokens": 3},
+            "message": {"role": "assistant", "id": "m2",
+                        "content": [{"type": "text", "text": "second turn"}]}}},
+        {"type": "step/end", "seq": 202, "time": 1790153680002, "data": {"turn": 2, "step": 1}},
+    ]
+    attempt_dir = _write_dsh_session(data, "att_dsh2", events + second_turn)
+
+    from backend.atif.converters.dsh import (
+        convert_events_to_trajectory,
+        find_session_events,
+    )
+
+    trajectory = convert_events_to_trajectory(
+        find_session_events(attempt_dir / "sandbox_home", "att_dsh2"), attempt_id="att_dsh2")
+    assert trajectory is not None
+    assert [s.step_id for s in trajectory.steps] == [1, 2]
+    assert trajectory.steps[1].message == "second turn"
+    assert trajectory.steps[0].extra["turn"] == 1
+    assert trajectory.steps[1].extra["turn"] == 2
+
+
+def test_dsh_converter_tolerates_unparsable_arguments() -> None:
+    """畸形 arguments 不能毁掉整条 trajectory——包进 _raw 保留原文。"""
+    data = Path(tempfile.mkdtemp())
+    events = _dsh_session()
+    for e in events:
+        if e.get("type") == "tool/call":
+            e["data"]["arguments"] = "{not json"
+    attempt_dir = _write_dsh_session(data, "att_dsh3", events)
+
+    from backend.atif.converters.dsh import (
+        convert_events_to_trajectory,
+        find_session_events,
+    )
+
+    trajectory = convert_events_to_trajectory(
+        find_session_events(attempt_dir / "sandbox_home", "att_dsh3"), attempt_id="att_dsh3")
+    assert trajectory is not None
+    assert trajectory.steps[0].tool_calls[0].arguments == {"_raw": "{not json"}
+
+
+def test_emitter_dsh_ready_from_sandbox_home() -> None:
+    data = Path(tempfile.mkdtemp())
+    _write_dsh_session(data, "att_dsh4", _dsh_session())
+    out = emit_attempt_atif(data / "attempts" / "att_dsh4")
+    assert out.status == "ready", out.reason
+    assert out.trajectory["agent"]["name"] == "dsh"
+    Trajectory.model_validate(out.trajectory)
+
+
+def test_emitter_dsh_reports_turn_error_instead_of_missing_transcript() -> None:
+    """转录在、但那一轮以错误收场——理由必须说出真实原因。
+
+    报成「no usable session transcript」会把上游/设施故障伪装成采集缺陷，
+    而把设施故障误读成 agent 表现正是本项目反复踩的坑。
+    """
+    data = Path(tempfile.mkdtemp())
+    _write_dsh_session(data, "att_dsh5", _dsh_session(no_steps=True, turn_failed=True))
+    out = emit_attempt_atif(data / "attempts" / "att_dsh5")
+    assert out.status == "not_available"
+    assert "session transcript present" in out.reason
+    assert "404: model_not_found" in out.reason
+    assert "no usable session transcript" not in out.reason
+
+
+def test_emitter_dsh_missing_transcript_stays_generic() -> None:
+    """转录真的不存在时，仍报采集缺失——两类原因不能混为一谈。"""
+    data = Path(tempfile.mkdtemp())
+    attempt_dir = _attempt_dir(data, "att_dsh6")
+    (attempt_dir / "sandbox_home" / "dsh_sessions").mkdir(parents=True)
+    out = emit_attempt_atif(attempt_dir)
+    assert out.status == "not_available"
+    assert "no usable session transcript" in out.reason
+
+
+# ---------- kimi-code ----------------------------------------------------------
+
+
+def _kimi_wire(*, no_steps: bool = False) -> list[dict]:
+    """一段最小但结构真实的 kimi wire（对齐 att_5b9d7a896d8c 的实际形态）。"""
+    events: list[dict] = [
+        {"protocol_version": "1.10", "type": "metadata"},
+        {"timestamp": 1790153668.25, "message": {
+            "type": "TurnBegin", "payload": {"user_input": "do the thing"}}},
+    ]
+    if no_steps:
+        events.append({"timestamp": 1790153918.17,
+                       "message": {"type": "TurnEnd", "payload": {}}})
+        return events
+    events += [
+        {"timestamp": 1790153668.26, "message": {"type": "StepBegin", "payload": {"n": 1}}},
+        {"timestamp": 1790153670.23, "message": {"type": "ContentPart", "payload": {
+            "type": "think", "think": "thinking", "encrypted": None}}},
+        {"timestamp": 1790153670.50, "message": {"type": "ContentPart", "payload": {
+            "type": "text", "text": "saying"}}},
+        {"timestamp": 1790153671.21, "message": {"type": "ToolCall", "payload": {
+            "type": "function", "id": "call_1",
+            "function": {"name": "Shell", "arguments": '{"command": "ls -la"}'}}}},
+        {"timestamp": 1790153671.22, "message": {"type": "StatusUpdate", "payload": {
+            "context_tokens": 12087, "max_context_tokens": 200000,
+            "token_usage": {"input_other": 12087, "output": 121,
+                            "input_cache_read": 64, "input_cache_creation": 0}}}},
+        {"timestamp": 1790153671.49, "message": {"type": "ToolResult", "payload": {
+            "tool_call_id": "call_1",
+            "return_value": {"is_error": False, "output": "total 0", "display": "",
+                             "message": "", "extras": {}}}}},
+        {"timestamp": 1790153918.17, "message": {"type": "TurnEnd", "payload": {}}},
+    ]
+    return events
+
+
+def _write_kimi_session(data: Path, attempt_id: str, wire: list[dict], *,
+                        session_id: str = "sess-uuid",
+                        manifest_session: str | None = "sess-uuid",
+                        system_prompt: str | None = "You are Kimi Code CLI.") -> Path:
+    attempt_dir = _attempt_dir(data, attempt_id)
+    kimi = attempt_dir / "sandbox_home" / ".kimi"
+    session = kimi / "sessions" / "workdirhash" / session_id
+    session.mkdir(parents=True, exist_ok=True)
+    (session / "wire.jsonl").write_text(
+        "\n".join(json.dumps(e, ensure_ascii=False) for e in wire), encoding="utf-8")
+    if system_prompt is not None:
+        (session / "context.jsonl").write_text(
+            json.dumps({"role": "_system_prompt", "content": system_prompt},
+                       ensure_ascii=False), encoding="utf-8")
+    if manifest_session is not None:
+        (kimi / "kimi.json").write_text(json.dumps(
+            {"work_dirs": [{"path": "/w", "kaos": "local",
+                            "last_session_id": manifest_session}]}), encoding="utf-8")
+    return attempt_dir
+
+
+def test_kimi_converter_builds_steps() -> None:
+    data = Path(tempfile.mkdtemp())
+    attempt_dir = _write_kimi_session(data, "att_km1", _kimi_wire())
+
+    from backend.atif.converters.kimi_code import (
+        convert_events_to_trajectory,
+        find_session_events,
+        find_system_prompt,
+    )
+
+    home = attempt_dir / "sandbox_home"
+    trajectory = convert_events_to_trajectory(
+        find_session_events(home), attempt_id="att_km1",
+        system_prompt=find_system_prompt(home))
+    assert trajectory is not None
+    Trajectory.model_validate(trajectory.to_json_dict())
+
+    assert trajectory.agent.name == "kimi-code"
+    # 转录里没有模型名——宁可留空也不猜。
+    assert trajectory.agent.model_name is None
+    assert trajectory.agent.extra["wire_protocol_version"] == "1.10"
+    assert trajectory.agent.extra["system_prompt"] == "You are Kimi Code CLI."
+
+    assert len(trajectory.steps) == 1
+    step = trajectory.steps[0]
+    assert step.reasoning_content == "thinking"
+    assert step.message == "saying"
+    assert step.tool_calls[0].function_name == "Shell"
+    assert step.tool_calls[0].arguments == {"command": "ls -la"}
+    assert step.observation.results[0].source_call_id == "call_1"
+    assert step.observation.results[0].content == "total 0"
+    # StatusUpdate 上报的是**真实**分步 token，不是累计值做差。
+    assert step.metrics.prompt_tokens == 12087
+    assert step.metrics.completion_tokens == 121
+    assert step.metrics.cached_tokens == 64
+    assert step.timestamp.startswith("2026-")
+
+
+def test_kimi_converter_picks_session_from_manifest() -> None:
+    """kimi.json 的 last_session_id 指哪个，就读哪个——不靠 mtime 猜。"""
+    data = Path(tempfile.mkdtemp())
+    attempt_dir = _write_kimi_session(data, "att_km2", _kimi_wire(),
+                                      session_id="wanted", manifest_session="wanted")
+    # 再塞一个更晚写入的干扰会话。
+    other = attempt_dir / "sandbox_home" / ".kimi" / "sessions" / "workdirhash" / "decoy"
+    other.mkdir(parents=True, exist_ok=True)
+    decoy = [{"protocol_version": "9.9", "type": "metadata"},
+             {"timestamp": 1790153999.0,
+              "message": {"type": "StepBegin", "payload": {"n": 1}}},
+             {"timestamp": 1790153999.1, "message": {"type": "ContentPart",
+                                                     "payload": {"type": "text", "text": "decoy"}}}]
+    (other / "wire.jsonl").write_text(
+        "\n".join(json.dumps(e) for e in decoy), encoding="utf-8")
+
+    from backend.atif.converters.kimi_code import find_session_dir
+
+    assert find_session_dir(attempt_dir / "sandbox_home").name == "wanted"
+
+
+def test_kimi_converter_tolerates_unparsable_arguments() -> None:
+    data = Path(tempfile.mkdtemp())
+    wire = _kimi_wire()
+    for e in wire:
+        msg = e.get("message") or {}
+        if msg.get("type") == "ToolCall":
+            msg["payload"]["function"]["arguments"] = "{not json"
+    attempt_dir = _write_kimi_session(data, "att_km3", wire)
+
+    from backend.atif.converters.kimi_code import (
+        convert_events_to_trajectory,
+        find_session_events,
+    )
+
+    trajectory = convert_events_to_trajectory(
+        find_session_events(attempt_dir / "sandbox_home"), attempt_id="att_km3")
+    assert trajectory.steps[0].tool_calls[0].arguments == {"_raw": "{not json"}
+
+
+def test_emitter_kimi_ready() -> None:
+    data = Path(tempfile.mkdtemp())
+    _write_kimi_session(data, "att_km4", _kimi_wire())
+    out = emit_attempt_atif(data / "attempts" / "att_km4")
+    assert out.status == "ready", out.reason
+    assert out.trajectory["agent"]["name"] == "kimi-code"
+    Trajectory.model_validate(out.trajectory)
+
+
+def test_emitter_kimi_reports_no_stepbegin() -> None:
+    """wire 在、但那一轮没走到模型——理由要说出这件事，不能报成转录缺失。"""
+    data = Path(tempfile.mkdtemp())
+    _write_kimi_session(data, "att_km5", _kimi_wire(no_steps=True))
+    out = emit_attempt_atif(data / "attempts" / "att_km5")
+    assert out.status == "not_available"
+    assert "no StepBegin" in out.reason
+    assert "no usable session transcript" not in out.reason
+
+
+def test_emitter_explicit_agent_name_wins_over_inference() -> None:
+    """显式 agent_name 是权威值；API 从库里取，不该退回目录推断。"""
+    data = Path(tempfile.mkdtemp())
+    _write_kimi_session(data, "att_km6", _kimi_wire())
+    out = emit_attempt_atif(data / "attempts" / "att_km6", agent_name="kimi-code")
+    assert out.status == "ready", out.reason
+    # 传一个该目录里没有痕迹的 agent：不应被目录标记"纠正"回 kimi。
+    other = emit_attempt_atif(data / "attempts" / "att_km6", agent_name="codex")
+    assert other.status == "not_available"

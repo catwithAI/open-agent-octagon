@@ -3,14 +3,16 @@
 在 wire/insight 数据结构**之外**，直接从沙盒 HOME 里各家 CLI 的本地会话转录
 还原 ATIF-v1.7 对话流，用于归因。源分两类：
 
-- **会话文件型**（claude-code / codex）：读 home 里的 CLI 自落盘转录
-  （``.cc-iso-home/.claude/projects`` / ``.codex-iso-home/sessions``，
-  沙箱模式为 ``sandbox_home`` 对应路径）；
-- **事件流型**（kimi-code / opencode / mimo-code）：读 attempt 目录的
-  ``events.jsonl``（adapter 逐行落盘的 CLI 事件流，与 Harbor 读的 stdout
-  文件同源）。这类无 home 标记可判别，须显式传 ``agent_name``。
+- **会话文件型**（claude-code / codex / kimi-code / dsh）：读 CLI 自落盘的
+  转录（``.cc-iso-home/.claude/projects``、``.codex-iso-home/sessions``、
+  ``.kimi-iso-home/.kimi/sessions``、``dsh_sessions``，沙箱模式为
+  ``sandbox_home`` 下对应路径）。判 adapter：显式 ``agent_name`` 优先，否则
+  按 home 标记推断；
+- **事件流型**（opencode / mimo-code）：读 attempt 目录的 ``events.jsonl``
+  （adapter 逐行落盘的 CLI 事件流，与 Harbor 读的 stdout 文件同源）。这类无
+  home 标记可判别，须显式传 ``agent_name``。
 
-源缺失 → ``not_available``。
+源缺失（如 codex 历史单轮 ``--ephemeral`` 无会话）→ ``not_available``。
 """
 
 from __future__ import annotations
@@ -22,17 +24,20 @@ from typing import Any, Literal
 from .schema import Trajectory
 from .converters import claude_code as cc_converter
 from .converters import codex as codex_converter
-from .converters import kimi as kimi_converter
+from .converters import dsh as dsh_converter
+from .converters import kimi_code as kimi_converter
 from .converters import opencode as opencode_converter
 
 PRODUCER_VERSION = "octagon-atif-v1"
 
 _SUPPORTED_AGENTS = frozenset(
-    {"claude-code", "codex", "kimi-code", "opencode", "mimo-code"}
+    {"claude-code", "codex", "dsh", "kimi-code", "opencode", "mimo-code"}
 )
 
 #: 事件流型 agent：转换器读 attempt 目录 events.jsonl，不需 home 会话文件。
-_EVENTS_AGENTS = frozenset({"kimi-code", "opencode", "mimo-code"})
+#: kimi-code **不在此列**——沙箱里的 1.50 会把带时间戳、带分步 token 的
+#: wire.jsonl 落在 ``.kimi/sessions``，比 events.jsonl 的 role/content 流信息多。
+_EVENTS_AGENTS = frozenset({"opencode", "mimo-code"})
 
 
 @dataclass(frozen=True)
@@ -50,6 +55,9 @@ class EmitOutcome:
 _HOST_HOMES = {
     "claude-code": Path(".cc-iso-home"),
     "codex": Path(".codex-iso-home"),
+    # dsh 的 DSH_SESSION_ROOT 指向 host_home(attempt_dir)/dsh_sessions，
+    # 宿主机模式下 host_home 就是 attempt 根，故 home 根是 "."。
+    "dsh": Path("."),
     "kimi-code": Path(".kimi-iso-home"),
 }
 
@@ -59,7 +67,8 @@ _HOST_HOMES = {
 _SANDBOX_MARKERS = {
     "claude-code": ".claude/projects",
     "codex": "sessions",
-    "kimi-code": ".kimi",
+    "dsh": "dsh_sessions",
+    "kimi-code": ".kimi/sessions",
 }
 
 
@@ -84,6 +93,8 @@ def _infer_agent(attempt_dir: Path) -> str | None:
             return agent
         if (attempt_dir / _HOST_HOMES[agent] / marker).is_dir():
             return agent
+    if (attempt_dir / "dsh_sessions").is_dir():
+        return "dsh"
     if (attempt_dir / ".codex-iso-home").is_dir():
         return "codex"
     if (attempt_dir / ".cc-iso-home" / ".claude" / "projects").is_dir():
@@ -102,8 +113,8 @@ def emit_attempt_atif(
     参数：
     - ``attempt_dir``：attempt 数据目录（沙箱模式下含 ``sandbox_home``；
       host 模式含 ``.cc-iso-home`` / ``.codex-iso-home``）。
-    - ``agent_name``：显式指定 adapter（claude-code / codex / kimi-code /
-      opencode / mimo-code）。事件流型（kimi/opencode/mimo）**必须显式传**
+    - ``agent_name``：显式指定 adapter（claude-code / codex / dsh / kimi-code /
+      opencode / mimo-code）。事件流型（opencode / mimo-code）**必须显式传**
       ——它们读 attempt 目录 events.jsonl，无 home 标记可判别。
     - ``attempt_id``：产物 ``trajectory_id`` / ``session_id`` 兜底；缺省用目录名。
 
@@ -128,16 +139,11 @@ def emit_attempt_atif(
 
     if agent in _EVENTS_AGENTS:
         # 事件流型：读 attempt 目录 events.jsonl（adapter 逐行落盘的 CLI 流）。
-        if agent == "kimi-code":
-            events = kimi_converter.find_session_events(attempt_dir)
-            trajectory = kimi_converter.convert_events_to_trajectory(
-                events, attempt_id=aid
-            )
-        else:  # opencode / mimo-code 契约同构
-            events = opencode_converter.find_session_events(attempt_dir)
-            trajectory = opencode_converter.convert_events_to_trajectory(
-                events, attempt_id=aid, agent_name=agent
-            )
+        # opencode / mimo-code 契约同构，共用一个转换器。
+        events = opencode_converter.find_session_events(attempt_dir)
+        trajectory = opencode_converter.convert_events_to_trajectory(
+            events, attempt_id=aid, agent_name=agent
+        )
         source_hint = "events.jsonl"
         if trajectory is None:
             return EmitOutcome(
@@ -156,23 +162,44 @@ def emit_attempt_atif(
         events = cc_converter.find_session_events(home, attempt_dir)
         trajectory = cc_converter.convert_events_to_trajectory(events, attempt_id=aid)
         source_hint = f"{home.name}/.claude/projects"
+    elif agent == "kimi-code":
+        events = kimi_converter.find_session_events(home)
+        trajectory = kimi_converter.convert_events_to_trajectory(
+            events, attempt_id=aid,
+            system_prompt=kimi_converter.find_system_prompt(home),
+        )
+        source_hint = f"{home.name}/.kimi/sessions"
+    elif agent == "dsh":
+        # session-id 恒为 octagon-<attempt_id>，传进去做精确定位。
+        events = dsh_converter.find_session_events(home, aid)
+        trajectory = dsh_converter.convert_events_to_trajectory(events, attempt_id=aid)
+        source_hint = f"{home.name}/dsh_sessions"
     else:
         events = codex_converter.find_session_events(home)
         trajectory = codex_converter.convert_events_to_trajectory(events, attempt_id=aid)
         source_hint = f"{home.name}/sessions"
 
     if trajectory is None:
-        return EmitOutcome(
-            status="not_available",
-            attempt_id=aid,
-            reason=(
+        # 「转录不存在」与「转录在、但那一轮以错误收场」必须分开报——把后者
+        # 说成前者，等于把上游/设施故障伪装成采集缺陷。dsh 的转录里有
+        # turn/end.reason，能给出真实原因。
+        if agent == "dsh":
+            detail = dsh_converter.describe_empty(events)
+        elif agent == "kimi-code":
+            detail = kimi_converter.describe_empty(events)
+        else:
+            detail = None
+        if detail:
+            reason = f"{detail} (source: {source_hint})"
+        elif agent == "codex":
+            reason = (
                 f"no usable session transcript under {source_hint}; "
                 f"codex single-turn runs were historically started with "
                 f"--ephemeral and never persisted a session"
-                if agent == "codex"
-                else f"no usable session transcript under {source_hint}"
-            ),
-        )
+            )
+        else:
+            reason = f"no usable session transcript under {source_hint}"
+        return EmitOutcome(status="not_available", attempt_id=aid, reason=reason)
     return EmitOutcome(
         status="ready",
         attempt_id=aid,

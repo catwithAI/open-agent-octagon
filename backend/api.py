@@ -1043,6 +1043,21 @@ def _artifact_attempt_dir(
     return data_path / "attempts" / attempt_id
 
 
+
+def _attempt_agent_name(*, db_path: Path, attempt_id: str) -> str | None:
+    """attempt 记录里的 agent 名。
+
+    ATIF emitter 缺省会按沙盒 home 里的标记目录反推 adapter；但 agent 名在库里
+    是现成的**权威值**，没有理由去猜。随着支持的 agent 变多（标记目录互相接近、
+    同一 sandbox_home 里可能留下不止一种痕迹），推断只会越来越脆。
+    """
+    with _open_sync(db_path) as conn:
+        row = conn.execute(
+            "SELECT agent_name FROM attempts WHERE id=?", (attempt_id,)
+        ).fetchone()
+    return row[0] if row and row[0] else None
+
+
 _TRUSTED_PREVIEW_PAGE_BYTES = 4 * 1024 * 1024
 _TRUSTED_PREVIEW_TOTAL_BYTES = 16 * 1024 * 1024
 _TRUSTED_PREVIEW_MAX_PAGES = 100
@@ -1928,8 +1943,12 @@ def build_router() -> APIRouter:
             data_path=state.data_path, db_path=state.db_path,
             run_id=run_id, attempt_id=attempt_id,
         )
+        agent_name = await asyncio.to_thread(
+            _attempt_agent_name, db_path=state.db_path, attempt_id=attempt_id
+        )
         outcome = await asyncio.to_thread(
-            emit_attempt_atif, attempt_dir, attempt_id=attempt_id
+            emit_attempt_atif, attempt_dir,
+            agent_name=agent_name, attempt_id=attempt_id,
         )
         payload: dict[str, Any] = {"status": outcome.status, "attempt_id": attempt_id}
         if outcome.trajectory is not None:
