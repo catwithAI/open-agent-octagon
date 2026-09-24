@@ -22,6 +22,7 @@ ARG KIMI_VERSION
 ARG OPENCODE_VERSION
 ARG MIMO_VERSION
 ARG DSH_VERSION
+ARG LIBREOFFICE_SERIES
 
 ENV DEBIAN_FRONTEND=noninteractive \
     LANG=C.UTF-8 \
@@ -35,6 +36,23 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         git curl ca-certificates procps \
         build-essential g++ ripgrep unzip xz-utils jq less \
     && rm -rf /var/lib/apt/lists/*
+
+# office 渲染：pptx/docx/xlsx → pdf（soffice）→ png（pdftoppm / pymupdf）。
+# 场景要求 agent 渲染后目检，评分的 office_render 也走同一条链路；缺了它，
+# agent 会自己去下载 LibreOffice，把时限耗光——那测的是网速不是能力。
+# 字体：noto-cjk 覆盖中文幻灯片；liberation / carlito / caladea 是
+# Arial/Times、Calibri、Cambria 的等宽替身，缺了会换行错位、误判为版式缺陷。
+RUN test -n "${LIBREOFFICE_SERIES}" \
+    && apt-get update && apt-get install -y --no-install-recommends \
+        libreoffice-impress-nogui libreoffice-writer-nogui libreoffice-calc-nogui \
+        poppler-utils \
+        fonts-noto-cjk fonts-liberation fonts-dejavu-core \
+        fonts-crosextra-carlito fonts-crosextra-caladea \
+    && rm -rf /var/lib/apt/lists/* \
+    && v="$(soffice --version)" && echo "${v}" \
+    && case "${v}" in "LibreOffice ${LIBREOFFICE_SERIES}."*) ;; \
+         *) echo "LibreOffice 版本 ${v} 不属于 ${LIBREOFFICE_SERIES}" >&2; exit 1 ;; esac \
+    && command -v pdftoppm
 
 # node（npm 安装的 CLI 需要；claude / codex / dsh runtime 是原生二进制）
 RUN curl -fsSL "https://deb.nodesource.com/setup_${NODE_MAJOR}.x" | bash - \
@@ -124,7 +142,8 @@ RUN test -n "${DSH_VERSION}" \
 # 这一串必须与 `SandboxSection.ephemeral_home_dirs` 的默认值保持一致。
 # 名单来自 2026-09-21 对 330 个 attempt / 32.8G sandbox_home 的实测：
 # .npm 5.77G、.tmp 3.95G、.cache 2.43G 是可安全回收的运行期缓存；
-# lo/loroot/sysroot/apt/fonts 合计仅 1.1G（镜像里并没有 LibreOffice），留作兜底。
+# lo/loroot/sysroot/apt/fonts 合计仅 1.1G（是 agent 自装 LibreOffice 的残留；
+# 镜像自带后应基本不再产生），留作兜底。
 # 漏掉任何一项，该目录的匿名卷就会是 root:root 0755，agent 写不进去。
 RUN mkdir -p /home/agent /attempt \
     && mkdir -p /home/agent/.npm /home/agent/.cache /home/agent/.tmp \
@@ -134,7 +153,12 @@ RUN mkdir -p /home/agent /attempt \
                   /home/agent/.tmp /home/agent/lo /home/agent/loroot \
                   /home/agent/sysroot /home/agent/fonts /home/agent/.fonts \
                   /home/agent/apt
+# UserInstallation：LibreOffice 的 bootstrap 变量，环境变量可覆盖。容器以宿主机 uid
+# 运行、/etc/passwd 里没有这个 uid，soffice 推不出默认 profile 目录，直接报
+# "User installation could not be completed" 起不来（设 XDG_CONFIG_HOME 也不行）。
+# 显式指到 .cache（0777 的匿名卷，运行期缓存，不进 attempt 目录）。
 ENV HOME=/home/agent \
+    UserInstallation=file:///home/agent/.cache/libreoffice-profile \
     PATH=/usr/local/bin:/usr/bin:/bin \
     DISABLE_AUTOUPDATER=1 \
     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
@@ -151,7 +175,8 @@ LABEL org.opencontainers.image.title="octagon-agent-runtime" \
       octagon.agent.kimi-code.version="${KIMI_VERSION}" \
       octagon.agent.opencode.version="${OPENCODE_VERSION}" \
       octagon.agent.mimo-code.version="unpinned" \
-      octagon.agent.dsh.version="${DSH_VERSION}"
+      octagon.agent.dsh.version="${DSH_VERSION}" \
+      octagon.tool.libreoffice.series="${LIBREOFFICE_SERIES}"
 
 WORKDIR /home/agent
 CMD ["sleep", "infinity"]
