@@ -31,6 +31,22 @@ else
 fi
 check dsh         "dsh-runtime"                                ls -l /opt/dsh/runtime/dsh-runtime
 
+check libreoffice "LibreOffice $(label octagon.tool.libreoffice.series)." soffice --version
+check pdftoppm    "pdftoppm version"                             pdftoppm -v
+check cjk-font    "Noto Sans CJK"                                 fc-list
+# 真实渲染一页，且用任意非 root uid 跑——评测时容器以宿主机 uid 运行，
+# 该 uid 不在 /etc/passwd 里，没有镜像里的 UserInstallation 时 soffice 会起不来，
+# 只验 --version 发现不了。
+render_out="$(docker run --rm --entrypoint "" --user 54321:54321 "${image}" sh -c '
+  cd /tmp && python3 -c "from pptx import Presentation as P; p=P(); s=p.slides.add_slide(p.slide_layouts[0]); s.shapes.title.text=\"渲染测试\"; p.save(\"t.pptx\")" \
+  && soffice --headless --convert-to pdf t.pptx 2>&1 | tail -3 \
+  && pdftoppm -png -r 50 t.pdf t && ls t-*.png >/dev/null && echo ok' 2>&1 || true)"
+if grep -qx ok <<<"${render_out}"; then
+  echo "ok   pptx→pdf→png render (uid 54321)"
+else
+  echo "FAIL pptx render: ${render_out}" >&2; fail=1
+fi
+
 mods="$(grep -hv '^\s*#' "${here}/requirements-base.txt" "${here}/requirements-envs.txt" \
         | sed -E 's/[<>=!~ ].*//; s/#.*//; /^\s*$/d' | tr '\n' ' ')"
 for m in ${mods}; do
