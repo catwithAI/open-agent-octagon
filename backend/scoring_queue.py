@@ -534,7 +534,9 @@ async def _execute_job(
             # /evaluate。dimensions 从 env meta.yaml 打包（维度 ID=维度名，
             # 与内置 scorer 的输出形状一致），commit/outbox/leader 全链路复用。
             judge_cfg = getattr(getattr(state, "settings", None), "judge", None)
-            use_evals = judge_cfg is not None and judge_cfg.backend == "evals"
+            eval_plan = (getattr(env, "meta", None) or {}).get("eval", {})
+            local_scorer = isinstance(eval_plan, dict) and eval_plan.get("backend") == "local"
+            use_evals = judge_cfg is not None and judge_cfg.backend == "evals" and not local_scorer
             if use_evals:
                 from .evals_scorer import EvalsJudgeError
             if scorer is None and not use_evals:
