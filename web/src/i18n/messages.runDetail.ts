@@ -123,6 +123,11 @@ export const MESSAGES_RUN_DETAIL: Record<string, Message> = {
   "runDetail.dim.task_completion": { zh: "任务完成度", en: "Task completion" },
   "runDetail.dim.constraint_compliance": { zh: "约束遵守", en: "Constraint compliance" },
   "runDetail.dim.efficiency": { zh: "调用效率", en: "Efficiency" },
+  "runDetail.dim.artifact_contract": { zh: "文件契约", en: "Artifact contract" },
+  "runDetail.dim.content_accuracy": { zh: "内容准确性", en: "Content accuracy" },
+  "runDetail.dim.structure": { zh: "结构完整性", en: "Structure" },
+  "runDetail.dim.style_mapping": { zh: "样式匹配度", en: "Style mapping" },
+  "runDetail.dim.technical_quality": { zh: "技术质量", en: "Technical quality" },
 
   // ---- STATUS_LABELS ----
   "runDetail.status.completed": { zh: "已完成", en: "Completed" },

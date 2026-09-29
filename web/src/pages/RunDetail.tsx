@@ -1216,6 +1216,8 @@ const DIMENSION_LABEL_KEYS: Record<string, string> = {
   mission_completion: "runDetail.dim.mission_completion", target_confirmation: "runDetail.dim.target_confirmation",
   data_accuracy: "runDetail.dim.data_accuracy", artifact_completeness: "runDetail.dim.artifact_completeness",
   task_completion: "runDetail.dim.task_completion", constraint_compliance: "runDetail.dim.constraint_compliance", efficiency: "runDetail.dim.efficiency",
+  artifact_contract: "runDetail.dim.artifact_contract", content_accuracy: "runDetail.dim.content_accuracy", structure: "runDetail.dim.structure",
+  style_mapping: "runDetail.dim.style_mapping", technical_quality: "runDetail.dim.technical_quality",
 };
 // 维度标签：命中字典用本地化文案，否则回落原始 dimension 名。
 function dimLabel(t: TFn, dimension: string): string {
