@@ -107,9 +107,16 @@ def _dimension_from_meta(item: dict[str, Any]) -> dict[str, Any]:
 
 def _iter_meta_dimensions(env: Any):
     meta = getattr(env, "meta", {}) or {}
-    for item in meta.get("dimensions") or []:
-        if not isinstance(item, dict) or not item.get("name"):
+    dimensions = meta.get("dimensions")
+    if not dimensions:
+        dimensions = ((meta.get("eval") or {}).get("plan") or {}).get("dimensions") or []
+    for item in dimensions:
+        if not isinstance(item, dict) or not (item.get("name") or item.get("id")):
             continue
+        if "name" not in item and item.get("id"):
+            item = {**item, "name": item["id"]}
+        if "description" not in item and item.get("question"):
+            item = {**item, "description": item["question"]}
         yield item
 
 

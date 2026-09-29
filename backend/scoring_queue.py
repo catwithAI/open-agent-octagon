@@ -537,7 +537,7 @@ async def _execute_job(
             use_evals = judge_cfg is not None and judge_cfg.backend == "evals"
             if use_evals:
                 from .evals_scorer import EvalsJudgeError
-            if scorer is None:
+            if scorer is None and not use_evals:
                 raise ScorerUnavailableError(f"env {attempt['env_name']} missing scorer")
             frozen_input = resolve_attempt_input(
                 data_path=state.data_path,
