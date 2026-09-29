@@ -126,20 +126,19 @@ def env_db_path(data_path: Path, attempt_id: str) -> Path:
 
 
 def _extract_meta(env: Any) -> tuple[int, dict[str, int]]:
-    """返回 (pass_threshold, {dim: weight})。weight 缺失时按 0,后续 normalize。"""
+    """返回 (pass_threshold, {dim: weight})，兼容 v2 与 v3 eval.plan。"""
     meta: dict[str, Any] = getattr(env, "meta", {}) or {}
     pass_threshold = int(meta.get("pass_threshold", 60))
+    dimensions = meta.get("dimensions", []) or []
+    if not dimensions:
+        dimensions = ((meta.get("eval") or {}).get("plan") or {}).get("dimensions", []) or []
     weights: dict[str, int] = {}
-    for dim in meta.get("dimensions", []) or []:
-        if not isinstance(dim, dict):
-            continue
-        name = dim.get("name")
-        if not name:
-            continue
-        try:
-            weights[name] = int(dim.get("weight", 0))
-        except (TypeError, ValueError):
-            weights[name] = 0
+    for dim in dimensions:
+        if not isinstance(dim, dict): continue
+        name = dim.get("name") or dim.get("id")
+        if not name: continue
+        try: weights[name] = int(dim.get("weight", 0))
+        except (TypeError, ValueError): weights[name] = 0
     return pass_threshold, weights
 
 
