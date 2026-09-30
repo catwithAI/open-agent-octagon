@@ -1234,8 +1234,9 @@ const PASS_THRESHOLDS: Record<string, number> = {
 };
 
 // 各 env 的权重/阈值以后端 meta.yaml 为准，避免前端硬编码漂移
-function useEnvMeta(envName: string | undefined): { weights: Record<string, number>; threshold: number | null } {
-  const [meta, setMeta] = useState<{ weights: Record<string, number>; threshold: number | null }>({ weights: {}, threshold: null });
+type RubricDimension = { description?: string; criteria?: string[]; role?: string; method?: string };
+function useEnvMeta(envName: string | undefined): { weights: Record<string, number>; dimensions: Record<string, RubricDimension>; threshold: number | null } {
+  const [meta, setMeta] = useState<{ weights: Record<string, number>; dimensions: Record<string, RubricDimension>; threshold: number | null }>({ weights: {}, dimensions: {}, threshold: null });
   useEffect(() => {
     if (!envName) return;
     let alive = true;
@@ -1244,8 +1245,12 @@ function useEnvMeta(envName: string | undefined): { weights: Record<string, numb
       const env = envs.find((e) => e.name === envName);
       if (!env) return;
       const weights: Record<string, number> = {};
-      for (const d of env.dimensions ?? []) weights[d.name] = d.weight;
-      setMeta({ weights, threshold: env.pass_threshold });
+      const dimensions: Record<string, RubricDimension> = {};
+      for (const d of env.dimensions ?? []) {
+        weights[d.name] = d.weight;
+        dimensions[d.name] = { description: d.description, criteria: d.criteria, role: d.role, method: d.method };
+      }
+      setMeta({ weights, dimensions, threshold: env.pass_threshold });
     }).catch(() => { /* 拿不到时用前端兜底表 */ });
     return () => { alive = false; };
   }, [envName]);
@@ -3116,7 +3121,7 @@ function dimWeight(dimension: string, envWeights?: Record<string, number>): numb
   return envWeights?.[dimension] ?? DIMENSION_WEIGHTS[dimension] ?? 0;
 }
 
-function dimensionExplanation(t: TFn, score: AttemptDetail["scores"][number], envWeights?: Record<string, number>): string {
+function dimensionExplanation(t: TFn, score: AttemptDetail["scores"][number], envWeights?: Record<string, number>, rubric?: RubricDimension): string {
   const weight = dimWeight(score.dimension, envWeights);
   const weighted = Math.round((score.value * weight) / 100);
   const lost = Math.max(0, 100 - score.value);
@@ -3125,7 +3130,8 @@ function dimensionExplanation(t: TFn, score: AttemptDetail["scores"][number], en
   const contrib = weightedLost > 0
     ? t("runDetail.dimExpl.contribDeducted", { weighted, weight, weightedLost })
     : t("runDetail.dimExpl.contribFull", { weight });
-  return t("runDetail.dimExpl.full", { value: score.value, weight, contrib, reason });
+  const rubricText = rubric?.description ? t("runDetail.dimExpl.rubric", { description: rubric.description, criteria: rubric.criteria?.length ? ` 检查项：${rubric.criteria.join("、")}` : "" }) : "";
+  return [rubricText, t("runDetail.dimExpl.full", { value: score.value, weight, contrib, reason })].filter(Boolean).join(" ");
 }
 
 function primaryScoreIssue(t: TFn, scores: AttemptDetail["scores"], envWeights?: Record<string, number>): string {
@@ -3447,7 +3453,7 @@ export function RunDetail() {
                           background: scoreColor(s.value),
                         }} />
                       </div>
-                      <div className="score-dim-detail">{dimensionExplanation(t, s, envMeta.weights)}</div>
+                      <div className="score-dim-detail">{dimensionExplanation(t, s, envMeta.weights, envMeta.dimensions[s.dimension])}</div>
                     </div>
                   ))}
                   {scores.length === 0 && (
@@ -3701,7 +3707,7 @@ export function RunDetail() {
                       }} />
                     </div>
                     <span className="score-dim-val" style={{ color: scoreColor(s.value) }}>{s.value}/100</span>
-                    <span className="score-dim-detail">{dimensionExplanation(t, s, envMeta.weights)}</span>
+                    <span className="score-dim-detail">{dimensionExplanation(t, s, envMeta.weights, envMeta.dimensions[s.dimension])}</span>
                   </div>
                 ))}
               </div>

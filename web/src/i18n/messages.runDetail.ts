@@ -481,6 +481,7 @@ export const MESSAGES_RUN_DETAIL: Record<string, Message> = {
   "runDetail.dimExpl.contribDeducted": { zh: "计入总分 {weighted} 分（满 {weight}），被扣 {weightedLost} 分", en: "contributes {weighted} to the total (of {weight}), {weightedLost} deducted" },
   "runDetail.dimExpl.contribFull": { zh: "计入总分 {weight} 分（满 {weight}），无扣分", en: "contributes {weight} to the total (of {weight}), no deduction" },
   "runDetail.dimExpl.full": { zh: "本维度得分 {value}/100，占总分权重 {weight}%，{contrib}。{reason}", en: "This dimension scores {value}/100 at {weight}% weight, {contrib}. {reason}" },
+  "runDetail.dimExpl.rubric": { zh: "评分标准：{description}{criteria}", en: "Rubric: {description}{criteria}" },
 
   // ---- primaryScoreIssue ----
   "runDetail.primaryIssue.none": { zh: "暂无维度评分，无法判断主要扣分项。", en: "No dimension scores yet; can't identify the main deduction." },
