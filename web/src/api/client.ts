@@ -21,6 +21,9 @@ export type EnvDimension = {
   name: string;
   weight: number;
   description: string;
+  criteria?: string[];
+  role?: string;
+  method?: string;
 };
 export type EnvSummary = {
   name: string;

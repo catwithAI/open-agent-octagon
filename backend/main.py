@@ -6,7 +6,7 @@ import asyncio
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import AsyncIterator
+from typing import Any, AsyncIterator
 
 from fastapi import FastAPI, HTTPException, Response
 from fastapi.responses import PlainTextResponse
@@ -420,6 +420,26 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @api.get("/envs")
     async def list_envs() -> list[dict[str, object]]:
+        def rubric_dimensions(env: Any) -> list[dict[str, object]]:
+            raw = env.meta.get("dimensions", []) or [
+                {"name": d.get("id"), "weight": d.get("weight", 0), "description": d.get("question", ""), **d}
+                for d in (((env.meta.get("eval") or {}).get("plan") or {}).get("dimensions", []) or [])
+                if isinstance(d, dict) and d.get("id")
+            ]
+            result = []
+            for item in raw:
+                if not isinstance(item, dict) or not (item.get("name") or item.get("id")):
+                    continue
+                result.append({
+                    "name": item.get("name") or item.get("id"),
+                    "weight": item.get("weight", 0),
+                    "description": item.get("description") or item.get("question", ""),
+                    "criteria": item.get("criteria", []) or [],
+                    "role": item.get("role", "scored"),
+                    "method": item.get("method", ""),
+                })
+            return result
+
         return [
             {
                 "name": env.name,
@@ -428,11 +448,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "category": env.meta.get("category", ""),
                 "test_focus": env.meta.get("test_focus", ""),
                 "pass_threshold": env.meta.get("pass_threshold"),
-                "dimensions": env.meta.get("dimensions", []) or [
-                    {"name": d.get("id"), "weight": d.get("weight", 0), "description": d.get("question", "")}
-                    for d in (((env.meta.get("eval") or {}).get("plan") or {}).get("dimensions", []) or [])
-                    if isinstance(d, dict) and d.get("id")
-                ],
+                "dimensions": rubric_dimensions(env),
                 "tool_count": len(env.tools),
                 "task_count": len(env.tasks),
                 # 多轮 conversation 场景：任一 task 带 _conversation 数组即多轮
