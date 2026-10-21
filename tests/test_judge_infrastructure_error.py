@@ -39,6 +39,40 @@ def test_detects_the_other_env_wordings() -> None:
         ]) is not None, detail
 
 
+def test_detects_judge_that_returned_an_invalid_verdict() -> None:
+    """judge 起来了但没给出合法裁决，同样是设施故障。
+
+    2026-09-21 实测：`Blade judge response parse/validation failed:
+    missing rubric item: <uuid>` —— judge 自己没产出有效结果，却被记成
+    agent 得 0 分（3 个 attempt，failure_kind 全是 NULL）。
+    「judge 崩了」与「agent 做得差」必须分开。
+    """
+    for detail in (
+        "Blade judge response parse/validation failed: missing rubric item: 52dc40eb-af9f",
+        "judge response parse error",
+        "missing rubric item: abc123",
+    ):
+        assert judge_infrastructure_error([
+            {"dimension": "official_rubric_judge", "value": 0, "detail": detail}
+        ]) is not None, detail
+
+
+def test_detects_judge_http_failures() -> None:
+    """judge 的 HTTP 调用失败（上游 5xx / 网关抖动）同样不是 agent 的锅。
+
+    2026-09-21 实测：`Blade judge failed: Server error '502 Bad Gateway'`
+    —— 网关抖一下，codex 就背一个 0 分。
+    """
+    for detail in (
+        "Blade judge failed: Server error '502 Bad Gateway' for url 'https://agent...'",
+        "Blade judge failed: Service Unavailable",
+        "judge failed: connection error",
+    ):
+        assert judge_infrastructure_error([
+            {"dimension": "official_rubric_judge", "value": 0, "detail": detail}
+        ]) is not None, detail
+
+
 def test_real_zero_is_not_an_infrastructure_error() -> None:
     """agent 真的没交付就是真的 0 分，不能被这条逻辑洗白。
 
