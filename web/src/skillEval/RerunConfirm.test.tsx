@@ -1,0 +1,6 @@
+import {it,expect,vi} from "vitest";
+import {fireEvent,screen,waitFor} from "@testing-library/react";
+import {RerunConfirm} from "./RerunConfirm";
+import {apiMock,jsonResponse,view} from "./test-utils";
+
+it("requires a manual mode and confirmation, and permits empty replacement inputs",async()=>{const plan={id:"p1",source_run_id:"r1",mode:"replace",state:"pending",hash:"hash",content:{source:{messages:[]}},inputs:[]};const fetch=apiMock(path=>path.endsWith("/confirm")?jsonResponse({...plan,state:"confirmed"}):jsonResponse(plan));const confirmed=vi.fn().mockResolvedValue(undefined);view(<RerunConfirm sourceRunId="r1" onConfirm={confirmed} onCancel={()=>{}}/>);expect((screen.getByText("读取并检查输入") as HTMLButtonElement).disabled).toBe(true);expect(confirmed).not.toHaveBeenCalled();fireEvent.click(screen.getByLabelText("重新提供（可以留空）"));fireEvent.click(screen.getByText("读取并检查输入"));await screen.findByText("新提示（可选）");expect(confirmed).not.toHaveBeenCalled();fireEvent.click(screen.getByText("确认输入并重跑"));await waitFor(()=>expect(confirmed).toHaveBeenCalledTimes(1));const body=JSON.parse(String(fetch.mock.calls.find(([path])=>String(path).endsWith("/confirm"))![1]?.body));expect(body).toMatchObject({prompt:"",input_ids:[],expected_hash:"hash"});});

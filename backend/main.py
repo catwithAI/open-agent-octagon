@@ -72,6 +72,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     `uv run uvicorn backend.main:create_app --factory --port 8100`
     """
     cfg = settings or load_settings()
+    from .skill_eval.api import register_routes as register_skill_eval_routes
+    from .skill_eval.run_api import register_routes as register_skill_run_routes
+    from .skill_eval.catalog import SkillCatalog
+    from .skill_eval.capabilities import Capabilities
+    from .skill_eval.packages import Limits
+    from .skill_eval.runs import RunService
+
+    skill_limits = Limits(**cfg.skill_eval.limits.model_dump())
+    skill_service = RunService(resolve_db_path(cfg.octagon.data_path), cfg.octagon.data_path,
+        limits=skill_limits, input_max_bytes=cfg.skill_eval.input_max_bytes, text_edit_max_bytes=cfg.skill_eval.text_edit_max_bytes, settings=cfg)
+    skill_capabilities = Capabilities(cfg,service=skill_service)
+
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -359,9 +371,39 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         from .wire.proxy_api import close_proxy_client, open_proxy_client
 
         await open_proxy_client(app)
+        skill_worker_task = None
+        skill_runtime = None
+        skill_service.execution_available = False
+        if cfg.skill_eval.enabled and not display_only:
+            from .skill_eval.runtime import BladeSkillRuntime
+            from .skill_eval.worker import Worker
+            from .skill_eval.recovery import Recovery
+            skill_runtime = BladeSkillRuntime(cfg,skill_service.store)
+            try:
+                await skill_runtime.open()
+                await Recovery(skill_service,skill_runtime).reconcile()
+                worker = Worker(skill_service,skill_runtime)
+                skill_worker_task = asyncio.create_task(worker.run_forever(),name='skill-eval-worker')
+                skill_service.execution_available = True
+                def skill_worker_stopped(task):
+                    skill_service.execution_available = False
+                    if not task.cancelled() and task.exception():
+                        logger.error('Skill Eval worker stopped; execution is unavailable')
+                skill_worker_task.add_done_callback(skill_worker_stopped)
+            except Exception:
+                if skill_runtime:
+                    await skill_runtime.close()
+                logger.error('Skill Eval worker unavailable; execution remains unavailable')
+                skill_runtime = None
+        app.state.skill_eval_worker_task = skill_worker_task
         try:
             yield
         finally:
+            if skill_worker_task:
+                skill_worker_task.cancel()
+                await asyncio.gather(skill_worker_task,return_exceptions=True)
+            if skill_runtime:
+                await skill_runtime.close()
             # Agent 执行生命周期与 API 服务生命周期隔离。必须在 cancel 之前
             # 置位——adapter 的 finally 据此区分「关停」与「Stop / 超时」，
             # 前者刻意保留 CLI 进程组，让 Agent 跨重启继续跑。
@@ -586,6 +628,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     register_frontend_routes(app, prefix="/api")
     register_research_routes(app)
     register_selfcheck_routes(app)
+    register_skill_eval_routes(app,skill_service,SkillCatalog(cfg.skill_eval.catalog_roots,skill_limits),skill_capabilities)
+    register_skill_run_routes(app,skill_service,skill_capabilities)
+
     # 纯展示部署的只读边界。**最后安装**：FastAPI 的 http 中间件按
     # 后进先出执行，装在最后才能保证它先于业务路由拦下执行型写请求。
     from .display_only import install as install_display_only

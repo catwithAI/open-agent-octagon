@@ -6,7 +6,7 @@ export default defineConfig({
   plugins: [react()],
   server: {
     proxy: {
-      "/api": "http://127.0.0.1:8100",
+      "/api": process.env.OCTAGON_BACKEND_URL || "http://127.0.0.1:8100",
     },
   },
   test: {

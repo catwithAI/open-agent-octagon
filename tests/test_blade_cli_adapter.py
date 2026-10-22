@@ -7,7 +7,7 @@ mock 掉 subprocess 就等于把这份契约也 mock 掉了——所以这里写
 
 桩脚本的输出形状取自真实 blade-cli（commit fede14736）对着 stub server 的实测：
   chat run --json      → {"session_id","status","messages":[{"id","content","tool_calls"}]}
-  session history      → {"session_id","intent","nodes":[{"id","kind","role","timestamp",...}]}
+beta.41 的历史改由真实 SDK 读取，HTTP 边界使用 respx 代理，不再伪造已删除命令。
 """
 
 from __future__ import annotations
@@ -19,6 +19,8 @@ import zipfile
 from pathlib import Path
 
 import pytest
+import httpx
+import respx
 
 from backend.adapters.base import AdapterRunInput
 from backend.adapters.blade_cli import BladeCliAdapter
@@ -37,6 +39,10 @@ if log:
 
 group = argv[0] if argv else ""
 verb = argv[1] if len(argv) > 1 else ""
+
+if group == "version":
+    print("blade 2612.0.0-beta.41 (commit 8690d27)")
+    sys.exit(0)
 
 if group == "chat" and verb in ("run", "send"):
     code = int(os.environ.get("BLADE_STUB_EXIT", "0"))
@@ -69,17 +75,6 @@ if group == "chat" and verb in ("run", "send"):
     }))
     sys.exit(0)
 
-if group == "session" and verb == "history":
-    print(json.dumps({"session_id": "sess-1", "intent": "do it", "nodes": [
-        {"id": "n1", "kind": "user", "role": "user",
-         "timestamp": "2026-09-22T10:00:00Z", "content": "do it", "tool_calls": []},
-        {"id": "n2", "kind": "ai", "role": "assistant",
-         "timestamp": "2026-09-22T10:00:05Z", "content": "done", "tool_calls": [
-             {"id": "t1", "function": {"name": "write_file", "arguments": "{}"}},
-             {"id": "t2", "function": {"name": "read_file", "arguments": "{}"}}]},
-    ]}))
-    sys.exit(0)
-
 if group == "session" and verb == "copy-dir":
     out = argv[argv.index("--out") + 1]
     with zipfile.ZipFile(out, "w") as z:
@@ -100,6 +95,23 @@ def stub_cli(tmp_path: Path) -> Path:
     path.write_text(_STUB, encoding="utf-8")
     path.chmod(path.stat().st_mode | stat.S_IEXEC | stat.S_IRUSR)
     return path
+
+
+@pytest.fixture(autouse=True)
+def sdk_history():
+    nodes = [
+        {"id": "n1", "kind": "message", "role": "user", "loop_name": "root",
+         "timestamp": "2026-09-22T10:00:00Z", "content": "do it"},
+        {"id": "n2", "kind": "message", "role": "assistant", "loop_name": "root",
+         "timestamp": "2026-09-22T10:00:05Z", "content": "done", "tool_calls": [
+             {"id": "t1", "function": {"name": "write_file", "arguments": "{}"}},
+             {"id": "t2", "function": {"name": "read_file", "arguments": "{}"}},
+         ]},
+    ]
+    with respx.mock as router:
+        route = router.get("http://blade.test:8020/api/sessions/sess-1/history")
+        route.mock(return_value=httpx.Response(200, json={"nodes": nodes}))
+        yield route
 
 
 @pytest.fixture()
@@ -163,7 +175,7 @@ def test_completed_run_collects_trace_and_artifacts(
     assert result.external_refs["blade_session_id"] == "sess-1"
     assert result.external_refs["blade_transport"] == "cli"
 
-    # events.jsonl 从 session history 事后重建：两个节点、两次工具调用。
+    # 真实 SDK 通过 HTTP 历史事后重建：两个节点、两次工具调用。
     attempt_dir = data / "attempts" / "att-1"
     events = [
         json.loads(x)
@@ -175,6 +187,11 @@ def test_completed_run_collects_trace_and_artifacts(
     assert result.last_event_at == "2026-09-22T10:00:05Z"
     # 下游必须能看出这不是实时事件流。
     assert all(e["source"] == "blade_cli_history" for e in events)
+    assert events[1]["raw"]["id"] == "n2"
+    assert events[1]["raw"]["tool_calls"][0]["id"] == "t1"
+    assert result.external_refs["cli_version"] == "blade 2612.0.0-beta.41 (commit 8690d27)"
+    assert result.external_refs["history_sync"]["status"] == "ready"
+    assert not any(c[:2] == ["session", "history"] for c in _argv_lines(argv_log))
 
     # 产物解包到 skill_workspace，运行时内部目录被跳过。
     workspace = attempt_dir / "skill_workspace"
@@ -195,6 +212,50 @@ def test_token_usage_is_empty_by_design(tmp_path: Path, stub_cli: Path, argv_log
     assert result.transport_status == "reconstructed"
 
 
+def test_history_failure_is_reported_without_discarding_artifacts(
+    tmp_path: Path, stub_cli: Path, argv_log: Path, sdk_history,
+) -> None:
+    sdk_history.mock(return_value=httpx.Response(503))
+    result = _run(_adapter(stub_cli), _task(tmp_path), _env(), tmp_path / "data")
+    assert result.status == "completed"
+    assert result.transport_status == "disconnected"
+    assert result.external_refs["history_sync"] == {
+        "status": "failed", "source": "sdk", "error": "HTTPStatusError",
+    }
+    assert result.external_refs["artifact_sync"] == {"files": 2}
+
+
+def test_sdk_history_preserves_parallel_tool_result_ids(
+    tmp_path: Path, stub_cli: Path, argv_log: Path, sdk_history,
+) -> None:
+    from backend.wire.normalizers.blade import BladeNormalizer
+
+    sdk_history.mock(return_value=httpx.Response(200, json={"nodes": [
+        {"id": "assistant-1", "kind": "message", "role": "assistant",
+         "loop_name": "root", "timestamp": "2026-10-21T10:00:00Z",
+         "content": "Read both files", "tool_calls": [
+             {"id": "call-a", "function": {"name": "read_file", "arguments": "{}"}},
+             {"id": "call-b", "function": {"name": "read_file", "arguments": "{}"}},
+         ]},
+        {"id": "tool-b", "kind": "message", "role": "tool", "loop_name": "root",
+         "timestamp": "2026-10-21T10:00:01Z", "tool_call_id": "call-b", "content": "B"},
+        {"id": "tool-a", "kind": "message", "role": "tool", "loop_name": "root",
+         "timestamp": "2026-10-21T10:00:02Z", "tool_call_id": "call-a", "content": "A"},
+        {"id": "assistant-2", "kind": "message", "role": "assistant",
+         "loop_name": "root", "timestamp": "2026-10-21T10:00:03Z", "content": "Compare A and B"},
+    ]}))
+    data = tmp_path / "data"
+    result = _run(_adapter(stub_cli), _task(tmp_path), _env(), data)
+    assert result.status == "completed"
+    attempt_dir = data / "attempts" / "att-1"
+    normalized = BladeNormalizer().normalize(attempt_id="att-1", attempt_dir=attempt_dir)
+    assert normalized.parse_errors == 0
+    steps = normalized.trajectory["steps"]
+    returns = [s for s in steps if s["kind"] == "tool_result"]
+    assert [s["tool_call_id"] for s in returns] == ["call-b", "call-a"]
+    assert len([s for s in steps if s["kind"] == "assistant"]) == 2
+
+
 def test_chat_run_argv_carries_solution_model_and_uploads(
     tmp_path: Path, stub_cli: Path, argv_log: Path
 ) -> None:
@@ -207,7 +268,7 @@ def test_chat_run_argv_carries_solution_model_and_uploads(
     result = _run(_adapter(stub_cli, model="ba-pro"), task, _env(), data)
     assert result.status == "completed"
 
-    run_argv = _argv_lines(argv_log)[0]
+    run_argv = next(c for c in _argv_lines(argv_log) if c[:2] == ["chat", "run"])
     assert run_argv[:2] == ["chat", "run"]
     # prompt 渲染与 blade_service 共用：任务消息 + 时间预算 + 上下文都在首轮注入。
     assert "写一份报告" in run_argv[2]
@@ -234,7 +295,7 @@ def test_attempt_json_carries_env_token_and_sandbox_base_url(
     adapter = _adapter(stub_cli, sandbox_env_base_url="http://host.docker.internal:9000")
     _run(adapter, _task(tmp_path), _env(), tmp_path / "data")
 
-    run_argv = _argv_lines(argv_log)[0]
+    run_argv = next(c for c in _argv_lines(argv_log) if c[:2] == ["chat", "run"])
     spec = next(
         run_argv[i + 1]
         for i, a in enumerate(run_argv)
@@ -368,7 +429,8 @@ def test_waiting_for_input_toggle_off_keeps_completed(
     assert len(chat_calls) == 1
 
 
-def test_cli_not_found_is_terminal_not_crash(tmp_path: Path) -> None:
+def test_cli_not_found_is_terminal_not_crash(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr("backend.adapters.blade_cli.shutil.which", lambda _: None)
     adapter = BladeCliAdapter(
         BladeAdapterConfig(base_url="http://blade.test", skills_path=Path("/tmp/s")),
         cli_path=str(tmp_path / "does-not-exist"),

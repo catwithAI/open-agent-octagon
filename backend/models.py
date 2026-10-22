@@ -145,7 +145,7 @@ TERMINAL_ATTEMPT_STATUSES: frozenset[str] = (
     frozenset(get_args(AttemptStatus)) - NON_TERMINAL_ATTEMPT_STATUSES
 )
 
-TransportStatus = Literal["unknown", "connected", "disconnected", "not_applicable"]
+TransportStatus = Literal["unknown", "connected", "disconnected", "not_applicable", "reconstructed"]
 
 
 class AttemptModel(BaseModel):

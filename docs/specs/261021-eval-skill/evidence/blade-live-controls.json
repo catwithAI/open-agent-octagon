@@ -1,0 +1,36 @@
+{
+  "timestamp": "2026-10-22T08:12:07.612645+00:00",
+  "sdk_version": "2612.0.0-beta.41",
+  "model": "provider-fd5995eebe::deepseek-v4-1-flash-261017",
+  "stages": [
+    {
+      "name": "targeted_stop_verified",
+      "run_id": "143b82a78c9743be95734dca099106bb",
+      "generation_status": "stopped"
+    },
+    {
+      "name": "finish_during_generation_collected",
+      "run_id": "143b82a78c9743be95734dca099106bb",
+      "status": "completed",
+      "generation": "stopped",
+      "error_code": null
+    }
+  ],
+  "runs": [
+    "143b82a78c9743be95734dca099106bb"
+  ],
+  "errors": [],
+  "cleanup": [
+    {
+      "session_id": "2026-1022-0812-8q79zx2s",
+      "status": "deleted_owned_session"
+    }
+  ],
+  "server_version": "2612.0.0-beta.44",
+  "checks": {
+    "targeted_stop": "verified",
+    "continue_after_stop": "verified",
+    "finish_during_generation": "verified",
+    "late_input_rejected": "verified"
+  }
+}

@@ -617,7 +617,7 @@ type OfficeSyncState = {
   setSheet: (sheet: number) => void;
 };
 
-function PresentationViewer({ presentation, officeSync }: { presentation: PresentationPreview; officeSync?: OfficeSyncState }) {
+export function PresentationViewer({ presentation, officeSync }: { presentation: PresentationPreview; officeSync?: OfficeSyncState }) {
   const { t } = useI18n();
   const [slideIndex, setSlideIndex] = useState(0);
   const [zoom, setZoom] = useState(100);
@@ -690,7 +690,7 @@ function PresentationViewer({ presentation, officeSync }: { presentation: Presen
   </div>;
 }
 
-function DocumentViewer({ document }: { document: DocumentPreview }) {
+export function DocumentViewer({ document }: { document: DocumentPreview }) {
   const { t } = useI18n();
   const [query, setQuery] = useState("");
   const [zoom, setZoom] = useState(100);
@@ -737,7 +737,7 @@ function DocumentViewer({ document }: { document: DocumentPreview }) {
   </div>;
 }
 
-function WorkbookViewer({ workbook, officeSync }: { workbook: WorkbookPreview; officeSync?: OfficeSyncState }) {
+export function WorkbookViewer({ workbook, officeSync }: { workbook: WorkbookPreview; officeSync?: OfficeSyncState }) {
   const { t } = useI18n();
   const [sheetIndex, setSheetIndex] = useState(0);
   const [query, setQuery] = useState("");
@@ -851,7 +851,7 @@ function WorkbookViewer({ workbook, officeSync }: { workbook: WorkbookPreview; o
 //
 // 默认显示源码、点按钮才运行：与本页"默认显示原始数据"的取向一致，不让
 // 打开产物这个动作本身就触发执行。
-function HtmlArtifactView({ html }: { html: string }) {
+export function HtmlArtifactView({ html }: { html: string }) {
   const { t } = useI18n();
   const [running, setRunning] = useState(false);
   return (

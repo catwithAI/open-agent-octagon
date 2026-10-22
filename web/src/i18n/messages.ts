@@ -13,6 +13,8 @@ import { MESSAGES_G4 } from "./messages.g4";
 import { MESSAGES_G5 } from "./messages.g5";
 
 export const MESSAGES: Record<string, Message> = {
+  "skillEval.workspace": { zh: "Skill 评测", en: "Skill Eval" },
+  "skillEval.records": { zh: "Skill 评测记录", en: "Skill Eval Record" },
   ...MESSAGES_RUN_DETAIL,
   ...MESSAGES_G2,
   ...MESSAGES_G3,

@@ -29,6 +29,7 @@ import hashlib
 import inspect
 import json
 import logging
+from importlib.metadata import PackageNotFoundError, version
 import shutil
 import tempfile
 import time
@@ -776,7 +777,12 @@ class BladeServiceAdapter:
                     "blade_session_id": blade_session_id,
                     "blade_base_url": self.config.base_url,
                     "blade_entry": blade_entry,
+                    "blade_transport": "sdk",
                 }
+                try:
+                    external_refs["blade_sdk_version"] = version("blade-agent-kit")
+                except PackageNotFoundError:
+                    pass
                 if (
                     wi.enabled
                     and wi.blade_session_metadata

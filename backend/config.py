@@ -126,8 +126,8 @@ class BladeSection(BaseModel):
     # 调用 BA 的通道："cli" 走 blade-cli 子进程（默认），"sdk" 走
     # blade_agent_kit + Socket.IO 的老 adapter。
     # 差异见 backend/adapters/blade_cli.py 模块 docstring：CLI 通道不采集
-    # token usage，也没有实时事件流（events.jsonl 是事后从 session history
-    # 重建的）。需要 token 口径或断点恢复时切回 "sdk"。
+    # token usage，也没有实时事件流（events.jsonl 由 SDK 历史接口事后
+    # 重建）。两条通道均需安装 blade extra；实时采集或恢复使用 "sdk"。
     transport: Literal["cli", "sdk"] = "cli"
     # blade 可执行文件路径；不填则在 PATH 里找 `blade`。
     cli_path: str | None = None
@@ -412,7 +412,38 @@ class CostSection(BaseModel):
         }.get(scope, self.run_key_limit_usd)
 
 
+class SkillEvalLimits(BaseModel):
+    max_upload: int = Field(default=20 * 1024 * 1024, gt=0)
+    max_total: int = Field(default=100 * 1024 * 1024, gt=0)
+    max_file: int = Field(default=20 * 1024 * 1024, gt=0)
+    max_files: int = Field(default=1000, gt=0)
+    max_ratio: int = Field(default=200, gt=0)
+
+
+class SkillEvalSection(BaseModel):
+    # Asset editing stays available; this switch only gates agent execution.
+    enabled: bool = False
+    catalog_roots: list[Path] = Field(default_factory=list)
+    limits: SkillEvalLimits = Field(default_factory=SkillEvalLimits)
+    input_max_bytes: int = Field(default=100 * 1024 * 1024, gt=0)
+    artifact_max_file_bytes: int = Field(default=50 * 1024 * 1024, gt=0)
+    artifact_max_total_bytes: int = Field(default=200 * 1024 * 1024, gt=0)
+    artifact_max_files: int = Field(default=1000, gt=0)
+    event_max_bytes: int = Field(default=1024 * 1024, gt=0)
+    context_max_bytes: int = Field(default=1024 * 1024, gt=0)
+    note_max_chars: int = Field(default=10000, gt=0)
+    text_edit_max_bytes: int = Field(default=1024 * 1024, gt=0)
+    json_max_bytes: int = Field(default=150 * 1024 * 1024, gt=0)
+
+    generation_timeout_seconds: int = Field(default=600, gt=0)
+    max_active_runs: int = Field(default=2, gt=0)
+    idle_session_retention_seconds: int | None = Field(default=None, gt=0)
+    lease_seconds: int = Field(default=60, gt=0)
+    recovery_poll_seconds: int = Field(default=5, gt=0)
+
+
 class Settings(BaseModel):
+    skill_eval: SkillEvalSection = Field(default_factory=SkillEvalSection)
     octagon: OctagonSection = Field(default_factory=OctagonSection)
     blade: BladeSection = Field(default_factory=BladeSection)
     same_model: SameModelSection = Field(default_factory=SameModelSection)

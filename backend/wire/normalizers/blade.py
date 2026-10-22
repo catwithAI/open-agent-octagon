@@ -10,6 +10,8 @@
      entry 本身 ``{id, kind, loop_name, message, parent_id, timestamp}``，
      **没有 payload 包装层**，``message.tool_call_id`` 在 assistant/tool 两侧
      都精确存在——不需要 FIFO。
+   - ``"blade_cli_history"``：CLI 执行后由 SDK 获取的原始历史节点，保留
+     消息 ID 与 tool_call_id，读取时投影为 entry，不冒充实时 socket。
 2. ``blade_history.json``（降级来源，仅 events.jsonl 缺失时）——``get_history()``
    投影 node，tool 节点**不带** tool_call_id，唯一允许 FIFO 猜配的场景，
    产出的 step 标 ``attributes.tool_call_id_source="fifo_inferred"``。
@@ -121,7 +123,7 @@ from backend.wire.trajectory_schema import (
 )
 
 PRODUCER_NAME = "blade-agent"
-PARSER_VERSION = "blade-normalizer-v1"
+PARSER_VERSION = "blade-normalizer-v2"
 SOURCE_KIND = "native-event"
 SOURCE_INSTANCE = "native-event"
 RAW_FILE = "events.jsonl"
@@ -140,6 +142,20 @@ class _RowParseError(ValueError):
     只有这个异常会被逐行兜住计 parse error；TrajectoryStep 构造失败等
     programmer error 不捕获，向上传播（两类失败区分）。
     """
+
+
+def _cli_history_entry(row: dict[str, Any]) -> dict[str, Any]:
+    node = row.get("raw")
+    node = node if isinstance(node, dict) else row
+    message = node.get("message")
+    if not isinstance(message, dict):
+        message = {
+            "role": node.get("role"),
+            "content": node.get("content"),
+            "tool_calls": node.get("tool_calls") or [],
+            "tool_call_id": node.get("tool_call_id"),
+        }
+    return {**row, "raw": {**node, "message": message}}
 
 
 def _iter_rows(path: Path) -> Iterator[tuple[int, dict[str, Any] | None]]:
@@ -269,6 +285,8 @@ class BladeNormalizer:
             ts = row.get("timestamp")
             if isinstance(ts, str) and ts:
                 result.last_ts = ts
+            if row.get("source") == "blade_cli_history":
+                row = _cli_history_entry(row)
             rows.append((lineno, row))
 
         # 第一遍：拓扑（agent:start + tool_call 候选索引）。索引同时吃 socket
@@ -290,7 +308,7 @@ class BladeNormalizer:
                             topo.add_call(tc.get("id"), loop)
                 elif etype == "llm:tool_call:created":
                     topo.add_call(payload.get("id") or payload.get("tool_call_id"), loop)
-            elif source == "messages_poll":
+            elif source in {"messages_poll", "blade_cli_history"}:
                 message = raw.get("message") if isinstance(raw.get("message"), dict) else {}
                 if message.get("role") == "assistant":
                     for tc in message.get("tool_calls") or []:
@@ -306,7 +324,7 @@ class BladeNormalizer:
             try:
                 if source == "socket":
                     self._apply_socket_row(row, lineno, attempt_id, st, topo)
-                elif source == "messages_poll":
+                elif source in {"messages_poll", "blade_cli_history"}:
                     self._apply_polling_row(row, lineno, attempt_id, st, topo)
                 else:
                     raise _RowParseError(f"未知 source: {source!r}")

@@ -33,7 +33,7 @@ jobs:
 
       # dev extra 带 pytest / pytest-asyncio 等；--locked 保证与 uv.lock 一致。
       - name: Sync dependencies
-        run: uv sync --locked --extra dev
+        run: uv sync --locked --extra dev --extra blade
 
       # 编译检查：整个后端 + octagon 包能被 import/编译，语法与顶层 import 不炸。
       - name: Compile check
@@ -77,6 +77,9 @@ jobs:
       - name: Type check
         run: npx tsc -b
 
-      # 注意：vitest 单测暂不进门禁。当前 85/147 个组件测试因 i18n 引入后
-      # 未同步包 <I18nProvider> 而失败，且 vitest run 失败时退出码为 0。
-      # 修好 render helper 与退出码后再单独 PR 把 `npm test` 加回这里。
+      # 既有组件测试的 i18n 基线单列追踪；新模块失败必须阻断合入。
+      - name: Skill Eval component tests
+        run: npm test -- src/skillEval
+
+      - name: Production build
+        run: npm run build

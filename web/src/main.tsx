@@ -18,6 +18,7 @@ import { Profiles } from "./pages/Profiles";
 import { SystemCapabilities } from "./pages/SystemCapabilities";
 import { ResearchOverview } from "./pages/ResearchOverview";
 import { ScenarioDetail } from "./pages/ScenarioDetail";
+import { skillEvalRoutes } from "./skillEval/routes";
 import { AppShell } from "./components/AppShell";
 import { I18nProvider } from "./i18n";
 import "./styles.css";
@@ -28,6 +29,7 @@ function App() {
     <BrowserRouter>
       <AppShell>
         <Routes>
+          {skillEvalRoutes}
           <Route path="/overview" element={<ResearchOverview />} />
           <Route path="/" element={<Submit />} />
           <Route path="/same-model" element={<SameModelSubmit />} />

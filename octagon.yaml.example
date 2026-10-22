@@ -60,8 +60,17 @@ octagon:
 
 blade:
   # 已运行的 blade-agent server 地址。
+  # 本次 beta.41 验证环境：https://agent.preview.bladeai.com.cn/
   # env: BLADE_BASE_URL
   base_url: "http://localhost:8020"
+
+  # CLI 与 SDK 基线均为 2612.0.0-beta.41。
+  # uv sync --locked --extra blade
+  # ./scripts/install-blade-cli.sh  # 原生 CLI 安装到 .venv/bin/blade
+  # CLI 执行与产物下载，SDK 回收历史；实时采集可切换到 sdk。
+  # env: BLADE_TRANSPORT / BLADE_CLI_PATH
+  transport: "cli"
+  # cli_path: "/absolute/path/to/.venv/bin/blade"
 
   # blade-agent web 界面创建长期 API Key(`sk-blade-v2-*`)。
   # Octagon 用 blade_agent_kit.BladeAgentClient 调 REST + Socket.IO。
@@ -345,3 +354,30 @@ judge:
   attribution_score_threshold: 60   # 只归因低于此分（0-100）的维度
   attribution_max_dimensions: 3     # 单个 attempt 最多归因几维（按分数升序）
   attribution_timeout: 600
+
+# Skill Eval: package APIs are independent of scenario scoring.
+# Catalog paths are configured by the server operator and are read-only sources.
+# These limits are local defaults; the remote service may impose smaller limits.
+skill_eval:
+  enabled: false  # 按部署配置启用；本次验收没有修改生产开关。
+  catalog_roots: []  # e.g. ["/srv/octagon/skill-catalog"]
+  limits:
+    max_upload: 20971520
+    max_total: 104857600
+    max_file: 20971520
+    max_files: 1000
+    max_ratio: 200
+  input_max_bytes: 104857600
+  artifact_max_file_bytes: 52428800
+  artifact_max_total_bytes: 209715200
+  artifact_max_files: 1000
+  event_max_bytes: 1048576
+  context_max_bytes: 1048576
+  note_max_chars: 10000
+  text_edit_max_bytes: 1048576
+  json_max_bytes: 157286400
+  generation_timeout_seconds: 600
+  max_active_runs: 2
+  idle_session_retention_seconds: null  # 首期不自动过期；远端保留时间不保证。
+  lease_seconds: 60
+  recovery_poll_seconds: 5
