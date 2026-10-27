@@ -5,9 +5,9 @@
 
 - 老路（SDK）：`blade_agent_kit` + Socket.IO 长连接，实时事件流、token usage、
   断线重连、优先恢复 checkpoint 全都有。
-- 新路（本文件）：`blade` 命令行。`blade chat run` 阻塞跑完一轮，终态才吐
-  `{session_id, status, messages[]}`；逐步轨迹靠事后 `blade session history
-  --json` 重建，产物靠 `blade session copy-dir` 拉 zip。
+- CLI 执行（本文件）：`blade chat run` 阻塞跑完一轮，终态才吐
+  `{session_id, status, messages[]}`；历史通过 SDK 回收（beta.41 已删除
+  `blade session history`），产物通过 `blade session copy-dir` 拉 zip。
 
 **刻意接受的数据缺口**（见 docs/agents.md「blade-cli 接入」）：CLI 不暴露
 token usage，也不暴露实时事件时序。因此本 adapter 的 `token_usage` 恒为空，
@@ -29,6 +29,7 @@ import os
 import shutil
 import tempfile
 import zipfile
+from importlib.metadata import PackageNotFoundError, version
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -53,6 +54,7 @@ from .blade_service import (
     BLADE_SANDBOX_SECURITY_EXTRA,
     UNEXPECTED_INTERACTION_AUTO_ANSWER,
     AdapterEnv,
+    BladeAgentClient,
     BladeAdapterConfig,
     _render_turn_prompt,
 )
@@ -237,6 +239,15 @@ class BladeCliAdapter:
             "blade_transport": "cli",
             "blade_cli_path": cli_path,
         }
+        code, cli_version, _ = await self._run_cli(
+            cli_path, ["version"], timeout=self.config.request_timeout_seconds
+        )
+        if code == 0 and cli_version.strip():
+            external_refs["cli_version"] = cli_version.strip()
+        try:
+            external_refs["blade_sdk_version"] = version("blade-agent-kit")
+        except PackageNotFoundError:
+            pass
         checkpoint_state: dict[str, Any] = {
             "blade_cli_path": cli_path,
             "blade_session_id": None,
@@ -422,9 +433,10 @@ class BladeCliAdapter:
         tool_call_count = 0
         # 轨迹与产物即便失败也要尽力回收：横评要能分辨"跑挂了"和"什么都没做"。
         if session_id:
-            events_count, last_event_at, tool_call_count = await self._rebuild_events(
-                cli_path, session_id, attempt_dir, task
+            events_count, last_event_at, tool_call_count, history_sync = await self._rebuild_events(
+                session_id, attempt_dir
             )
+            external_refs["history_sync"] = history_sync
             external_refs["artifact_sync"] = await self._recover_artifacts(
                 cli_path, session_id, workspace
             )
@@ -441,7 +453,10 @@ class BladeCliAdapter:
             error_code=error_code,
             error_message=error_message,
             # CLI 无实时流：事件是事后从 session history 重建的。
-            transport_status="reconstructed" if session_id else "not_applicable",
+            transport_status=(
+                "reconstructed" if session_id and history_sync["status"] == "ready"
+                else "disconnected" if session_id else "not_applicable"
+            ),
             events_count=events_count,
             last_event_at=last_event_at,
             # CLI 不区分 thinking 节点，恒 0（见模块 docstring 的数据缺口说明）。
@@ -568,32 +583,28 @@ class BladeCliAdapter:
 
     async def _rebuild_events(
         self,
-        cli_path: str,
         session_id: str,
         attempt_dir: Path,
-        task: AdapterRunInput,
-    ) -> tuple[int, str | None, int]:
-        """用 `blade session history --json` 事后重建 events.jsonl。
+    ) -> tuple[int, str | None, int, dict[str, Any]]:
+        """通过 beta.41 SDK 的历史接口事后重建 events.jsonl。
 
         这不是实时流的等价物：时序是 blade 端记录的 node timestamp，
-        粒度到消息节点为止。返回 (events_count, last_event_at, tool_call_count)。
+        粒度到消息节点为止。保留原始节点与关联 ID，不能当作实时流。
         """
-        code, out, err = await self._run_cli(
-            cli_path,
-            ["session", "history", session_id, "--json", "--max", "0"],
-            timeout=self.config.request_timeout_seconds or 30.0,
-        )
-        if code != 0:
-            logger.warning("blade-cli session history failed (%s): %s", code, err)
-            return 0, None, 0
-
         try:
-            payload = json.loads(out)
-        except json.JSONDecodeError:
-            logger.warning("blade-cli session history returned non-JSON")
-            return 0, None, 0
+            async with BladeAgentClient(
+                self.config.base_url,
+                token=self.config.api_key,
+                timeout=self.config.request_timeout_seconds or 30.0,
+            ) as client:
+                history = await client.get_history(session_id)
+            nodes = history.nodes
+        except Exception as exc:
+            logger.warning("blade-cli SDK history retrieval failed: %s", type(exc).__name__)
+            return 0, None, 0, {
+                "status": "failed", "source": "sdk", "error": type(exc).__name__,
+            }
 
-        nodes = payload.get("nodes") or []
         events_path = attempt_dir / "events.jsonl"
         count = 0
         tool_calls = 0
@@ -608,6 +619,10 @@ class BladeCliAdapter:
                     "role": node.get("role"),
                     "content": node.get("content"),
                     "tool_calls": node.get("tool_calls") or [],
+                    "id": node.get("id"),
+                    "tool_call_id": node.get("tool_call_id"),
+                    "loop_name": node.get("loop_name"),
+                    "raw": node,
                     # 标记来源，避免下游把它当实时事件流解读。
                     "source": "blade_cli_history",
                 }
@@ -621,7 +636,7 @@ class BladeCliAdapter:
                 tool_calls += len(node.get("tool_calls") or [])
                 if node.get("timestamp"):
                     last_at = str(node["timestamp"])
-        return count, last_at, tool_calls
+        return count, last_at, tool_calls, {"status": "ready", "source": "sdk", "nodes": count}
 
     async def _recover_artifacts(
         self, cli_path: str, session_id: str, workspace: Path

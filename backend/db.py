@@ -1307,6 +1307,8 @@ def _init_db_sync(db_path: Path) -> None:
         _migrate_attempt_observability(conn)
         _migrate_rubric_evolution(conn)
         _migrate_research_columns(conn)
+        from .skill_eval.schema import migrate as migrate_skill_eval
+        migrate_skill_eval(conn)
         conn.commit()
 
 

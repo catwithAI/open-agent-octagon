@@ -23,6 +23,8 @@ function ShellIcon({ name }: { name: IconName }) {
 }
 
 const ROUTE_LABELS: Array<[RegExp, string]> = [
+  [/^\/skill-eval-records/, "skillEval.records"],
+  [/^\/skill-eval/, "skillEval.workspace"],
   [/^\/overview$/, "crumb.overview"],
   [/^\/experiments\/new$/, "crumb.experimentNew"],
   [/^\/experiments\/[^/]+\/groups\/[^/]+\/results$/, "crumb.experimentResults"],
@@ -100,6 +102,8 @@ export function AppShell({ children }: { children: ReactNode }) {
         {navLink("/overview", t("shell.nav.overview"), "dashboard", true)}
         {navLink("/experiments/new", t("shell.nav.newExperiment"), "plus", true)}
         {navLink("/experiments", t("shell.nav.experiments"), "flask", true)}
+        {navLink("/skill-eval", t("skillEval.workspace"), "flask")}
+        {navLink("/skill-eval-records", t("skillEval.records"), "boxes")}
         <div className="shell-nav-spacer" />
         <div className="shell-nav-section">{t("shell.nav.resources")}</div>
         {navLink("/scenarios", t("shell.nav.scenarios"), "boxes")}

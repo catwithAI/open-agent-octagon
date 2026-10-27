@@ -56,6 +56,21 @@ env trace（工具调用）不由 adapter 返回——它由 env attempt server 
 
 ### 两条通道：blade-cli（默认）与 SDK
 
+当前兼容基线为 Blade Agent `v2612.0.0-beta.41`，Python SDK 精确锁定
+`blade-agent-kit==2612.0.0b41`。在项目根目录安装：
+
+```bash
+uv sync --locked --extra blade --extra dev
+./scripts/install-blade-cli.sh
+uv run --no-sync blade version
+```
+
+安装脚本从固定 release 提交构建本机原生 CLI，默认放入当前 worktree 的
+`.venv/bin/blade`，不覆盖全局或其他 worktree 的版本。脚本需要 `gh` 登录态、
+Git、Go 和 Make。使用 `uv run` 启动时该路径在 PATH 中，也可显式设置
+`BLADE_CLI_PATH`。预览服务为 `https://agent.preview.bladeai.com.cn/`，通过
+`BLADE_BASE_URL` 配置，凭据使用 `BLADE_API_KEY`。
+
 BA 出了官方命令行 `blade-cli` 后，调用通道有两条，都打同一个 blade server，
 由 `settings.blade.transport` 选择（`BLADE_TRANSPORT` 可覆盖）：
 
@@ -63,14 +78,15 @@ BA 出了官方命令行 `blade-cli` 后，调用通道有两条，都打同一�
 |---|---|---|
 | adapter | `adapters/blade_cli.py` | `adapters/blade_service.py` |
 | 通道 | `blade` 子进程 | `blade_agent_kit` + Socket.IO |
-| 轨迹 | 事后 `blade session history` 重建 | 实时事件流 |
+| 轨迹 | 事后由 SDK `get_history` 重建 | 实时事件流 |
 | token usage | **不采集**（字段留空） | 采集 |
 | 断点恢复 | 不支持 | 支持 |
 
 **CLI 通道的已知数据缺口**：blade-cli 只在一轮跑完后吐终态
 `{session_id, status, messages[]}`，不暴露 token usage，也没有实时事件时序。
-因此 `events.jsonl` 是事后从 `session history --json` 重建的历史节点
-（每行带 `source: "blade_cli_history"`），`token_usage` 恒为空、
+beta.41 已移除 CLI 的 `session history`，因此两种通道都需要安装 `blade` extra。
+CLI 通道的 `events.jsonl` 由 SDK `get_history` 事后重建为历史节点
+（每行带 `source: "blade_cli_history"`，并保留节点与工具返回的关联 ID），`token_usage` 恒为空、
 `thinking_count` 恒为 0。**横评矩阵里 BA 的 token 成本列因此是空的——这是通道
 取舍，不是采集失败。** 需要 token 口径时把 transport 切回 `sdk`。
 
@@ -91,7 +107,9 @@ Socket.IO 独有能力，CLI 每次 `chat run` 都新建会话，没有对应语
 **可用性判据**：`transport=cli` 时除 `blade.api_key` 外还要求 `blade` 二进制在
 PATH（或配 `blade.cli_path`）。`/agents` 与实验目录的 availability 都已覆盖这
 一条——漏了会变成「实验建得出来、跑起来才 cli_not_found」，整批 attempt 作废还
-会被误读成 agent 能力问题。二进制构建：`cd builtin/clis/blade-cli && make build`。
+会被误读成 agent 能力问题。历史读取失败记录在 `external_refs.history_sync`，
+与产物回收状态分开，不将执行成功等同于采集完整；SDK 及 CLI 实际版本也写入
+`external_refs`。
 
 ### 原则（SDK 通道）
 

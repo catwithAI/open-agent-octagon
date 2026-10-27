@@ -118,15 +118,15 @@ wheels = [
 
 [[package]]
 name = "blade-agent-kit"
-version = "1.1.7"
+version = "2612.0.0b41"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "httpx" },
     { name = "python-socketio", extra = ["asyncio-client"] },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/b9/19/32bd730d03173a81fc53223645c4c6aeffa7be6569a2d0f296163fc5032e/blade_agent_kit-1.1.7.tar.gz", hash = "sha256:2c60c8284626b914774b84391ee2876e5226b936e9ce2515a99c79a45d59bc01", size = 22914, upload-time = "2026-07-24T06:53:25.712Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/34/83/3a6707baea00889175d5215195d2c28229ff26b23c72f447fc80e9780fe7/blade_agent_kit-2612.0.0b41.tar.gz", hash = "sha256:e8bc3b67a5a93023492c0b22578010890fbaad6a861880917f0334b8be70771b", size = 39364, upload-time = "2026-10-21T07:34:34.52Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/47/49/2ad0092a1683a29e28a1012254fb925561de88f93749e1260d5f305bcf75/blade_agent_kit-1.1.7-py3-none-any.whl", hash = "sha256:80e5f58c00dcb7742ea0fd667ccfc0a4d22ce7eea11370cf734b4bdbcd43fa0e", size = 17483, upload-time = "2026-07-24T06:53:24.692Z" },
+    { url = "https://files.pythonhosted.org/packages/d2/85/c8d69b8ffc3d9689065082fef2c05b228888d1256155f21509dfb3222586/blade_agent_kit-2612.0.0b41-py3-none-any.whl", hash = "sha256:f9c3597f5d6e90b66b2ba0f7db849118fc6ecef538947440d874fea7a738827a", size = 23166, upload-time = "2026-10-21T07:34:33.079Z" },
 ]
 
 [[package]]
@@ -628,6 +628,7 @@ dependencies = [
     { name = "mcp" },
     { name = "pydantic" },
     { name = "pydantic-settings" },
+    { name = "python-multipart" },
     { name = "python-socketio", extra = ["asyncio-client"] },
     { name = "pyyaml" },
     { name = "rfc8785" },
@@ -646,7 +647,6 @@ dev = [
     { name = "py" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
-    { name = "python-multipart" },
     { name = "respx" },
     { name = "toml" },
     { name = "wcwidth" },
@@ -658,7 +658,7 @@ dsh = [
 [package.metadata]
 requires-dist = [
     { name = "aiosqlite", specifier = ">=0.20" },
-    { name = "blade-agent-kit", marker = "extra == 'blade'", specifier = ">=1.1.7" },
+    { name = "blade-agent-kit", marker = "extra == 'blade'", specifier = "==2612.0.0b41" },
     { name = "deepseek-harness-sdk", marker = "extra == 'dsh'", specifier = "==0.1.0rc6" },
     { name = "fastapi", specifier = ">=0.115" },
     { name = "httpx", specifier = ">=0.27" },
@@ -672,7 +672,7 @@ requires-dist = [
     { name = "pydantic-settings", specifier = ">=2.5" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.23" },
-    { name = "python-multipart", marker = "extra == 'dev'", specifier = ">=0.0.18" },
+    { name = "python-multipart", specifier = ">=0.0.18" },
     { name = "python-socketio", extras = ["asyncio-client"], specifier = ">=5.11" },
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "respx", marker = "extra == 'dev'", specifier = ">=0.21" },

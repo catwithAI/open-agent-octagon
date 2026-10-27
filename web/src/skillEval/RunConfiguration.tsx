@@ -1,0 +1,32 @@
+import {useEffect,useState} from "react";
+import {useNavigate,useSearchParams} from "react-router-dom";
+import {post,request} from "./api";
+import {ErrorBox,InputUpload,Panel,ScopeNotice,useAction,useCopy,useSubmissionKey} from "./common";
+import {RerunConfirm} from "./RerunConfirm";
+import type {Capabilities,CreateRun,Experiment,Input,ModelCatalog,Plan} from "./types";
+
+export function RunConfiguration({skillId,releaseId,sourceRunId,freeze,onStarted}:{skillId:string;releaseId?:string;sourceRunId?:string;freeze:()=>Promise<{snapshot_id:string;draft_id?:string}>;onStarted?:()=>void}){
+  const c=useCopy(),navigate=useNavigate(),action=useAction(),keys=useSubmissionKey();const [params,setParams]=useSearchParams();
+  const [cap,setCap]=useState<Capabilities|null>(null),[models,setModels]=useState<ModelCatalog>({status:"loading",default:null,models:[]}),[model,setModel]=useState("");
+  const [experiments,setExperiments]=useState<Experiment[]>([]),[experiment,setExperiment]=useState(params.get("experiment")||""),[name,setName]=useState("");
+  const [prompt,setPrompt]=useState(""),[inputs,setInputs]=useState<Input[]>([]),[uploading,setUploading]=useState(false),[rerun,setRerun]=useState(false);
+  useEffect(()=>{const abort=new AbortController();void Promise.all([request<Capabilities>("/capabilities",{signal:abort.signal}),request<ModelCatalog>("/models",{signal:abort.signal}),request<{items:Experiment[]}>(`/experiments?skill_id=${skillId}`,{signal:abort.signal})]).then(([capability,catalog,list])=>{setCap(capability);setModels(catalog);setModel(current=>catalog.models.some(m=>m.id===current)?current:catalog.default&&catalog.models.some(m=>m.id===catalog.default)?catalog.default:catalog.models[0]?.id||"");setExperiments(list.items);setExperiment(current=>list.items.some(item=>item.id===current)?current:"");}).catch(e=>{if(!abort.signal.aborted)action.setError(e);});return()=>abort.abort();},[skillId]);
+  const selectedFromUrl=params.get("experiment");
+  useEffect(()=>{if(selectedFromUrl&&experiments.some(item=>item.id===selectedFromUrl))setExperiment(selectedFromUrl);},[selectedFromUrl,experiments]);
+  const setSelected=(id:string)=>{setExperiment(id);const query=new URLSearchParams(params);query.set("experiment",id);setParams(query,{replace:true});};
+  const start=async(plan?:Plan)=>{const snapshot=await freeze();const body:CreateRun={experiment_id:experiment,...snapshot,agent:"blade-agent",model:{id:model},...(releaseId?{release_id:releaseId}:{}),...(plan?{source_run_id:sourceRunId,rerun_plan_id:plan.id}:{prompt,input_ids:inputs.map(i=>i.id)})};const result=await post<{run_id:string}>("/runs",body,keys.forBody(body));keys.done();onStarted?.();navigate(`/skill-eval/runs/${result.run_id}`);};
+  const disabled=action.busy||uploading||!experiment||!model||!cap?.enabled||cap.execution.status==="unavailable";
+  return <Panel title={c("运行配置","Run configuration")}><div className="se-stack"><ScopeNotice/>
+    <label>{c("实验","Experiment")}<select value={experiment} onChange={event=>setSelected(event.target.value)}><option value="">{c("请选择或新建命名实验","Choose or create a named experiment")}</option>{experiments.map(item=><option key={item.id} value={item.id}>{item.name}</option>)}</select></label>
+    <form className="se-toolbar" onSubmit={event=>{event.preventDefault();void action.act(async()=>{const created=await post<Experiment>("/experiments",{skill_id:skillId,name});setExperiments([...experiments,created]);setSelected(created.id);setName("");});}}><input aria-label={c("新实验名称","New experiment name")} placeholder={c("新实验名称","New experiment name")} value={name} onChange={e=>setName(e.target.value)}/><button disabled={!name.trim()||action.busy||cap?.display_only}>{c("新建实验","Create experiment")}</button>{experiment&&<button type="button" disabled={action.busy||cap?.display_only} onClick={()=>{const current=experiments.find(e=>e.id===experiment);const newName=window.prompt(c("实验新名称","New experiment name"),current?.name);if(newName)void action.act(async()=>{const updated=await request<Experiment>(`/experiments/${experiment}`,{method:"PATCH",body:JSON.stringify({name:newName})});setExperiments(experiments.map(item=>item.id===updated.id?updated:item));});}}>{c("改名","Rename")}</button>}</form>
+    <div className="se-fields"><label>{c("智能体","Agent")}<select value="blade-agent" onChange={()=>{}}><option value="blade-agent">blade-agent</option></select></label><label>{c("模型","Model")}<select value={model} onChange={e=>setModel(e.target.value)}>{models.models.map(item=><option key={item.id} value={item.id}>{item.label}</option>)}</select></label></div>
+    {sourceRunId?<p>{c("重跑前需要确认带上全部输入，或重新提供。","Before rerunning, confirm whether to carry all inputs or provide new ones.")}</p>:<><label>{c("提示（可选）","Prompt (optional)")}<textarea value={prompt} onChange={e=>setPrompt(e.target.value)} placeholder={c("可留空，按 Skill 本身启动。","May be empty; the Skill can start on its own.")}/></label><InputUpload items={inputs} onChange={setInputs} onUploadingChange={setUploading} disabled={action.busy}/></>}
+    <p className="se-hint">{c("采集可获得的公开思考、工具参数和返回；部署限制与缺口会在流程中显示。","Captures available public reasoning, tool arguments and returns. Deployment limits and gaps are shown in the process view.")}</p>
+    {cap?.capture&&<p className="se-hint">{c("采集档位：","Capture policy: ")}{cap.capture.policy.requested} → {cap.capture.policy.effective}{cap.capture.policy.downgrade_reason?` · ${cap.capture.policy.downgrade_reason}`:""}</p>}
+    {cap?.enabled&&cap.execution.status==="unavailable"&&<p className="se-error">{c("当前执行服务不可用，配置与历史仍可查看。","Execution service is unavailable; configuration and history remain accessible.")}</p>}
+    {!cap?.enabled&&<p className="se-hint">{c("当前部署尚未开放运行，已有内容仍可查看和编辑。","Execution is disabled on this deployment; existing content remains accessible.")}</p>}
+    {models.status==="unavailable"&&<p className="se-error">{c("模型目录不可用，请检查服务配置。","Model catalog unavailable. Check service configuration.")} {models.reason}</p>}
+    <button className="primary" disabled={disabled} onClick={()=>sourceRunId?setRerun(true):void action.act(()=>start())}>{action.busy?c("正在提交…","Submitting…"):sourceRunId?c("确认输入并重跑…","Review inputs and rerun…"):c("运行 Skill","Run Skill")}</button><ErrorBox error={action.error}/>
+    {rerun&&<RerunConfirm sourceRunId={sourceRunId!} onCancel={()=>setRerun(false)} onConfirm={plan=>start(plan)}/>}</div>
+  </Panel>;
+}

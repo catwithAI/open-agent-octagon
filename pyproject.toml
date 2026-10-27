@@ -16,6 +16,7 @@ dependencies = [
     "python-socketio[asyncio_client]>=5.11",
     "mcp>=1.0",
     "rfc8785>=0.1.4",
+    "python-multipart>=0.0.18",
 ]
 
 [project.urls]
@@ -26,7 +27,7 @@ Repository = "https://github.com/catwithAI/open-agent-octagon"
 # blade-agent adapter 走 REST + Socket.IO。适配器是懒 import + cli_not_found 早退，
 # 缺此包不影响其余 agent，故设为可选依赖。
 blade = [
-    "blade-agent-kit>=1.1.7",
+    "blade-agent-kit==2612.0.0b41",
 ]
 # dsh（DeepSeek Harness）走 Python SDK，同样懒 import、可选。pin 精确版本——
 # dsh 是 developer preview，明示会有 breaking change。
@@ -37,7 +38,6 @@ dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
     "respx>=0.21",
-    "python-multipart>=0.0.18",
     # blade_skill/tools.py 在 blade-agent 进程加载,这里仅为单测 import 时用。
     "langchain>=0.3",
     "langchain-core>=0.3",
