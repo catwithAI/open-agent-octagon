@@ -8,6 +8,7 @@ import {ProcessView} from "./ProcessView";
 import {RunNote} from "./RunNote";
 import {useRunEvents} from "./useRunEvents";
 import {useCompareSelection} from "./RunHistory";
+import {createIdempotencyKey} from "../api/idempotency";
 import type {Interaction,Run,RunMessage} from "./types";
 import "./styles.css";
 
@@ -37,7 +38,7 @@ export function RunDetail(){
           {run.input_snapshot.system_startup_message&&<details><summary>{c("查看系统启动指令","View system startup instruction")}</summary><pre>{run.input_snapshot.system_startup_message}</pre></details>}
         </Panel>
         {ended&&<Panel title={c("最终文件","Final files")}>{run.final_result?.artifacts.length?<ul className="se-artifact-list">{run.final_result.artifacts.map(artifact=><li key={artifact.id}>{artifact.state==="complete"?<span><button onClick={()=>setPreview(artifact.id)}>{artifact.relative_path}</button> <a href={url(`/artifacts/${artifact.id}`)}>{c("下载","Download")}</a></span>:<span>{artifact.relative_path} — {c("未下载","Not downloaded")} {artifact.error}</span>}<small>{artifact.size??"?"} B</small></li>)}</ul>:<p>{run.artifact_status==="complete"?c("无文件产物。文字结论本身也是有效结果。","No file artifacts. Text conclusions are valid results."):c("文件回收未完成，暂时无法确认是否有产物。","File collection is incomplete; artifact availability is unknown.")}</p>}
-          {run.final_result?.gaps.map((gap,i)=><p className="se-hint" key={i}>{gap.path} {gap.reason}</p>)}{run.final_result?.observations.map((observation,i)=><p className="se-hint" key={i}>{c("超出当前评测范围：","Outside the current evaluation scope: ")}{observation.kind} {observation.path}</p>)}{run.artifact_status!=="complete"&&<button disabled={readOnly||action.busy} onClick={()=>void action.act(async()=>{await post(`/runs/${run.id}/collect`,{},crypto.randomUUID());update();})}>{c("仅重试回收","Retry collection only")}</button>}</Panel>}
+          {run.final_result?.gaps.map((gap,i)=><p className="se-hint" key={i}>{gap.path} {gap.reason}</p>)}{run.final_result?.observations.map((observation,i)=><p className="se-hint" key={i}>{c("超出评测范围：","Outside the current evaluation scope: ")}{observation.kind} {observation.path}</p>)}{run.artifact_status!=="complete"&&<button disabled={readOnly||action.busy} onClick={()=>void action.act(async()=>{await post(`/runs/${run.id}/collect`,{},createIdempotencyKey());update();})}>{c("仅重试回收","Retry collection only")}</button>}</Panel>}
       </>}
       {preview&&<ArtifactPreview descriptorPath={`/artifacts/${preview}/preview`} downloadUrl={url(`/artifacts/${preview}`)} onClose={()=>setPreview(null)}/>}
       <ChatComposer key={run.id} run={run} interaction={pending} onSent={update} readOnly={readOnly}/>

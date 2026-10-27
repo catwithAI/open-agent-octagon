@@ -37,7 +37,9 @@ class BladeSkillRuntime:
         self.client=None
 
     async def create(self,run):
-        session=await self.client.create_session(intent='',model=run['requested_model'],initiator='sdk',solution_id='general_chat')
+        # beta.4 rejects the legacy `initiator` field with extra_forbidden.
+        # The SDK defaults to the supported initiator on the server side.
+        session=await self.client.create_session(intent='',model=run['requested_model'],solution_id='general_chat')
         if not session.id:raise RuntimeError('Blade did not return a session ID')
         return {'session_id':session.id,'sdk_version':version('blade-agent-kit'),'server_version':session.raw.get('ba_version') or self.server_version,'session_model':session.raw.get('model'),'transport':'sdk'}
 
