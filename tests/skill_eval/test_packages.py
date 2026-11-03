@@ -129,6 +129,8 @@ def test_utf8_entry_names_without_flag_are_recovered(tmp_path,skill_files):
 
 
 def test_default_file_limit_accepts_large_asset_packages(tmp_path,skill_files):
+    from backend.config import SkillEvalLimits
+    assert Limits().max_files==SkillEvalLimits().max_files
     files=dict(skill_files)
     files.update({f'icons/{index}.svg':(f'<svg>{index}</svg>'.encode(),0o644) for index in range(1001)})
     package=parse_package('icons.zip',zip_bytes(files),Store(tmp_path))

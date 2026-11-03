@@ -416,7 +416,7 @@ class SkillEvalLimits(BaseModel):
     max_upload: int = Field(default=20 * 1024 * 1024, gt=0)
     max_total: int = Field(default=100 * 1024 * 1024, gt=0)
     max_file: int = Field(default=20 * 1024 * 1024, gt=0)
-    max_files: int = Field(default=20000, gt=0)
+    max_files: int = Field(default=50000, gt=0)
     max_ratio: int = Field(default=200, gt=0)
 
 

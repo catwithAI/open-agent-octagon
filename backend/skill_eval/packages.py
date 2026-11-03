@@ -24,7 +24,7 @@ class Limits:
     max_file: int = 20 * 1024 * 1024
     # Icon/asset packs legitimately contain >10k small files. Keep the count
     # bounded while still accepting real-world Skill packages.
-    max_files: int = 20000
+    max_files: int = 50000
     max_ratio: int = 200
 
     def __post_init__(self):
