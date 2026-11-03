@@ -29,6 +29,24 @@ it("browses package contents and switches versions without creating a draft",asy
  expect(JSON.parse(String(creation[1]?.body))).toEqual({release_id:"rel2"});
 });
 
+it("pages a large resource list and searches paths outside the first page",async()=>{
+ const entries=Array.from({length:600},(_,index)=>({...entry,file_id:`f${index}`,path:`assets/${index}.svg`}));
+ apiMock(path=>{
+  if(path==="/skills")return jsonResponse({items:[{id:"s1",name:"sample"}]});
+  if(path==="/skills/s1")return jsonResponse({id:"s1",name:"sample",releases:[release]});
+  if(path==="/versions/v1")return jsonResponse({entries});
+  if(path==="/versions/v1/files?path=SKILL.md")return jsonResponse({text:"Original instructions"});
+  if(path.startsWith("/experiments?"))return jsonResponse({items:[]});
+  if(path.startsWith("/runs?"))return jsonResponse({items:[],next_cursor:null});
+ });
+ view(<Routes><Route path="/skill-eval/skills/:skillId" element={<Workspace/>}/></Routes>,"/skill-eval/skills/s1");
+ await screen.findByText("assets/0.svg");
+ expect(document.querySelectorAll(".se-resource-list li")).toHaveLength(250);
+ fireEvent.change(screen.getByLabelText("搜索资源文件"),{target:{value:"assets/599.svg"}});
+ await screen.findByText("assets/599.svg");
+ expect(document.querySelectorAll(".se-resource-list li")).toHaveLength(1);
+});
+
 it("shows the source final reply and restores the experiment when refining",async()=>{
  const {run}=await import("./test-utils");
  apiMock(path=>{
