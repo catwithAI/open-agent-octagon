@@ -22,7 +22,9 @@ class Limits:
     max_upload: int = 20 * 1024 * 1024
     max_total: int = 100 * 1024 * 1024
     max_file: int = 20 * 1024 * 1024
-    max_files: int = 1000
+    # Icon/asset packs legitimately contain >10k small files. Keep the count
+    # bounded while still accepting real-world Skill packages.
+    max_files: int = 20000
     max_ratio: int = 200
 
     def __post_init__(self):
@@ -101,7 +103,23 @@ def metadata(body: bytes) -> tuple[str, str | None, list[str]]:
 
 def _check_size(value: int, maximum: int, label: str) -> None:
     if value > maximum:
-        raise ValueError(f'{label} limit exceeded')
+        raise ValueError(f'{label} limit exceeded ({value} > {maximum})')
+
+
+def _zip_name(info: zipfile.ZipInfo) -> str:
+    """Recover UTF-8 entry names from ZIPs that omit the UTF-8 flag.
+
+    Some Windows/macOS tools write UTF-8 filename bytes without setting general
+    purpose bit 11. ``zipfile`` then decodes them as cp437 and yields mojibake.
+    Only reinterpret names when the cp437 bytes are valid UTF-8, so genuine
+    legacy cp437 names are left untouched.
+    """
+    if info.flag_bits & 0x800:
+        return info.filename
+    try:
+        return info.filename.encode('cp437').decode('utf-8')
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return info.filename
 
 
 def parse_package(filename: str, data: bytes, store: Store, limits: Limits | None = None) -> Package:
@@ -122,7 +140,8 @@ def parse_package(filename: str, data: bytes, store: Store, limits: Limits | Non
                 seen = set()
                 directories = set()
                 for info in infos:
-                    path = safe_path(info.filename[:-1] if info.is_dir() else info.filename)
+                    name = _zip_name(info)
+                    path = safe_path(name[:-1] if info.is_dir() else name)
                     if path in seen:
                         raise ValueError(f'duplicate path: {path}')
                     seen.add(path)

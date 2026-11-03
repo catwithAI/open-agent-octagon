@@ -27,3 +27,11 @@ async def test_content_length_rejection_does_not_read_or_parse_body():
     async def send(message):sent.append(message)
     await BodyLimits(never,package_bytes=1,input_bytes=1,json_bytes=5)({'type':'http','method':'POST','path':'/api/skill-eval/runs','headers':[(b'content-length',b'6')]},never,send)
     assert sent[0]['status']==413
+
+
+async def test_trailing_slash_still_uses_the_package_limit():
+    async def never(*args):raise AssertionError('must not parse oversized body')
+    sent=[]
+    async def send(message):sent.append(message)
+    await BodyLimits(never,package_bytes=1,input_bytes=1,json_bytes=70000)({'type':'http','method':'POST','path':'/api/skill-eval/skills/import/','headers':[(b'content-length',b'70000')]},never,send)
+    assert sent[0]['status']==413

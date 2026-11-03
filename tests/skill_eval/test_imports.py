@@ -63,6 +63,16 @@ async def test_real_multipart_http_and_unconfigured_catalog(service):
         assert len((await client.get('/api/skill-eval/skills')).json()['items'])==1
 
 
+async def test_upload_filename_from_client_path_is_normalized(service):
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app(service)),base_url='http://local') as client:
+        response=await client.post('/api/skill-eval/skills/import',files={'file':('C:\\fakepath\\SKILL.md',b'---\nname: sample\n---\nx','text/markdown')})
+        assert response.status_code==201
+        assert response.json()['detected_name']=='sample'
+        result=await client.post('/api/skill-eval/inputs',files={'file':('/tmp/report.txt',b'input')})
+        assert result.status_code==201
+        assert result.json()['original_name']=='report.txt'
+
+
 def test_scope_and_expired_import(service):
     from datetime import datetime,timezone,timedelta
     pending=service.import_package('SKILL.md',b'---\nname: sample\n---\nx')

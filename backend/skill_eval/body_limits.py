@@ -11,9 +11,9 @@ class BodyLimits:
         self.app=app;self.package_bytes=package_bytes;self.input_bytes=input_bytes;self.json_bytes=json_bytes
 
     async def __call__(self,scope,receive,send):
-        if scope['type']!='http' or scope.get('method') not in ('POST','PATCH','PUT') or not scope.get('path','').startswith('/api/skill-eval/'):
+        path=scope.get('path','').rstrip('/')
+        if scope['type']!='http' or scope.get('method') not in ('POST','PATCH','PUT') or not (path=='/api/skill-eval' or path.startswith('/api/skill-eval/')):
             return await self.app(scope,receive,send)
-        path=scope['path']
         maximum=self.package_bytes+65536 if path.endswith('/skills/import') else self.input_bytes+65536 if path.endswith('/inputs') else self.json_bytes
         async def reject():
             response=JSONResponse({'error':{'code':'request_too_large','message':'Skill Eval request body limit exceeded'}},status_code=413)
