@@ -22,6 +22,16 @@ it("uploads a new binary resource into the full package without a version save",
  fireEvent.change(screen.getByLabelText("上传 Skill 资源"),{target:{files:[file]}});await screen.findByRole("button",{name:"assets/data.bin *"});expect(handle.current!.changes()).toContainEqual({op:"write",path:"assets/data.bin",content_base64:"AP+A",mode:420});expect(screen.getByText("新资源尚未暂存，可导出当前整个 Skill 包。")).toBeTruthy();
 });
 
+it("pages the editor file tree and searches paths outside the first page",async()=>{
+ const entries=[entry,...Array.from({length:600},(_,index)=>({...entry,file_id:`f${index}`,path:`assets/${index}.svg`}))];
+ apiMock(path=>path.includes("/files?")?jsonResponse({text:"original"}):undefined);
+ view(<SkillPackageEditor draft={{...draft,entries}} onDraft={()=>{}}/>);
+ await screen.findByLabelText("编辑文件 SKILL.md");
+ expect(document.querySelectorAll(".se-file-tree>button").length).toBeLessThan(300);
+ fireEvent.change(screen.getByLabelText("搜索资源文件"),{target:{value:"assets/599.svg"}});
+ await screen.findByRole("button",{name:"assets/599.svg"});
+});
+
 it("restores one source file without discarding another file's buffer",async()=>{
  const second={...entry,file_id:"f2",path:"code.py",hash:"b".repeat(64)};const value={...draft,entries:[entry,second],base_entries:[entry,second]};
  apiMock(path=>path.includes("/files?")?jsonResponse({text:path.includes("SKILL.md")?"original instructions":"source code"}):undefined);

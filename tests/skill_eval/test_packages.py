@@ -19,6 +19,17 @@ def zip_bytes(files):
     return buf.getvalue()
 
 
+def clear_utf8_flags(data):
+    """Simulate tools that write UTF-8 names without general purpose bit 11."""
+    raw = bytearray(data)
+    for signature, offset in ((b'PK\x03\x04', 6), (b'PK\x01\x02', 8)):
+        start = 0
+        while (position := raw.find(signature, start)) >= 0:
+            raw[position+offset+1] &= ~0x08
+            start = position + 4
+    return bytes(raw)
+
+
 def test_whole_package_roundtrip_keeps_bytes_paths_modes(tmp_path, skill_files):
     store = Store(tmp_path)
     package = parse_package('sample.zip', zip_bytes({'root/'+p: v for p,v in skill_files.items()}), store)
@@ -105,6 +116,30 @@ def test_encrypted_and_corrupt_crc_are_rejected_before_any_manifest(tmp_path,ski
     corrupt=bytearray(output.getvalue());body_start=30+len('SKILL.md');corrupt[body_start]^=1
     with pytest.raises(ValueError,match='invalid ZIP'):parse_package('corrupt.zip',bytes(corrupt),Store(tmp_path/'crc'))
     assert not list(tmp_path.rglob('manifests/*.json'))
+
+
+def test_utf8_entry_names_without_flag_are_recovered(tmp_path,skill_files):
+    body=b'---\nname: sample\n---\nx'
+    data=zip_bytes({'PPT生成与编辑/SKILL.md':(body,0o644),'PPT生成与编辑/图标/示例.svg':(b'<svg/>',0o644)})
+    legacy=clear_utf8_flags(data)
+    with zipfile.ZipFile(io.BytesIO(legacy)) as archive:
+        assert all(not (info.flag_bits & 0x800) for info in archive.infolist())
+    package=parse_package('sample.zip',legacy,Store(tmp_path))
+    assert {entry.path for entry in package.entries}=={'SKILL.md','图标/示例.svg'}
+
+
+def test_default_file_limit_accepts_large_asset_packages(tmp_path,skill_files):
+    from backend.config import SkillEvalLimits
+    assert Limits().max_files==SkillEvalLimits().max_files
+    files=dict(skill_files)
+    files.update({f'icons/{index}.svg':(f'<svg>{index}</svg>'.encode(),0o644) for index in range(1001)})
+    package=parse_package('icons.zip',zip_bytes(files),Store(tmp_path))
+    assert len(package.entries)==len(files)
+
+
+def test_limit_errors_report_observed_and_allowed_values(tmp_path):
+    with pytest.raises(ValueError,match=r'limit exceeded \(\d+ > 10\)'):
+        parse_package('SKILL.md',b'---\nname: a\n---\nx',Store(tmp_path),Limits(max_file=10))
 
 
 def test_explicit_directories_are_allowed_but_file_directory_collision_is_not(tmp_path,skill_files):

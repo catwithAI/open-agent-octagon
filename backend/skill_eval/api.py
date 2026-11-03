@@ -13,6 +13,11 @@ from .capabilities import Capabilities
 from .service import EvalError, SkillService
 
 
+def _upload_filename(filename: str | None) -> str:
+    """Keep only the basename; some clients still send a full local path."""
+    return (filename or '').replace('\\', '/').rsplit('/', 1)[-1]
+
+
 class RequestBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -113,9 +118,9 @@ def register_routes(app: FastAPI, service: SkillService, catalog: SkillCatalog |
             while chunk:=await file.read(64*1024):
                 total+=len(chunk)
                 if total>service.limits.max_upload:
-                    raise EvalError('upload_too_large','Package upload limit exceeded',413)
+                    raise EvalError('upload_too_large',f'Package upload limit exceeded ({total} > {service.limits.max_upload})',413)
                 chunks.append(chunk)
-            return await run_in_threadpool(call,service.import_package,file.filename or '',b''.join(chunks))
+            return await run_in_threadpool(call,service.import_package,_upload_filename(file.filename),b''.join(chunks))
         finally:
             await file.close()
 
@@ -178,9 +183,9 @@ def register_routes(app: FastAPI, service: SkillService, catalog: SkillCatalog |
             while chunk:=await file.read(64*1024):
                 total+=len(chunk)
                 if total>service.input_max_bytes:
-                    raise EvalError('upload_too_large','Input upload limit exceeded',413)
+                    raise EvalError('upload_too_large',f'Input upload limit exceeded ({total} > {service.input_max_bytes})',413)
                 chunks.append(chunk)
-            return await run_in_threadpool(call,service.upload_input,file.filename or '',b''.join(chunks),file.content_type or 'application/octet-stream')
+            return await run_in_threadpool(call,service.upload_input,_upload_filename(file.filename),b''.join(chunks),file.content_type or 'application/octet-stream')
         finally:
             await file.close()
 

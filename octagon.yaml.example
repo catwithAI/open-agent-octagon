@@ -365,7 +365,7 @@ skill_eval:
     max_upload: 20971520
     max_total: 104857600
     max_file: 20971520
-    max_files: 1000
+    max_files: 50000
     max_ratio: 200
   input_max_bytes: 104857600
   artifact_max_file_bytes: 52428800

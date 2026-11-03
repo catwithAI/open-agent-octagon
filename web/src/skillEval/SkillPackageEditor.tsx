@@ -2,6 +2,7 @@ import {forwardRef,useEffect,useImperativeHandle,useRef,useState} from "react";
 import {post,request,download,url} from "./api";
 import {ErrorBox,useAction,useCopy,useLeaveGuard} from "./common";
 import {createIdempotencyKey} from "../api/idempotency";
+import {usePathFilter} from "./usePathFilter";
 import type {Change,Draft,Entry,Release} from "./types";
 
 export interface EditorHandle {freeze:()=>Promise<{snapshot_id:string;draft_id:string}>;changes:()=>Change[];allowLeave:()=>void}
@@ -12,6 +13,7 @@ export const SkillPackageEditor=forwardRef<EditorHandle,{draft:Draft;onDraft:(dr
   const [release,setRelease]=useState<Release|null>(null),[version,setVersion]=useState(""),[mode,setMode]=useState<"save"|"publish"|null>(null),[message,setMessage]=useState("");
   const [limits,setLimits]=useState({file:20*1024*1024,text:1024*1024});
   const [canLeave,setCanLeave]=useState(false),[showDiff,setShowDiff]=useState(false),[sourceText,setSourceText]=useState("");
+  const fileList=usePathFilter(files,file=>file.entry.path);
   const key=useRef(draft.id);const current=files.find(f=>f.entry.path===selected);const changes=():Change[]=>{
     const all:Change[]=[];
     for(const original of draft.entries){const file=files.find(item=>item.entry.file_id===original.file_id);if(!file)all.push({op:"delete",path:original.path});else if(file.entry.path!==original.path)all.push({op:"rename",path:original.path,to:file.entry.path});}
@@ -41,7 +43,7 @@ export const SkillPackageEditor=forwardRef<EditorHandle,{draft:Draft;onDraft:(dr
       if(existing>=0&&!updated[existing].entry.encoding)text=undefined;
       let base64:string|undefined;if(text===undefined){let binary="";for(const byte of bytes)binary+=String.fromCharCode(byte);base64=btoa(binary);}
       const entry:Entry={file_id:existing>=0?updated[existing].entry.file_id:createIdempotencyKey(),path,hash:"",size:file.size,mode:existing>=0?updated[existing].entry.mode:420,encoding:text===undefined?null:"utf-8"};const buffer={entry,text,content_base64:base64,dirty:true};if(existing>=0)updated[existing]=buffer;else updated.push(buffer);last=path;
-    }setFiles(updated);setSelected(last);
+    }setFiles(updated);setSelected(last);fileList.reset();
   };
   const applySave=async()=>{const response=await post<{draft?:Draft;release:Release}>(`/drafts/${draft.id}/${mode}`,{expected_revision:draft.revision,expected_release_revision:release?.revision,...(mode==="publish"||!draft.target_release_id?{version}:{}),changes:changes()});if(response.draft){setFiles(response.draft.entries.map(entry=>({entry})));onDraft(response.draft);}else onDraft({...draft});setMode(null);setMessage(mode==="publish"?c("已另建正式版，原版本继续保留。","Published a new release; the source version is preserved."):c("整个 Skill 版本已保存。","The entire Skill version was saved."));};
   return <div className="se-editor">
@@ -52,7 +54,11 @@ export const SkillPackageEditor=forwardRef<EditorHandle,{draft:Draft;onDraft:(dr
     {mode&&<form className="se-inline-dialog" onSubmit={event=>{event.preventDefault();void action.act(applySave);}}><strong>{mode==="publish"?c("发布会另建不可变正式版本，保留来源。","Publishing creates an immutable release and preserves the source."):draft.target_release_id?c("保存全部文件到当前未发布版本。","Save all files to the current unpublished version."):c("正式版不能覆盖，首次保存请填写新版本号。","Published versions cannot be overwritten. Use a new version for the first save.")}</strong>
       {(mode==="publish"||!draft.target_release_id)&&<label>{c("新版本号","New version")}<input required value={version} onChange={e=>setVersion(e.target.value)}/></label>}
       <button disabled={action.busy} className="primary">{c("确认","Confirm")}</button><button type="button" onClick={()=>setMode(null)}>{c("取消","Cancel")}</button></form>}
-    <div className="se-editor-grid"><aside className="se-file-tree"><div className="se-toolbar"><button disabled={readOnly} onClick={()=>{const path=window.prompt(c("新文件路径","New file path"));if(!path)return;if(files.some(f=>f.entry.path===path)){action.setError(c("路径已存在","Path already exists"));return;}const entry={file_id:createIdempotencyKey(),path,hash:"",size:0,mode:420,encoding:"utf-8"};setFiles([...files,{entry,text:"",dirty:true}]);setSelected(path);}}>{c("新建","New")}</button></div>{files.map(file=><button key={file.entry.file_id} className={selected===file.entry.path?"is-selected":""} onClick={()=>setSelected(file.entry.path)}>{file.entry.path}{file.dirty?" *":""}</button>)}</aside>
+    <div className="se-editor-grid"><aside className="se-file-tree"><div className="se-toolbar"><button disabled={readOnly} onClick={()=>{const path=window.prompt(c("新文件路径","New file path"));if(!path)return;if(files.some(f=>f.entry.path===path)){action.setError(c("路径已存在","Path already exists"));return;}const entry={file_id:createIdempotencyKey(),path,hash:"",size:0,mode:420,encoding:"utf-8"};setFiles([...files,{entry,text:"",dirty:true}]);setSelected(path);fileList.reset();}}>{c("新建","New")}</button><input aria-label={c("搜索资源文件","Search resource files")} placeholder={c("搜索文件","Search files")} value={fileList.query} onChange={event=>fileList.setQuery(event.target.value)}/></div>
+      {fileList.visible.map(file=><button key={file.entry.file_id} className={selected===file.entry.path?"is-selected":""} onClick={()=>setSelected(file.entry.path)}>{file.entry.path}{file.dirty?" *":""}</button>)}
+      <div className="se-list-status">{fileList.visible.length} / {fileList.matched.length}</div>
+      {fileList.hasMore&&<button className="se-list-more" onClick={fileList.showMore}>{c("显示更多","Show more")}</button>}
+    </aside>
       <div className="se-file-buffer">{current&&<><div className="se-toolbar"><strong>{selected}</strong><small>{current.entry.encoding||c("二进制","Binary")}</small>
         <label><input type="checkbox" checked={current.entry.mode===493} disabled={readOnly} onChange={e=>setFiles(files.map(file=>file===current?{...file,entry:{...file.entry,mode:e.target.checked?493:420}}:file))}/>{c("可执行","Executable")}</label>
         <button disabled={readOnly||selected==="SKILL.md"} onClick={()=>{const next=window.prompt(c("重命名为","Rename to"),selected);if(!next||next===selected)return;setFiles(files.map(file=>file===current?{...file,entry:{...file.entry,path:next}}:file));setSelected(next);}}>{c("重命名","Rename")}</button>
