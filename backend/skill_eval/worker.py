@@ -309,6 +309,22 @@ class Worker:
         finally:
             control.cancel();await asyncio.gather(control,return_exceptions=True)
 
+    @staticmethod
+    def latest_reply(events):
+        """Pick the last assistant reply, including SDKs that omit chat:end.output."""
+        latest=None;reply=None
+        for event in events:
+            payload=event.get('payload') or {}
+            if event.get('type')=='llm:response:done':
+                body=payload.get('body') or {};data=body.get('payload') or {}
+                if payload.get('loop_name')=='root' and data.get('role')=='assistant' and data.get('content'):
+                    latest={'event_id':event['event_id'],'text':data['content']}
+            elif event.get('type')=='chat:end':
+                body=payload.get('body') or {}
+                reply={'event_id':event['event_id'],'text':body['output']} if body.get('output') else latest
+                latest=None
+        return reply
+
     async def collect(self,job,run):
         from .artifacts import ArtifactCollector
         id_=run['id'];refs=run['external_refs'];gaps=[];history=None;quiescent=False;never_started=False
@@ -350,12 +366,7 @@ class Worker:
             if not page:break
             events.extend(page);cursor=page[-1]['seq']
             if len(page)<500:break
-        last_reply=None
-        for event in events:
-            if event['type']=='chat:end':
-                body=event['payload'].get('body') or {}
-                if body.get('output'):
-                    last_reply={'event_id':event['event_id'],'text':body['output']}
+        last_reply=self.latest_reply(events)
         messages=self.service.messages(id_)
         with self.repo.transaction() as c:
             owner=c.execute('SELECT owner FROM skill_eval_jobs WHERE id=?',(job['id'],)).fetchone()

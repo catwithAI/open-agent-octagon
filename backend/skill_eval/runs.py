@@ -54,12 +54,20 @@ class RunService(SkillService):
             run['note']=dict(note) if note else {'text':'','revision':0,'updated_at':None}
             run['skill']=self._skill(c,run['skill_id'])
             run['experiment']=self._row(c,'SELECT * FROM skill_eval_experiments WHERE id=?',(run['experiment_id'],))
-            run['chat_replies']=[dict(row) for row in c.execute('''SELECT e.event_id,e.seq,
-                json_extract(e.payload_json,'$.body.output') AS text,g.triggering_message_id AS message_id
+            reply_rows=c.execute('''SELECT e.event_id,e.seq,
+                COALESCE(NULLIF(json_extract(e.payload_json,'$.body.output'),''),
+                  (SELECT json_extract(r.payload_json,'$.body.payload.content')
+                   FROM skill_eval_events r
+                   WHERE r.run_id=e.run_id AND r.type='llm:response:done'
+                     AND r.seq>COALESCE((SELECT max(p.seq) FROM skill_eval_events p WHERE p.run_id=e.run_id AND p.type='chat:end' AND p.seq<e.seq),0)
+                     AND json_extract(r.payload_json,'$.loop_name')='root'
+                     AND json_extract(r.payload_json,'$.body.payload.role')='assistant'
+                     AND json_extract(r.payload_json,'$.body.payload.content') IS NOT NULL
+                   ORDER BY r.seq DESC LIMIT 1)) AS text,g.triggering_message_id AS message_id
                 FROM skill_eval_events e LEFT JOIN skill_eval_generations g
                 ON g.run_id=e.run_id AND g.chat_run_id=json_extract(e.payload_json,'$.body.chat_run_id')
-                WHERE e.run_id=? AND e.type='chat:end' AND json_extract(e.payload_json,'$.body.output') IS NOT NULL
-                AND json_extract(e.payload_json,'$.body.output')!='' ORDER BY e.seq''',(id_,))]
+                WHERE e.run_id=? AND e.type='chat:end' ORDER BY e.seq''',(id_,)).fetchall()
+            run['chat_replies']=[dict(row) for row in reply_rows if row['text']]
             run['final_result']=json.loads(run['finalized_result_ref']) if run['finalized_result_ref'] else None
             return run
 
