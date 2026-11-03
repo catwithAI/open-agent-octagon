@@ -199,15 +199,16 @@ def parse_package(filename: str, data: bytes, store: Store, limits: Limits | Non
             encoding = None
         entries.append(Entry(uuid.uuid4().hex, path, digest(value), len(value), mode, encoding))
     validate_tree(entries)
-    for _, value, _ in raw:
-        store.put_blob(value)
+    # The entries above already carry digests for every byte we just validated.
+    # Batch the writes and trust that verification when publishing the manifest.
+    store.put_blobs([value for _, value, _ in raw])
     hash_ = content_hash(entries)
     # ZIP comments are untrusted hints and are only used with a matching fingerprint.
     if not isinstance(suggestion, dict) or suggestion.get('content_hash') != hash_:
         suggestion = {}
     if suggestion.get('name') is not None:key(suggestion['name'])
     if suggestion.get('version') is not None and not isinstance(suggestion['version'],str):raise ValueError('export version hint must be a string')
-    return Package(name, version, entries, store.put_manifest(entries), hash_, candidates, suggestion)
+    return Package(name, version, entries, store.put_manifest(entries, verify=False), hash_, candidates, suggestion)
 
 
 def validate_skill(entries: list[Entry], store: Store) -> None:

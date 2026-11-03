@@ -2,7 +2,7 @@ import dataclasses
 
 import pytest
 
-from backend.skill_eval.storage import Entry, Store, content_hash, safe_path
+from backend.skill_eval.storage import Entry, Store, content_hash, digest, safe_path
 
 
 @pytest.mark.parametrize('path', ['../a','a/../b','/a','C:/a','a\\b','a//b','a/./b','a/','\x00x'])
@@ -27,6 +27,27 @@ def test_blob_manifest_hash_and_immutable_bytes(tmp_path):
     assert store.read_blob(blob) == b'old'
     with pytest.raises(ValueError):
         store.read_blob('../../a')
+
+
+def test_bulk_blob_publication_dedupes_and_syncs_each_directory_once(tmp_path, monkeypatch):
+    store=Store(tmp_path);synced=[]
+    monkeypatch.setattr(store,'_fsync_dir',lambda path:synced.append(path))
+    values=[b'alpha',b'alpha',b'beta',b'gamma']
+    store.put_blobs(values)
+    hashes={digest(value) for value in values}
+    assert {store.read_blob(hash_) for hash_ in hashes}==set(values)
+    directories={store.blob_path(hash_).parent for hash_ in hashes}
+    assert sorted(synced)==sorted(directories)
+
+
+def test_manifest_can_skip_reverification_after_a_trusted_batch(tmp_path, monkeypatch):
+    store=Store(tmp_path);hash_=digest(b'body')
+    store.put_blobs([b'body'])
+    entry=Entry('a','SKILL.md',hash_,4,0o644,'utf-8')
+    monkeypatch.setattr(store,'read_blob',lambda _: (_ for _ in ()).throw(AssertionError('must not verify')))
+    assert store.put_manifest([entry],verify=False)
+    with pytest.raises(AssertionError):
+        store.put_manifest([entry])
 
 
 def test_interrupted_publication_does_not_publish_partial_object(tmp_path, monkeypatch):

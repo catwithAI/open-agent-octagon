@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import fcntl
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from functools import wraps
 
@@ -189,11 +190,20 @@ class Store:
             raise ValueError('storage integrity: hash mismatch')
         return data
 
-    def _publish(self, path: Path, data: bytes, expected: str) -> None:
+    @staticmethod
+    def _fsync_dir(path: Path) -> None:
+        directory_fd = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+
+    def _publish_file(self, path: Path, data: bytes, expected: str) -> bool:
+        """Publish one object without syncing its directory. Returns True on write."""
         path.parent.mkdir(parents=True, exist_ok=True)
         if path.exists():
             self._read_checked(path, expected)
-            return
+            return False
         fd, temporary = tempfile.mkstemp(suffix='.tmp', dir=path.parent)
         try:
             with os.fdopen(fd, 'wb') as stream:
@@ -202,13 +212,13 @@ class Store:
                 os.fsync(stream.fileno())
                 os.fchmod(stream.fileno(), 0o444)
             os.replace(temporary, path)
-            directory_fd = os.open(path.parent, os.O_RDONLY)
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
         finally:
             Path(temporary).unlink(missing_ok=True)
+        return True
+
+    def _publish(self, path: Path, data: bytes, expected: str) -> None:
+        if self._publish_file(path, data, expected):
+            self._fsync_dir(path.parent)
 
     @guarded
     def put_blob(self, data: bytes) -> str:
@@ -216,15 +226,34 @@ class Store:
         self._publish(self.blob_path(hash_), data, hash_)
         return hash_
 
+    @guarded
+    def put_blobs(self, values: list[bytes]) -> None:
+        """Publish many blobs in parallel, syncing each hash-prefix dir once."""
+        unique: dict[str, bytes] = {}
+        for value in values:
+            unique.setdefault(digest(value), value)
+
+        def publish(item: tuple[str, bytes]) -> Path | None:
+            hash_, value = item
+            path = self.blob_path(hash_)
+            return path.parent if self._publish_file(path, value, hash_) else None
+
+        workers = min(8, len(unique)) or 1
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            written = {directory for directory in pool.map(publish, unique.items()) if directory}
+        for directory in sorted(written):
+            self._fsync_dir(directory)
+
     def read_blob(self, hash_: str) -> bytes:
         return self._read_checked(self.blob_path(hash_), hash_)
 
     @guarded
-    def put_manifest(self, entries: list[Entry]) -> str:
+    def put_manifest(self, entries: list[Entry], *, verify: bool = True) -> str:
         validate_tree(entries)
-        for entry in entries:
-            if len(self.read_blob(entry.hash)) != entry.size:
-                raise ValueError('manifest size mismatch')
+        if verify:
+            for entry in entries:
+                if len(self.read_blob(entry.hash)) != entry.size:
+                    raise ValueError('manifest size mismatch')
         data = canonical([asdict(e) for e in sorted(entries, key=lambda e: e.path)])
         ref = digest(data)
         self._publish(self.root / 'manifests' / f'{ref}.json', data, ref)
