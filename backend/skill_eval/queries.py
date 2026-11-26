@@ -26,13 +26,24 @@ def cursor_decode(value):
 class Queries:
     def __init__(self,service):self.service=service;self.repo=service.repo;self.store=service.store
 
-    def history(self,*,skill_id=None,experiment_id=None,release_id=None,group_key=None,status=None,model=None,created_after=None,created_before=None,limit=50,cursor=None):
+    def history(self,*,skill_id=None,experiment_id=None,release_id=None,group_key=None,status=None,model=None,model_like=None,agent=None,provider=None,created_after=None,created_before=None,limit=50,cursor=None):
         if not 1<=limit<=100:raise ValueError('History limit must be 1–100')
         where=['s.scope_id=?'];params=[self.service.scope]
-        for column,value in [('r.skill_id',skill_id),('r.experiment_id',experiment_id),('r.source_release_id',release_id),('r.group_key',group_key),('r.run_status',status)]:
+        for column,value in [('r.skill_id',skill_id),('r.experiment_id',experiment_id),('r.source_release_id',release_id),('r.run_status',status),('r.agent',agent)]:
             if value is not None:where.append(column+'=?');params.append(value)
+        if group_key is not None:
+            keys=group_key if isinstance(group_key,(list,tuple)) else [group_key]
+            keys=[key for key in keys if key]
+            if keys:
+                if len(keys)==1:where.append('r.group_key=?');params.append(keys[0])
+                else:where.append('r.group_key IN ('+','.join('?' for _ in keys)+')');params.extend(keys)
+        if provider:
+            where.append("coalesce(nullif(r.resolved_provider,''),r.requested_provider)=?");params.append(provider)
         if model:
             where.append('(r.resolved_model=? OR r.requested_model=?)');params.extend([model,model])
+        if model_like:
+            needle='%'+model_like.casefold()+'%'
+            where.append("(lower(r.requested_model) LIKE ? OR lower(coalesce(r.resolved_model,'')) LIKE ?)");params.extend([needle,needle])
         for column,value,operator in [('r.created_at',created_after,'>='),('r.created_at',created_before,'<=')]:
             if value:
                 try:
@@ -54,20 +65,37 @@ class Queries:
         items=rows[:limit];last=items[-1] if items else None
         return {'items':items,'next_cursor':cursor_encode({'time':last['created_at'],'id':last['id']}) if len(rows)>limit and last else None}
 
-    def groups(self,*,limit=50,cursor=None):
+    def groups(self,*,limit=50,cursor=None,agent=None,provider=None,model_like=None,status=None,created_after=None,created_before=None):
         if not 1<=limit<=100:raise ValueError('Group limit must be 1–100')
         previous=cursor_decode(cursor) if cursor else None
         with self.repo.connection() as c:
             boundary=previous.get('boundary') if previous else c.execute('SELECT coalesce(max(rowid),0) FROM skill_eval_runs').fetchone()[0]
             if not isinstance(boundary,int):raise ValueError('Invalid group cursor')
             params=[self.service.scope,boundary]
+            filters=['s.scope_id=?','r.rowid<=?']
+            if agent:
+                filters.append('r.agent=?');params.append(agent)
+            if provider:
+                filters.append("coalesce(nullif(r.resolved_provider,''),r.requested_provider)=?");params.append(provider)
+            if status:
+                filters.append('r.run_status=?');params.append(status)
+            if model_like:
+                needle='%'+model_like.casefold()+'%'
+                filters.append("(lower(r.requested_model) LIKE ? OR lower(coalesce(r.resolved_model,'')) LIKE ?)");params.extend([needle,needle])
+            for column,value,operator in [('r.created_at',created_after,'>='),('r.created_at',created_before,'<=')]:
+                if value:
+                    try:
+                        instant=datetime.fromisoformat(value.replace('Z','+00:00'))
+                        if instant.tzinfo is None:raise ValueError('Timezone required')
+                    except (ValueError,AttributeError):raise ValueError('Invalid history timestamp; use ISO 8601 with timezone')
+                    filters.append(column+operator+'?');params.append(instant.astimezone(timezone.utc).isoformat())
             having=''
             if previous:
                 if not isinstance(previous.get('time'),str) or not isinstance(previous.get('key'),str):raise ValueError('Invalid group cursor')
                 having=' HAVING (max(r.created_at),r.group_key)<(?,?)';params.extend([previous['time'],previous['key']])
             sql='''SELECT r.group_key,r.agent,r.requested_model,r.requested_provider,r.resolved_model,r.resolved_provider,
                 count(*) AS run_count,max(r.created_at) AS last_run_at FROM skill_eval_runs r JOIN skill_eval_skills s ON s.id=r.skill_id
-                WHERE s.scope_id=? AND r.rowid<=? GROUP BY r.group_key'''+having+' ORDER BY last_run_at DESC,r.group_key DESC LIMIT ?'
+                WHERE '''+' AND '.join(filters)+''' GROUP BY r.group_key'''+having+' ORDER BY last_run_at DESC,r.group_key DESC LIMIT ?'
             rows=[dict(row) for row in c.execute(sql,(*params,limit+1))]
         items=rows[:limit];last=items[-1] if items else None
         return {'items':items,'next_cursor':cursor_encode({'boundary':boundary,'time':last['last_run_at'],'key':last['group_key']}) if len(rows)>limit and last else None}

@@ -6,7 +6,7 @@ import json
 from typing import Any,Literal
 from urllib.parse import quote
 
-from fastapi import APIRouter,FastAPI,Header,HTTPException,Request
+from fastapi import APIRouter,FastAPI,Header,HTTPException,Query,Request
 from fastapi.responses import Response,StreamingResponse
 from pydantic import Field
 from starlette.concurrency import run_in_threadpool
@@ -207,11 +207,12 @@ def register_routes(app:FastAPI,service,capabilities):
     query=Queries(service);reruns=Reruns(service)
 
     @router.get('/runs')
-    def history(skill_id:str|None=None,experiment_id:str|None=None,release_id:str|None=None,group_key:str|None=None,status:str|None=None,model:str|None=None,created_after:str|None=None,created_before:str|None=None,limit:int=50,cursor:str|None=None):
-        return call(query.history,skill_id=skill_id,experiment_id=experiment_id,release_id=release_id,group_key=group_key,status=status,model=model,created_after=created_after,created_before=created_before,limit=limit,cursor=cursor)
+    def history(skill_id:str|None=None,experiment_id:str|None=None,release_id:str|None=None,group_key:list[str]|None=Query(default=None),status:str|None=None,model:str|None=None,model_like:str|None=None,agent:str|None=None,provider:str|None=None,created_after:str|None=None,created_before:str|None=None,limit:int=50,cursor:str|None=None):
+        return call(query.history,skill_id=skill_id,experiment_id=experiment_id,release_id=release_id,group_key=group_key,status=status,model=model,model_like=model_like,agent=agent,provider=provider,created_after=created_after,created_before=created_before,limit=limit,cursor=cursor)
 
     @router.get('/record-groups')
-    def groups(limit:int=50,cursor:str|None=None):return call(query.groups,limit=limit,cursor=cursor)
+    def groups(limit:int=50,cursor:str|None=None,agent:str|None=None,provider:str|None=None,model_like:str|None=None,status:str|None=None,created_after:str|None=None,created_before:str|None=None):
+        return call(query.groups,limit=limit,cursor=cursor,agent=agent,provider=provider,model_like=model_like,status=status,created_after=created_after,created_before=created_before)
 
     @router.post('/runs/{id_}/drafts',status_code=201)
     def refine(id_:str):return call(service.create_run_draft,id_)
