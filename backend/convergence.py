@@ -34,6 +34,16 @@ _OPEN_LEGACY = ("queued", "starting_blade_session", "running", "scoring")
 _OPEN_EXECUTION = ("queued", "running")
 _OPEN_SCORING = ("not_ready", "queued", "running")
 
+# scoring_status 终态 → scoring_jobs.status 终态映射。
+# 同步把 queued/running 的 scoring_jobs 一起收口，避免重启恢复把已过期的
+# scoring job 重新拉起复活。
+_TERMINAL_SCORING_JOB_STATUS = {
+    "timed_out": "timed_out",
+    "failed": "failed",
+    "cancelled": "cancelled",
+    "skipped": "cancelled",
+}
+
 
 def _placeholders(values: Iterable[str]) -> str:
     return ",".join("?" for _ in values)
@@ -105,6 +115,14 @@ def converge_attempts(
                     "COALESCE(scoring_ended_at,?),scoring_error_code=? WHERE id=?",
                     (score_status, now, error_code, row["id"]),
                 )
+                job_status = _TERMINAL_SCORING_JOB_STATUS.get(score_status)
+                if job_status is not None:
+                    conn.execute(
+                        "UPDATE scoring_jobs SET status=?,ended_at=COALESCE(ended_at,?),"
+                        "error_code=?,error_message=? "
+                        "WHERE attempt_id=? AND status IN ('queued','running')",
+                        (job_status, now, error_code, error_message, row["id"]),
+                    )
             touched.append(row["id"])
             if row["run_id"]:
                 run_ids.add(row["run_id"])
@@ -114,6 +132,8 @@ def converge_attempts(
     # project_cell_for_run → rebuild_group_projection → _project_experiment。
     for attempt_id in touched:
         _reproject(db_path, attempt_id)
+    for run_id in run_ids:
+        runtime_state.notify_run_update(run_id)
     if touched:
         logger.warning(
             "converged %d attempt(s) → %s (%s)", len(touched), status, error_code
@@ -229,6 +249,49 @@ def cancel_attempt_tasks(attempt_ids: list[str]) -> int:
             # 要么马上会随 loop 一起结束。DB 收敛仍然继续。
             logger.warning(
                 "cancel_attempt_tasks: 无可用 loop，跳过 attempt=%s", attempt_id
+            )
+            continue
+        cancelled += 1
+    return cancelled
+
+
+def cancel_scoring_tasks(attempt_ids: Iterable[str]) -> int:
+    """按 **attempt 粒度**发起评分协程取消，释放 scoring_semaphore 槽位。
+
+    镜像 :func:`cancel_attempt_tasks`：sweeper 跑在工作线程里，跨线程通过
+    ``loop.call_soon_threadsafe(task.cancel)`` 调度取消。优先取 ``task.get_loop()``
+    （即使 ``state.loop`` 已被执行侧清空也能准确回到评分协程所属 loop），
+    无该属性时回落到 ``state.loop``。
+    """
+    try:
+        state = runtime_state.get()
+    except RuntimeError:
+        return 0
+
+    try:
+        current_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        current_loop = None
+
+    cancelled = 0
+    for attempt_id in attempt_ids:
+        task = state.scoring_tasks.get(attempt_id)
+        if task is None or task.done():
+            continue
+        get_loop = getattr(task, "get_loop", None)
+        task_loop = get_loop() if callable(get_loop) else state.loop
+        if task_loop is None:
+            task_loop = state.loop
+        if current_loop is not None and current_loop is task_loop:
+            task.cancel()
+        elif task_loop is not None and not task_loop.is_closed():
+            try:
+                task_loop.call_soon_threadsafe(task.cancel)
+            except RuntimeError:
+                continue
+        else:
+            logger.warning(
+                "cancel_scoring_tasks: 无可用 loop，跳过 attempt=%s", attempt_id
             )
             continue
         cancelled += 1

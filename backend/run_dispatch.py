@@ -461,7 +461,7 @@ async def dispatch(
     task_context = frozen_input.context
     if frozen_input.timeout_seconds is not None:
         timeout_seconds = frozen_input.timeout_seconds
-    _mark_running(state.db_path, attempt_id, timeout_seconds)
+    await asyncio.to_thread(_mark_running, state.db_path, attempt_id, timeout_seconds)
     _start_attempt_heartbeat(state.db_path, attempt_id, timeout_seconds)
     env = state.envs.get(env_name)
     if env is None:
@@ -470,7 +470,11 @@ async def dispatch(
         _finalize_no_score(
             db_path=state.db_path,
             attempt_id=attempt_id,
-            status="blade_service_unavailable",
+            status=(
+                "blade_service_unavailable"
+                if agent_name == "blade-agent"
+                else "cli_error"
+            ),
             error_code="env_not_loaded",
             error_message=f"env not loaded: {env_name}",
             pass_threshold=60,
@@ -770,14 +774,25 @@ async def dispatch(
         )
 
         # 把 env scripts 拷贝到 workspace（防止 agent 修改源文件）
-        _copy_env_scripts(state.data_path, attempt_id, env)
-        _copy_agent_materials(state.data_path, attempt_id, env, task_context)
+        await asyncio.to_thread(_copy_env_scripts, state.data_path, attempt_id, env)
+        await asyncio.to_thread(
+            _copy_agent_materials, state.data_path, attempt_id, env, task_context
+        )
         # 把 uploaded_files 落到 workspace；物料缺失或越界直接判失败，
         # 不能让 agent 拿着"你有一段视频"的 prompt 在空 workspace 里瞎找
-        _copy_uploads(state.data_path, attempt_id, task_context, env_name=env_name, env=env)
+        await asyncio.to_thread(
+            _copy_uploads,
+            state.data_path,
+            attempt_id,
+            task_context,
+            env_name=env_name,
+            env=env,
+        )
         # HITL 场景：把 task 预置的批复策略落到 attempt 目录，供
         # request_human_approval 工具读取。决策由 task 固定，不由 agent 代拟。
-        _seed_approval_policy(state.data_path, attempt_id, task_context)
+        await asyncio.to_thread(
+            _seed_approval_policy, state.data_path, attempt_id, task_context
+        )
         # 把 task_context 里的路径简化为文件名，agent 通过 skill 工具在 workspace 下访问
         _normalize_upload_paths(task)
 
@@ -829,7 +844,11 @@ async def dispatch(
             result = _finalize_no_score(
                 db_path=state.db_path,
                 attempt_id=attempt_id,
-                status="blade_service_unavailable",
+                status=(
+                    "blade_service_unavailable"
+                    if agent_name == "blade-agent"
+                    else "cli_error"
+                ),
                 error_code="dispatch_crashed",
                 error_message=str(exc),
                 pass_threshold=60,
@@ -846,30 +865,53 @@ def _start_attempt_heartbeat(
 ) -> None:
     """启动轻量控制面 heartbeat，不侵入 adapter 主执行循环。"""
     async def _loop() -> None:
-        await append_attempt_observation(
-            db_path, attempt_id, stage="execution", event_type="attempt.started",
-            payload={"message": "agent execution started", "timeout_seconds": timeout_seconds},
-            heartbeat=True,
-        )
-        while True:
-            await asyncio.sleep(5.0)
-            row = await asyncio.to_thread(_attempt_heartbeat_state, db_path, attempt_id)
-            if row is None or row["execution_status"] not in {"queued", "running"}:
-                return
+        try:
             await append_attempt_observation(
-                db_path, attempt_id, stage="execution", event_type="attempt.heartbeat",
-                payload={
-                    "message": "agent execution active",
-                    "execution_status": row["execution_status"],
-                    "deadline_at": row["execution_deadline_at"],
-                },
+                db_path, attempt_id, stage="execution", event_type="attempt.started",
+                payload={"message": "agent execution started", "timeout_seconds": timeout_seconds},
                 heartbeat=True,
             )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning(
+                "attempt heartbeat initial observation failed attempt=%s",
+                attempt_id,
+                exc_info=True,
+            )
+        while True:
+            await asyncio.sleep(5.0)
+            try:
+                row = await asyncio.to_thread(_attempt_heartbeat_state, db_path, attempt_id)
+                if row is None or row["execution_status"] not in {"queued", "running"}:
+                    return
+                await append_attempt_observation(
+                    db_path, attempt_id, stage="execution", event_type="attempt.heartbeat",
+                    payload={
+                        "message": "agent execution active",
+                        "execution_status": row["execution_status"],
+                        "deadline_at": row["execution_deadline_at"],
+                    },
+                    heartbeat=True,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning(
+                    "attempt heartbeat tick failed (continuing) attempt=%s",
+                    attempt_id,
+                    exc_info=True,
+                )
 
     try:
-        asyncio.create_task(_loop(), name=f"attempt-heartbeat:{attempt_id}")
+        task = asyncio.create_task(_loop(), name=f"attempt-heartbeat:{attempt_id}")
     except RuntimeError:
         logger.debug("attempt heartbeat skipped without running event loop: %s", attempt_id)
+        return
+    try:
+        runtime_state.track_background_task(f"heartbeat:{attempt_id}", task)
+    except RuntimeError:
+        pass
 
 
 def _attempt_heartbeat_state(db_path: Path, attempt_id: str) -> dict[str, Any] | None:
@@ -894,7 +936,13 @@ def _mark_running(db_path: Path, attempt_id: str, timeout_seconds: int | None = 
     deadline = None
     if timeout_seconds and timeout_seconds > 0:
         deadline = _iso_after(now, timeout_seconds)
+    run_id: str | None = None
     with _open_sync(db_path) as conn:
+        row = conn.execute(
+            "SELECT run_id FROM attempts WHERE id=?", (attempt_id,)
+        ).fetchone()
+        if row and row[0]:
+            run_id = str(row[0])
         conn.execute(
             "UPDATE attempts SET status='running', started_at=?,"
             "execution_status='running',execution_started_at=?,"
@@ -910,6 +958,8 @@ def _mark_running(db_path: Path, attempt_id: str, timeout_seconds: int | None = 
             (now, attempt_id),
         )
         conn.commit()
+    if run_id:
+        runtime_state.notify_run_update(run_id)
 
 
 def _schedule_cost_checkpoint(
@@ -948,7 +998,11 @@ def _schedule_cost_checkpoint(
         except Exception:
             logger.exception("cost checkpoint failed run=%s", run_id)
 
-    loop.create_task(_checkpoint())
+    task = loop.create_task(_checkpoint(), name=f"cost-checkpoint:{run_id}")
+    try:
+        runtime_state.track_background_task(f"cost-checkpoint:{run_id}", task)
+    except RuntimeError:
+        pass
 
 
 def _run_id_of(db_path: Path, attempt_id: str) -> str | None:
@@ -1027,6 +1081,7 @@ def _refresh_run_status(db_path: Path, attempt_id: str) -> None:
         project_cell_for_run(db_path, run_id)
     except Exception:
         logger.exception("failed to project experiment cell for run=%s", run_id)
+    runtime_state.notify_run_update(run_id)
 
 
 def _copy_env_scripts(data_path: Path, attempt_id: str, env: Any) -> None:
@@ -1379,4 +1434,11 @@ def _schedule_attempt_settle(db_path: Path, attempt_id: str) -> None:
         loop = asyncio.get_running_loop()
     except RuntimeError:
         return
-    loop.create_task(_settle_attempt_cost_key(state, attempt_id))
+    task = loop.create_task(
+        _settle_attempt_cost_key(state, attempt_id),
+        name=f"cost-settle:{attempt_id}",
+    )
+    try:
+        runtime_state.track_background_task(f"cost-settle:{attempt_id}", task)
+    except RuntimeError:
+        pass

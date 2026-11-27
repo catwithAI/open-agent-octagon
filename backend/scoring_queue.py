@@ -72,7 +72,7 @@ def _execution_status(adapter_status: str) -> str:
     return "failed"
 
 
-def enqueue_scoring_job(
+def _persist_scoring_job(
     *,
     attempt_id: str,
     adapter_status: str,
@@ -80,18 +80,10 @@ def enqueue_scoring_job(
     adapter_error_message: str | None,
     stats: dict[str, Any],
     security_meta: dict[str, Any],
-    capacity: int,
     execution_ended_at: str | None = None,
     rejudge_prev: dict[str, Any] | None = None,
-) -> str:
-    """Atomically persist execution output and its scoring job, then schedule it.
-
-    ``execution_ended_at`` 仅供重评传入原执行结束时间：否则 UPDATE 会把
-    execution_ended_at 写成重评时刻，误标成"重评瞬间刚结束执行"。
-
-    ``rejudge_prev`` 仅供重评传入原分数/状态：失败路径据此恢复，否则一次
-    失败的重评会永久摧毁最后一次成功评分（审查 #1）。
-    """
+) -> tuple[str, str | None]:
+    """Create the frozen scoring snapshot and atomically persist attempt + scoring job."""
     state = runtime_state.get()
     snapshot = create_scoring_snapshot(
         data_path=state.data_path,
@@ -124,11 +116,14 @@ def enqueue_scoring_job(
     from .adapters.blade_service import artifact_recovery_failed
 
     recovery_failed = adapter_status == "completed" and artifact_recovery_failed(refs)
+    run_id: str | None = None
     with _open_sync(state.db_path) as conn:
         env_row = conn.execute(
-            "SELECT env_name FROM attempts WHERE id=?", (attempt_id,)
+            "SELECT env_name, run_id FROM attempts WHERE id=?", (attempt_id,)
         ).fetchone()
         env = state.envs.get(str(env_row[0])) if env_row else None
+        if env_row and env_row[1]:
+            run_id = str(env_row[1])
         scorer_version = _scorer_version_for_env(env)
         conn.execute(
             "UPDATE attempts SET status='scoring',execution_status=?,"
@@ -170,7 +165,74 @@ def enqueue_scoring_job(
             ),
         )
         conn.commit()
-    schedule_scoring_job(job_id, capacity=capacity)
+    return job_id, run_id
+
+
+def enqueue_scoring_job(
+    *,
+    attempt_id: str,
+    adapter_status: str,
+    adapter_error_code: str | None,
+    adapter_error_message: str | None,
+    stats: dict[str, Any],
+    security_meta: dict[str, Any],
+    capacity: int,
+    execution_ended_at: str | None = None,
+    rejudge_prev: dict[str, Any] | None = None,
+) -> str:
+    """Atomically persist execution output and its scoring job, then schedule it.
+
+    ``execution_ended_at`` 仅供重评传入原执行结束时间：否则 UPDATE 会把
+    execution_ended_at 写成重评时刻，误标成"重评瞬间刚结束执行"。
+
+    ``rejudge_prev`` 仅供重评传入原分数/状态：失败路径据此恢复，否则一次
+    失败的重评会永久摧毁最后一次成功评分（审查 #1）。
+    """
+    job_id, run_id = _persist_scoring_job(
+        attempt_id=attempt_id,
+        adapter_status=adapter_status,
+        adapter_error_code=adapter_error_code,
+        adapter_error_message=adapter_error_message,
+        stats=stats,
+        security_meta=security_meta,
+        execution_ended_at=execution_ended_at,
+        rejudge_prev=rejudge_prev,
+    )
+    if run_id:
+        runtime_state.notify_run_update(run_id)
+    schedule_scoring_job(job_id, capacity=capacity, attempt_id=attempt_id)
+    return job_id
+
+
+async def enqueue_scoring_job_async(
+    *,
+    attempt_id: str,
+    adapter_status: str,
+    adapter_error_code: str | None,
+    adapter_error_message: str | None,
+    stats: dict[str, Any],
+    security_meta: dict[str, Any],
+    capacity: int,
+    execution_ended_at: str | None = None,
+    rejudge_prev: dict[str, Any] | None = None,
+) -> str:
+    """Offload heavy scoring snapshot creation + DB persistence to a worker thread,
+    then schedule the scoring job on the running event loop.
+    """
+    job_id, run_id = await asyncio.to_thread(
+        _persist_scoring_job,
+        attempt_id=attempt_id,
+        adapter_status=adapter_status,
+        adapter_error_code=adapter_error_code,
+        adapter_error_message=adapter_error_message,
+        stats=stats,
+        security_meta=security_meta,
+        execution_ended_at=execution_ended_at,
+        rejudge_prev=rejudge_prev,
+    )
+    if run_id:
+        runtime_state.notify_run_update(run_id)
+    schedule_scoring_job(job_id, capacity=capacity, attempt_id=attempt_id)
     return job_id
 
 
@@ -316,7 +378,16 @@ def _claim_job(
             (now, deadline, job_id),
         )
         row = conn.execute("SELECT * FROM scoring_jobs WHERE id=?", (job_id,)).fetchone()
+        run_row = (
+            conn.execute(
+                "SELECT run_id FROM attempts WHERE id=?", (row["attempt_id"],)
+            ).fetchone()
+            if row is not None
+            else None
+        )
         conn.commit()
+        if run_row and run_row[0]:
+            runtime_state.notify_run_update(str(run_row[0]))
         return row
 
 
@@ -421,6 +492,7 @@ def _finish_failure(
     # 取消不是任何一类故障，用独立值让它不落进 agent/scoring/infrastructure
     # 任何一个失败桶。
     failure_kind = "cancelled" if status == "cancelled" else "scoring"
+    run_id: str | None = None
     with _open_sync(db_path) as conn:
         row = conn.execute(
             "SELECT attempt_id, scorer_config_json FROM scoring_jobs WHERE id=?",
@@ -429,6 +501,11 @@ def _finish_failure(
         if row is None:
             return
         attempt_id = row[0]
+        run_row = conn.execute(
+            "SELECT run_id FROM attempts WHERE id=?", (attempt_id,)
+        ).fetchone()
+        if run_row and run_row[0]:
+            run_id = str(run_row[0])
         # rejudge 失败恢复：job config 里带 rejudge_prev 时，score_total 回退到
         # rejudge 前最后一次成功评分（审查 #1）。否则 attempt 永久 NULL 而
         # leaderboard（outbox 旧 revision）仍显示旧分，两边不一致且不可恢复。
@@ -454,6 +531,8 @@ def _finish_failure(
             ),
         )
         conn.commit()
+    if run_id:
+        runtime_state.notify_run_update(run_id)
 
 
 async def _execute_job(
@@ -473,6 +552,11 @@ async def _execute_job(
         if job is None:
             return
         attempt_id = str(job["attempt_id"])
+        current_task = asyncio.current_task()
+        if current_task is not None:
+            if state.loop is None:
+                state.loop = asyncio.get_running_loop()
+            state.scoring_tasks[attempt_id] = current_task
         # 硬上限从**获得评分槽**起算：排队不消耗评分预算，与
         # 「排队不消耗耐心」同理。
         scoring_started = time.monotonic()
@@ -744,7 +828,10 @@ async def _execute_job(
             except Exception:
                 logger.exception("leader outbox notification failed attempt=%s", attempt_id)
             _refresh_run_status(state.db_path, attempt_id)
+            if judge_run_id:
+                runtime_state.notify_run_update(judge_run_id)
         except asyncio.CancelledError:
+            _invoke_scorer_cancel_hook(state, attempt_id)
             if _job_cancelled(state.db_path, job_id):
                 _finish_failure(
                     state.db_path,
@@ -838,23 +925,61 @@ async def _execute_job(
             from .run_dispatch import _refresh_run_status
 
             _refresh_run_status(state.db_path, attempt_id)
+        finally:
+            if (
+                current_task is not None
+                and state.scoring_tasks.get(attempt_id) is current_task
+            ):
+                state.scoring_tasks.pop(attempt_id, None)
 
 
-def schedule_scoring_job(job_id: str, *, capacity: int) -> bool:
+def _attempt_id_of_job(db_path: Path, job_id: str) -> str | None:
+    try:
+        with _open_sync(db_path) as conn:
+            row = conn.execute(
+                "SELECT attempt_id FROM scoring_jobs WHERE id=?", (job_id,)
+            ).fetchone()
+        return str(row[0]) if row and row[0] else None
+    except Exception:
+        return None
+
+
+def schedule_scoring_job(
+    job_id: str, *, capacity: int, attempt_id: str | None = None
+) -> bool:
     state = runtime_state.get()
-    key = f"scoring:{job_id}"
-    if any(not task.done() for task in state.active_tasks.get(key, [])):
+    resolved_attempt_id = attempt_id or _attempt_id_of_job(state.db_path, job_id)
+    group = (
+        f"scoring:{resolved_attempt_id}"
+        if resolved_attempt_id
+        else f"scoring:{job_id}"
+    )
+    if any(not task.done() for task in state.active_tasks.get(group, [])):
         return False
+    if resolved_attempt_id:
+        existing = state.scoring_tasks.get(resolved_attempt_id)
+        if existing is not None and not existing.done():
+            return False
 
     async def run() -> None:
         try:
             await _execute_job(job_id, capacity=capacity)
         finally:
-            state.active_tasks.pop(key, None)
+            if (
+                resolved_attempt_id
+                and state.scoring_tasks.get(resolved_attempt_id) is asyncio.current_task()
+            ):
+                state.scoring_tasks.pop(resolved_attempt_id, None)
 
-    state.active_tasks[key] = [
-        asyncio.create_task(run(), name=f"scoring-job:{job_id}")
-    ]
+    if state.loop is None:
+        try:
+            state.loop = asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+    task = asyncio.create_task(run(), name=f"scoring-job:{job_id}")
+    if resolved_attempt_id:
+        state.scoring_tasks[resolved_attempt_id] = task
+    runtime_state.track_background_task(group, task)
     return True
 
 
@@ -870,12 +995,16 @@ def schedule_startup_scoring_recovery(*, capacity: int) -> int:
             "WHERE scoring_status='running'"
         )
         rows = conn.execute(
-            "SELECT id FROM scoring_jobs WHERE status='queued' "
+            "SELECT id, attempt_id FROM scoring_jobs WHERE status='queued' "
             "AND cancel_requested_at IS NULL ORDER BY created_at,id"
         ).fetchall()
         conn.commit()
-    for (job_id,) in rows:
-        schedule_scoring_job(str(job_id), capacity=capacity)
+    for job_id, attempt_id in rows:
+        schedule_scoring_job(
+            str(job_id),
+            capacity=capacity,
+            attempt_id=str(attempt_id) if attempt_id else None,
+        )
     return len(rows)
 
 
@@ -925,10 +1054,16 @@ def cancel_scoring_for_runs(run_ids: list[str]) -> int:
                 cancel_hook(str(attempt_id))
             except Exception:
                 logger.exception("scorer cancellation hook failed attempt=%s", attempt_id)
-    for job_id in job_ids:
-        for task in state.active_tasks.get(f"scoring:{job_id}", []):
-            if not task.done():
-                task.cancel()
+    for job_id, attempt_id, _env_name in rows:
+        scoring_task = state.scoring_tasks.get(str(attempt_id))
+        if scoring_task is not None and not scoring_task.done():
+            scoring_task.cancel()
+        for key in (f"scoring:{attempt_id}", f"scoring:{job_id}"):
+            for task in state.active_tasks.get(key, []):
+                if not task.done():
+                    task.cancel()
+    for run_id in run_ids:
+        runtime_state.notify_run_update(run_id)
     return len(job_ids)
 
 

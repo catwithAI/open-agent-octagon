@@ -353,10 +353,20 @@ async def _run_attempt_inner(
             adapter_result = await adapter.run()
     except Exception as exc:
         logger.exception("adapter.run() 崩溃")
+        failed_attempt_id = getattr(adapter, "attempt_id", "<unknown>")
+        agent_name = (
+            _agent_name_of_attempt(state.db_path, failed_attempt_id)
+            or getattr(adapter, "agent_name", None)
+        )
+        crash_status = (
+            "blade_service_unavailable"
+            if agent_name == "blade-agent"
+            else "cli_error"
+        )
         return _finalize_no_score(
             db_path=state.db_path,
-            attempt_id=getattr(adapter, "attempt_id", "<unknown>"),
-            status="blade_service_unavailable",
+            attempt_id=failed_attempt_id,
+            status=crash_status,
             error_code="adapter_crashed",
             error_message=str(exc),
             pass_threshold=60,
@@ -512,9 +522,9 @@ async def _run_attempt_inner(
     task_dict = _row_to_task_dict(task_row, frozen_input=frozen_input)
     security_meta = dict(getattr(adapter_result, "security_meta", {}) or {})
     if defer_scoring:
-        from .scoring_queue import enqueue_scoring_job
+        from .scoring_queue import enqueue_scoring_job_async
 
-        enqueue_scoring_job(
+        await enqueue_scoring_job_async(
             attempt_id=attempt_id,
             adapter_status=adapter_status,
             adapter_error_code=getattr(adapter_result, "error_code", None),
@@ -657,6 +667,9 @@ async def _run_attempt_inner(
         # startup or the next scoring transition consumes the durable cursor.
         logger.exception("leader outbox notification failed attempt=%s", attempt_id)
 
+    if attempt_row.get("run_id"):
+        runtime_state.notify_run_update(str(attempt_row["run_id"]))
+
     return RunAttemptResult(
         attempt_id=attempt_id,
         status=final_status,
@@ -690,9 +703,7 @@ def _write_security_columns_sync(
     security_summary: dict | None,
 ) -> None:
     """写执行场合快照列（② locus/permission_mode/workspace_root）+ 安全汇总列。"""
-    import sqlite3
-
-    with sqlite3.connect(db_path) as conn:
+    with _open_sync(db_path) as conn:
         conn.execute(
             "UPDATE attempts SET execution_locus=?, permission_mode=?, "
             "workspace_root=? WHERE id=?",
@@ -766,6 +777,18 @@ def _run_id_of_attempt(db_path: Path, attempt_id: str) -> str | None:
         return None
 
 
+def _agent_name_of_attempt(db_path: Path, attempt_id: str) -> str | None:
+    """attempt → agent_name，用于区分 blade-agent 与本地 CLI agent 的异常归类。"""
+    try:
+        with _open_sync(db_path) as conn:
+            row = conn.execute(
+                "SELECT agent_name FROM attempts WHERE id=?", (attempt_id,)
+            ).fetchone()
+        return str(row[0]) if row and row[0] else None
+    except Exception:
+        return None
+
+
 def _finalize_no_score(
     *,
     db_path: Path,
@@ -817,10 +840,19 @@ def _finalize_no_score(
         "blade_service_unavailable",
         "timeout",
     }
+    terminal_statuses = tuple(sorted(TERMINAL_ATTEMPT_STATUSES))
+    terminal_placeholders = ",".join("?" for _ in terminal_statuses)
+    run_id: str | None = None
+    existing_status: str | None = None
+    updated = 0
     with _open_sync(db_path) as conn:
         current = conn.execute(
-            "SELECT external_refs_json FROM attempts WHERE id=?", (attempt_id,)
+            "SELECT external_refs_json, run_id, status FROM attempts WHERE id=?",
+            (attempt_id,),
         ).fetchone()
+        if current:
+            run_id = str(current[1]) if current[1] else None
+            existing_status = str(current[2]) if current[2] else None
         try:
             stored_refs = json.loads(current[0] or "{}") if current else {}
         except json.JSONDecodeError:
@@ -843,7 +875,9 @@ def _finalize_no_score(
             if status == "scoring_failed"
             else "skipped"
         )
-        conn.execute(
+        # 状态机终态护栏：仅推进仍处于非终态的 attempt，防止竞态协程覆盖
+        # sweeper / stop_run 已落库的 timeout / cancelled 等终态。
+        cursor = conn.execute(
             "UPDATE attempts SET status=?, score_total=NULL, error_code=?, error_message=?,"
             " failure_kind=?, retryable=?,"
             " external_refs_json=?, event_count=?, last_event_at=?,"
@@ -851,7 +885,8 @@ def _finalize_no_score(
             " cost_estimate=?, duration_ms=?, transport_status=?, ended_at=?,"
             " execution_status=?,execution_ended_at=?,execution_error_code=?,"
             " execution_error_message=?,scoring_status=?,scoring_ended_at=?,"
-            " scoring_error_code=?,scoring_error_message=? WHERE id=?",
+            " scoring_error_code=?,scoring_error_message=?"
+            f" WHERE id=? AND status NOT IN ({terminal_placeholders})",
             (
                 status,
                 error_code,
@@ -877,13 +912,33 @@ def _finalize_no_score(
                 error_code if scoring_status == "failed" else None,
                 error_message if scoring_status == "failed" else None,
                 attempt_id,
+                *terminal_statuses,
             ),
         )
+        updated = cursor.rowcount
         # 成本估算：这些 attempt 没走评分，但同样已经花了钱。
         # 与 commit_scoring_result 共用同一 helper，口径一致；与上面的终态
         # UPDATE 同事务，不产生"有终态没成本"的中间态。
-        apply_cost_columns(conn, attempt_id, token_usage=token_usage)
+        if updated:
+            apply_cost_columns(conn, attempt_id, token_usage=token_usage)
         conn.commit()
+    if not updated:
+        logger.info(
+            "_finalize_no_score skipped: attempt=%s already terminal (%s), ignoring %s",
+            attempt_id,
+            existing_status,
+            status,
+        )
+        return RunAttemptResult(
+            attempt_id=attempt_id,
+            status=existing_status or status,
+            score_total=0,
+            pass_threshold=pass_threshold,
+            error_code=error_code,
+            error_message=error_message,
+        )
+    if run_id:
+        runtime_state.notify_run_update(run_id)
     # Deterministic automation is a post-terminal derived projection.  It may
     # fail independently, but must never change the authoritative attempt fact.
     try:
@@ -921,7 +976,13 @@ def _finalize_with_score_sync(
     transport_status: str = "unknown",
     ended_at: str,
 ) -> None:
+    run_id: str | None = None
     with _open_sync(db_path) as conn:
+        row = conn.execute(
+            "SELECT run_id FROM attempts WHERE id=?", (attempt_id,)
+        ).fetchone()
+        if row and row[0]:
+            run_id = str(row[0])
         conn.execute(
             "UPDATE attempts SET status=?, score_total=?, external_refs_json=?,"
             " event_count=?, last_event_at=?, thinking_count=?, tool_call_count=?,"
@@ -946,3 +1007,5 @@ def _finalize_with_score_sync(
         # 成本估算：与 _finalize_no_score 同理，共用 helper 保证口径一致。
         apply_cost_columns(conn, attempt_id, token_usage=token_usage)
         conn.commit()
+    if run_id:
+        runtime_state.notify_run_update(run_id)
