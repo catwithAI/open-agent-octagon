@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, screen, waitFor } from "@testing-library/react";
 import "@testing-library/jest-dom/vitest";
 import { MemoryRouter } from "react-router-dom";
+import { renderWithI18n as render } from "../i18n/test-utils";
 
 import { api } from "../api/client";
 import { ExperimentBuilder } from "./ExperimentBuilder";

@@ -77,9 +77,9 @@ jobs:
       - name: Type check
         run: npx tsc -b
 
-      # 既有组件测试的 i18n 基线单列追踪；新模块失败必须阻断合入。
-      - name: Skill Eval component tests
-        run: npm test -- src/skillEval
+      # 全量前端单测作为 PR 门禁，任一失败即阻断合入。
+      - name: Unit tests
+        run: npm test
 
       - name: Production build
         run: npm run build

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 
 import { api } from "../api/client";
@@ -41,6 +41,12 @@ export function RunGroupLive() {
   const [page, setPage] = useState(0);
   const [selectedCellId, setSelectedCellId] = useState("");
   const [attemptLabels, setAttemptLabels] = useState<Record<string, AttemptLabel>>({});
+  const attemptedIdsRef = useRef<Set<string>>(new Set());
+
+  useEffect(() => {
+    attemptedIdsRef.current.clear();
+    setAttemptLabels({});
+  }, [experimentId, groupId]);
 
   useEffect(() => {
     discoverCapabilities().then((result) => {
@@ -79,8 +85,8 @@ export function RunGroupLive() {
     return () => { alive = false; source.close(); };
   }, [capabilities, experimentId, groupId]);
 
-  const cells = state.snapshot?.cells ?? [];
-  const leaders = state.snapshot?.leaders ?? [];
+  const cells = useMemo(() => state.snapshot?.cells ?? [], [state.snapshot]);
+  const leaders = useMemo(() => state.snapshot?.leaders ?? [], [state.snapshot]);
   const visible = useMemo(
     () => cells.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE),
     [cells, page],
@@ -88,29 +94,41 @@ export function RunGroupLive() {
   useEffect(() => {
     let alive = true;
     const runIds = new Set<string>();
+    const pendingAttemptIds: string[] = [];
     for (const leader of leaders) {
-      if (!leader.current_attempt_id || attemptLabels[leader.current_attempt_id]) continue;
+      const attemptId = leader.current_attempt_id;
+      if (!attemptId || attemptedIdsRef.current.has(attemptId)) continue;
       const scope = parseScope(leader.scope_key);
       const cell = scope && cells.find((item) =>
         item.variant_id === scope.variantId && item.repeat_index === scope.repeat
       );
-      if (cell?.run_id) runIds.add(cell.run_id);
+      if (cell?.run_id) {
+        runIds.add(cell.run_id);
+        pendingAttemptIds.push(attemptId);
+      }
     }
     if (runIds.size === 0) return () => { alive = false; };
+    for (const attemptId of pendingAttemptIds) {
+      attemptedIdsRef.current.add(attemptId);
+    }
     Promise.all([...runIds].map((runId) => api.getRun(runId).catch(() => null))).then((runs) => {
       if (!alive) return;
       setAttemptLabels((current) => {
-        const next = { ...current };
+        let next: Record<string, AttemptLabel> | null = null;
         for (const run of runs) {
           for (const attempt of run?.attempts ?? []) {
+            attemptedIdsRef.current.add(attempt.id);
+            const prev = (next ?? current)[attempt.id];
+            if (prev?.agent === attempt.agent_name && prev?.model === attempt.model) continue;
+            if (next === null) next = { ...current };
             next[attempt.id] = { agent: attempt.agent_name, model: attempt.model };
           }
         }
-        return next;
+        return next ?? current;
       });
     });
     return () => { alive = false; };
-  }, [attemptLabels, cells, leaders]);
+  }, [cells, leaders]);
 
   const group = state.snapshot?.group;
   if (capabilities && !capabilities.features.run_groups) {

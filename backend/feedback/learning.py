@@ -14,6 +14,8 @@ from backend.profiles.recommend import ProfileRecommendation
 
 
 LEARNING_VERSION = "octagon-recommendation-learning-v1"
+POSITIVE_SIGNALS = frozenset({"helpful", "accepted"})
+NEGATIVE_SIGNALS = frozenset({"unhelpful", "rejected", "misleading", "incorrect"})
 
 
 class LearningConflict(RuntimeError):
@@ -92,7 +94,13 @@ def rebuild_state(
         scope = json.loads(row["scope_json"])
         if scope.get("scope_key") != scope_key:
             continue
-        signal = 1.0 if row["signal"] in {"helpful", "accepted"} else -1.0
+        raw_signal = row["signal"]
+        if raw_signal in POSITIVE_SIGNALS:
+            signal = 1.0
+        elif raw_signal in NEGATIVE_SIGNALS:
+            signal = -1.0
+        else:
+            continue
         profile_id = str(json.loads(row["recommendation_json"])["profile_id"])
         previous = ema.get(profile_id, 0.0)
         ema[profile_id] = round(alpha * signal + (1 - alpha) * previous, 12)

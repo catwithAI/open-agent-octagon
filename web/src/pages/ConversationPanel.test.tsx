@@ -1,8 +1,9 @@
 // 验收：ConversationPanel 生产 DOM——turn 分段 + 五态 evaluation + capability
 // gap，fixture 覆盖 main / sub-agent / unsupported / legacy / aggregate-only。
 import { describe, it, expect, afterEach } from "vitest";
-import { render, screen, cleanup, within } from "@testing-library/react";
+import { screen, cleanup, within } from "@testing-library/react";
 import "@testing-library/jest-dom/vitest";
+import { renderWithI18n as render } from "../i18n/test-utils";
 import type { AttemptConversation } from "../api/client";
 import { ConversationPanel } from "./ConversationPanel";
 

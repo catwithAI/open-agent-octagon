@@ -6,8 +6,9 @@
 //
 // 核心不变式：**估算永不出现在费用位**、**缺账显示原因而不是数字**。
 import { describe, it, expect, afterEach } from "vitest";
-import { render, screen, cleanup } from "@testing-library/react";
+import { screen, cleanup } from "@testing-library/react";
 import "@testing-library/jest-dom/vitest";
+import { renderWithI18n as render } from "../i18n/test-utils";
 import type { AttemptMoney } from "../api/client";
 import { MoneyStat } from "./RunDetail";
 

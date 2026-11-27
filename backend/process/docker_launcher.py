@@ -27,6 +27,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 from collections.abc import AsyncIterator, Iterable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -164,6 +165,7 @@ class DockerAttemptSandbox:
         self.server_side_tools: str = launcher.server_side_tools
         self.execs: list[_ExecRecord] = []
         self.killed = False
+        self._env_files: list[Path] = []
 
     # ---- adapter 侧路径 / 环境翻译 -------------------------------------------
 
@@ -207,11 +209,82 @@ class DockerAttemptSandbox:
 
     # ---- 每轮进程 ------------------------------------------------------------
 
+    def _write_env_file(self, env_vars: Mapping[str, str]) -> Path:
+        """把单行环境变量写入 0o600 临时文件供 `docker exec --env-file` 读取，
+        避免 API key 等凭据以明文出现在宿主机进程 argv（ps / /proc/cmdline）中。"""
+        raw_fd, raw_path = tempfile.mkstemp(prefix="octagon-docker-env-", suffix=".env")
+        env_path = Path(raw_path)
+        try:
+            os.chmod(raw_fd, 0o600)
+            with os.fdopen(raw_fd, "w", encoding="utf-8") as fh:
+                for key, value in env_vars.items():
+                    fh.write(f"{key}={value}\n")
+        except Exception:
+            env_path.unlink(missing_ok=True)
+            raise
+        self._env_files.append(env_path)
+        return env_path
+
+    def _unlink_env_file(self, env_file: Path | None) -> None:
+        if env_file is None:
+            return
+        try:
+            env_file.unlink(missing_ok=True)
+        except OSError:
+            logger.debug("清理 docker env-file 失败: %s", env_file, exc_info=True)
+        try:
+            self._env_files.remove(env_file)
+        except ValueError:
+            pass
+
+    def cleanup_env_files(self) -> None:
+        for env_file in list(self._env_files):
+            self._unlink_env_file(env_file)
+
+    def _split_container_env(
+        self, spec: ExecSpec
+    ) -> tuple[dict[str, str], dict[str, str]]:
+        """把容器环境变量拆为可走 `--env-file` 的单行项与含换行的多行项。"""
+        file_env: dict[str, str] = {}
+        multiline_env: dict[str, str] = {}
+        for key, value in self._container_env(spec.env, keep=spec.env_keep).items():
+            if "\n" in value or "\r" in value:
+                multiline_env[key] = value
+            else:
+                file_env[key] = value
+        return file_env, multiline_env
+
+    def _prepare_exec_invocation(
+        self, spec: ExecSpec
+    ) -> tuple[tuple[str, ...], Path | None, dict[str, str] | None]:
+        # data_path 可能是相对路径（octagon.yaml 默认 ./data），adapter 传来的 cwd
+        # 也就是相对的；docker exec 要求绝对路径，且同路径挂载用的是 resolve() 后的值。
+        file_env, multiline_env = self._split_container_env(spec)
+        argv: list[str] = [self._launcher.docker, "exec", "-i", "-w", str(Path(spec.cwd).resolve())]
+        env_file: Path | None = None
+        if file_env:
+            env_file = self._write_env_file(file_env)
+            argv += ["--env-file", str(env_file)]
+        sub_env: dict[str, str] | None = None
+        if multiline_env:
+            # Docker --env-file 不支持值内嵌入 \n/\r；多行值仅传 `-e KEY`，
+            # 由 docker CLI 从自身进程 env 透传，避免明文进 argv。
+            sub_env = {**os.environ, **multiline_env}
+            for key in multiline_env:
+                argv += ["-e", key]
+        argv.append(self.container_id)
+        argv.extend(spec.argv)
+        return tuple(argv), env_file, sub_env
+
     def build_exec_argv(self, spec: ExecSpec) -> tuple[str, ...]:
         # data_path 可能是相对路径（octagon.yaml 默认 ./data），adapter 传来的 cwd
         # 也就是相对的；docker exec 要求绝对路径，且同路径挂载用的是 resolve() 后的值。
+        file_env, multiline_env = self._split_container_env(spec)
         argv: list[str] = [self._launcher.docker, "exec", "-i", "-w", str(Path(spec.cwd).resolve())]
-        for key, value in self._container_env(spec.env, keep=spec.env_keep).items():
+        if file_env:
+            env_file = self._write_env_file(file_env)
+            argv += ["--env-file", str(env_file)]
+        for key, value in multiline_env.items():
             argv += ["-e", f"{key}={value}"]
         argv.append(self.container_id)
         argv.extend(spec.argv)
@@ -240,35 +313,45 @@ class DockerAttemptSandbox:
 
     @asynccontextmanager
     async def exec(self, spec: ExecSpec) -> AsyncIterator[asyncio.subprocess.Process]:
-        argv = self.build_exec_argv(spec)
+        argv, env_file, sub_env = self._prepare_exec_invocation(spec)
         record = _ExecRecord(turn_id=spec.turn_id, started_at=_now_iso())
         self.execs.append(record)
-        proc = await asyncio.create_subprocess_exec(
-            *argv,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            limit=10 * 1024 * 1024,
-            start_new_session=True,
-        )
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *argv,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=sub_env,
+                limit=10 * 1024 * 1024,
+                start_new_session=True,
+            )
+        except BaseException:
+            self._unlink_env_file(env_file)
+            raise
         try:
             yield proc
         finally:
-            if proc.returncode is None:
-                if is_shutting_down():
-                    logger.warning(
-                        "后端关停：保留沙盒容器 %s 及其中进程 attempt=%s",
-                        self.container_name, self.spec.attempt_id,
-                    )
-                else:
-                    # 权威动作是杀整容器：超时是 attempt 级的，没有「只杀一轮」。
-                    await self.kill()
-                    try:
-                        proc.kill()
-                    except ProcessLookupError:
-                        pass
-                    await proc.wait()
-            record.ended_at = _now_iso()
-            record.exit_code = proc.returncode
+            try:
+                if proc.returncode is None:
+                    if is_shutting_down():
+                        logger.warning(
+                            "后端关停：保留沙盒容器 %s 及其中进程 attempt=%s",
+                            self.container_name, self.spec.attempt_id,
+                        )
+                    else:
+                        # 权威动作是杀整容器：超时是 attempt 级的，没有「只杀一轮」。
+                        try:
+                            await self.kill()
+                        finally:
+                            try:
+                                proc.kill()
+                            except ProcessLookupError:
+                                pass
+                            await proc.wait()
+            finally:
+                record.ended_at = _now_iso()
+                record.exit_code = proc.returncode
+                self._unlink_env_file(env_file)
 
     async def kill(self) -> None:
         if self.killed:
@@ -396,14 +479,17 @@ class DockerLauncher:
         try:
             yield sandbox
         finally:
-            if is_shutting_down():
-                logger.warning(
-                    "后端关停：保留沙盒容器 %s attempt=%s，交给重启回收", name, spec.attempt_id,
-                )
-            else:
-                await sandbox.kill()
-                self._write_record(attempt_dir, sandbox, started_at)
-                await self._run(["rm", "-f", container_id], check=False)
+            try:
+                if is_shutting_down():
+                    logger.warning(
+                        "后端关停：保留沙盒容器 %s attempt=%s，交给重启回收", name, spec.attempt_id,
+                    )
+                else:
+                    await sandbox.kill()
+                    self._write_record(attempt_dir, sandbox, started_at)
+                    await self._run(["rm", "-f", container_id], check=False)
+            finally:
+                sandbox.cleanup_env_files()
 
     def _write_record(
         self, attempt_dir: Path, sandbox: DockerAttemptSandbox, started_at: str,

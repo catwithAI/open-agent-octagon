@@ -214,6 +214,14 @@ def _prepare_rejudge(state: Any, attempt_id: str, run_id: str, capacity: int) ->
         ).fetchone()
         if inflight is not None or attempt["scoring_status"] in {"queued", "running"}:
             raise RejudgeError(409, "scoring_in_flight", "scoring already in flight for this attempt")
+        # 快照源目录必须在盘上（create_scoring_snapshot 会 copytree + hash），
+        # env 也必须已加载（_execute_job 里 env is None 会 RuntimeError → job failed）。
+        # 这两项前置校验必须在任何 DB 写操作之前完成，避免校验失败却已清空旧评分/改写 rubric。
+        attempt_dir = Path(state.data_path) / "attempts" / attempt_id
+        if not attempt_dir.is_dir():
+            raise RejudgeError(409, "attempt_dir_missing", "attempt artifact directory no longer exists")
+        if state.envs.get(str(attempt["env_name"])) is None:
+            raise RejudgeError(409, "env_unavailable", "environment is not loaded")
         # rejudge 用**当前** env 的 rubric：attempts.rubric_version 是创建时冻结
         # 的旧值，不更新的话 record_judge_run 会把新分归到旧 rubric 名下
         # （审查 #6）。best-effort——active_rubrics 无当前版本时保持原值。
@@ -240,13 +248,6 @@ def _prepare_rejudge(state: Any, attempt_id: str, run_id: str, capacity: int) ->
         conn.execute("DELETE FROM scoring_jobs WHERE attempt_id=?", (attempt_id,))
         conn.execute("DELETE FROM scores WHERE attempt_id=?", (attempt_id,))
         conn.commit()
-    # 快照源目录必须在盘上（create_scoring_snapshot 会 copytree + hash）
-    attempt_dir = Path(state.data_path) / "attempts" / attempt_id
-    if not attempt_dir.is_dir():
-        raise RejudgeError(409, "attempt_dir_missing", "attempt artifact directory no longer exists")
-    # env 必须已加载（_execute_job 里 env is None 会 RuntimeError → job failed）
-    if state.envs.get(str(attempt["env_name"])) is None:
-        raise RejudgeError(409, "env_unavailable", "environment is not loaded")
     return {
         "attempt_id": attempt_id,
         "adapter_status": exec_status,  # completed/timeout/failed 即 adapter_status

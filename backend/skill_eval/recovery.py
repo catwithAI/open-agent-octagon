@@ -82,7 +82,9 @@ class Recovery:
                                 function=call.get('function') or {}
                                 if str(function.get('name','')).endswith('AskUserQuestion') and call.get('id'):
                                     arguments=function.get('arguments') or {}
-                                    if isinstance(arguments,str):arguments=json.loads(arguments)
+                                    if isinstance(arguments,str):
+                                        try:arguments=json.loads(arguments)
+                                        except (ValueError,TypeError):continue
                                     from backend.wire.redaction import redact_json
                                     with self.repo.transaction() as c:
                                         c.execute("INSERT OR IGNORE INTO skill_eval_interactions(id,run_id,remote_tool_call_id,question_json,state,created_at) VALUES(?,?,?,?,'pending',?)",(new_id(),run['id'],call['id'],json.dumps(redact_json({'arguments':arguments,'name':function['name'],'tool_call_id':call['id']})),self.service._time()))
@@ -93,9 +95,14 @@ class Recovery:
                         # inventing an answer. Explicitly mark the capture gap.
                         with self.repo.transaction() as c:
                             c.execute("UPDATE skill_eval_runs SET capture_status='partial',error_code='paused_question_not_recovered' WHERE id=?",(run['id'],))
+                gen_status='paused' if remote_status=='paused' else 'completed'
                 with self.repo.transaction() as c:
                     c.execute("UPDATE skill_eval_jobs SET state='completed',last_error='reconciled_from_history' WHERE id=?",(job['id'],))
-                    c.execute("UPDATE skill_eval_runs SET run_status=CASE WHEN finish_requested_at IS NOT NULL THEN 'finishing' ELSE ? END,generation_status=?,revision=revision+1 WHERE id=?",('waiting_input' if remote_status=='paused' else 'waiting_continue','paused' if remote_status=='paused' else 'completed',run['id']))
+                    if generation_id:
+                        c.execute("UPDATE skill_eval_generations SET status=?,ended_at=coalesce(ended_at,?) WHERE id=?",(gen_status,self.service._time(),generation_id))
+                    if message and message['interaction_id']:
+                        c.execute("UPDATE skill_eval_interactions SET state='answered' WHERE id=? AND state='answering'",(message['interaction_id'],))
+                    c.execute("UPDATE skill_eval_runs SET run_status=CASE WHEN finish_requested_at IS NOT NULL THEN 'finishing' ELSE ? END,generation_status=?,revision=revision+1 WHERE id=?",('waiting_input' if remote_status=='paused' else 'waiting_continue',gen_status,run['id']))
                 return {'job_id':job['id'],'status':'session_restored_without_send'}
         # A live or ambiguous command is never re-issued. Keep remote IDs and all
         # evidence, and let finish/collection inspect or stop that exact generation.

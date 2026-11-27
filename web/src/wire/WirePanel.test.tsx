@@ -1,9 +1,10 @@
 // 验收：用 Testing Library 渲染真实 WirePanel，固定 API fixture
 // 验证空态/曲线/降级 banner/aggregate-only 文案的生产 DOM——不测 helper 死代码。
 import { describe, it, expect, vi, afterEach, beforeEach } from "vitest";
-import { render, screen, waitFor, cleanup, fireEvent } from "@testing-library/react";
+import { screen, waitFor, cleanup, fireEvent } from "@testing-library/react";
 import "@testing-library/jest-dom/vitest";
 import { MemoryRouter } from "react-router-dom";
+import { renderWithI18n as render } from "../i18n/test-utils";
 import type { WireManifest, WirePage, WireTrajectory } from "../api/client";
 
 // mock api：getWireManifest/getWire/getWireBlob 返回固定 fixture。

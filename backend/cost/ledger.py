@@ -384,7 +384,6 @@ def aggregate_run(db_path: Path, run_id: str) -> dict[str, Any]:
     partial = None
     if execution is not None or scoring is not None:
         partial = (execution or 0.0) + (scoring or 0.0)
-    total = None if priced_missing else partial
 
     # 与 attempts 表对账：少一行账就少一个 agent 的钱。
     expected = expected_attempt_ids(db_path, run_id)
@@ -395,6 +394,10 @@ def aggregate_run(db_path: Path, run_id: str) -> dict[str, Any]:
     # scoring_cost 是缺的，总额同样不完整——不能因为 attempt 都齐了就标 final。
     judge_required = _judge_required(db_path, run_id)
     judge_missing = judge_required and not judges
+
+    # 任一账缺金额/部分归因、或存在缺账 attempt / 缺 judge 账时，总额均不完整，
+    # 必须置 NULL（已有部分由 partial_total_cost_usd 单列，不能冒充 total_cost_usd）。
+    total = None if (priced_missing or missing or judge_missing) else partial
 
     complete = not missing and not judge_missing and all(x.auditable for x in ledgers)
     if complete:

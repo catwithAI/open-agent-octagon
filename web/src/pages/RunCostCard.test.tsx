@@ -4,8 +4,9 @@
 // **failed 不回落为估算真值**。这三条一旦破了，读者会把未结算或含背景流量的
 // 数字当成这次 run 的实际花费。
 import { describe, it, expect, afterEach, vi } from "vitest";
-import { render, screen, cleanup, waitFor } from "@testing-library/react";
+import { screen, cleanup, waitFor } from "@testing-library/react";
 import "@testing-library/jest-dom/vitest";
+import { renderWithI18n as render } from "../i18n/test-utils";
 import type { RunCost } from "../api/client";
 import { api } from "../api/client";
 import { RunCostCard } from "./RunDetail";

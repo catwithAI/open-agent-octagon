@@ -1351,9 +1351,15 @@ export function RunCostCard({ runId }: { runId: string }) {
 
   useEffect(() => {
     let alive = true;
+    setCost(null);
+    setFailed(false);
     api
       .getRunCost(runId)
-      .then((c) => alive && setCost(c))
+      .then((c) => {
+        if (!alive) return;
+        setFailed(false);
+        setCost(c);
+      })
       .catch(() => alive && setFailed(true));
     return () => {
       alive = false;
@@ -3192,6 +3198,16 @@ export function RunDetail() {
   focusAgentRef.current = focusAgent;
 
   useEffect(() => {
+    setRun(null);
+    setDetails({});
+    setEventsMap({});
+    setArtifactsMap({});
+    setRunCost(null);
+    setErr("");
+    setFocusAgent(null);
+  }, [runId]);
+
+  useEffect(() => {
     if (!runId) return;
     let alive = true;
     let fallbackId: ReturnType<typeof setInterval> | undefined;
@@ -3275,12 +3291,13 @@ export function RunDetail() {
     // 目标板块的数据是异步加载的（评分/产物/事件），轮询等它渲染出来再滚动；
     // 找不到（如该 attempt 无产物）最多重试 20 次后放弃，不阻塞页面。
     let tries = 0;
-    const timer = setInterval(() => {
+    const timer = window.setInterval(() => {
       const element = document.getElementById(targetId);
       tries += 1;
       if (element) element.scrollIntoView({ behavior: "smooth", block: "start" });
-      if (element || tries > 20) clearInterval(timer);
+      if (element || tries > 20) window.clearInterval(timer);
     }, 300);
+    return () => window.clearInterval(timer);
   }, [run]);
 
   useEffect(() => {

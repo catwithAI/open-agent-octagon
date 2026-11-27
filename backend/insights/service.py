@@ -108,7 +108,7 @@ async def generate_idempotent(
             fail_idempotency(conn, operation="insight:active", key=experiment_id)
             conn.commit()
         return {**response, "replayed": False}
-    except Exception:
+    except BaseException:
         with _open_sync(repository.db_path) as conn:
             fail_idempotency(conn, operation=operation, key=idempotency_key)
             if active_claimed:

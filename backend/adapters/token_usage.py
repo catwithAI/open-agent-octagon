@@ -155,13 +155,16 @@ def result_usage_tokens(data: dict[str, Any]) -> tuple[int, int]:
     input_tokens = usage_input_tokens(usage if isinstance(usage, dict) else None)
     output_tokens = usage_output_tokens(usage if isinstance(usage, dict) else None)
 
-    model_usage = data.get("modelUsage") or data.get("model_usage") or {}
-    if isinstance(model_usage, dict):
-        for item in model_usage.values():
-            if not isinstance(item, dict):
-                continue
-            input_tokens += usage_input_tokens(item)
-            output_tokens += usage_output_tokens(item)
+    # Claude Code 同时上报顶层 `usage` 汇总与按模型拆分的 `modelUsage`（同一批用量的
+    # 两种视图）；仅在顶层 `usage` 给出 (0, 0) 时才回退累加 `modelUsage`，避免 2× 重复计数。
+    if input_tokens == 0 and output_tokens == 0:
+        model_usage = data.get("modelUsage") or data.get("model_usage") or {}
+        if isinstance(model_usage, dict):
+            for item in model_usage.values():
+                if not isinstance(item, dict):
+                    continue
+                input_tokens += usage_input_tokens(item)
+                output_tokens += usage_output_tokens(item)
 
     return input_tokens, output_tokens
 

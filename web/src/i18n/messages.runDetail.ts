@@ -281,6 +281,7 @@ export const MESSAGES_RUN_DETAIL: Record<string, Message> = {
   "runDetail.hop.durationUnknown": { zh: "耗时未知 · ", en: "duration unknown · " },
   "runDetail.hop.status": { zh: "状态 {code}", en: "Status {code}" },
   "runDetail.hop.sourceUnknown": { zh: "未知", en: "unknown" },
+  "runDetail.hop.callLink": { zh: "调用 {id}", en: "call {id}" },
   "runDetail.hop.unmatched": { zh: "未关联：缺少可用 call anchor，未按时间猜配", en: "Unmatched: no usable call anchor, not guessed by timing" },
   "runDetail.hop.trajectory": { zh: "轨迹 #{seq}", en: "trajectory #{seq}" },
   "runDetail.hop.reqHashTitle": { zh: "请求 semantic hash（跨 agent/source 同 hash=同一逻辑调用）", en: "Request semantic hash (same hash across agents/sources = same logical call)" },

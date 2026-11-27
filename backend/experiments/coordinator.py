@@ -158,12 +158,13 @@ async def _provision_cell(
             },
             input_override=frozen_input,
         )
-        repository.transition_cell(
+        if not repository.transition_cell(
             cell["id"],
             expected={"provisioning"},
             target="running",
             run_id=created.run_id,
-        )
+        ):
+            return
         if created.dispatch_jobs:
             dispatch = _dispatch_serial if created.execution == "serial" else _dispatch_all
             await dispatch(created.run_id, created.dispatch_jobs, legacy=False)
@@ -348,6 +349,22 @@ def stop_group(group_id: str, *, experiment_id: str | None = None) -> dict[str, 
 
         cancelled_scoring = cancel_scoring_for_runs(run_ids)
         cancelled_tasks = cancel_dispatch_tasks(run_ids)
+        for task in state.active_tasks.pop(f"group:{group_id}", []):
+            if not task.done():
+                task_loop = getattr(task, "get_loop", lambda: None)()
+                try:
+                    current_loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    current_loop = None
+                if (
+                    isinstance(task_loop, asyncio.AbstractEventLoop)
+                    and current_loop is not task_loop
+                    and not task_loop.is_closed()
+                ):
+                    task_loop.call_soon_threadsafe(task.cancel)
+                else:
+                    task.cancel()
+                cancelled_tasks += 1
         # attempt 级收敛在事务外统一做（见下方 cancel_attempts_for_runs）：
         # 它要写三条状态轴并重建投影，与本事务里的 cell/group 写入分开，
         # 避免嵌套连接。此前这里只写 legacy status='timeout'，与 cell 的

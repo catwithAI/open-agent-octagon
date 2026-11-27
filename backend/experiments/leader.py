@@ -18,7 +18,12 @@ PRODUCER_VERSION = "rc-a02-v1"
 
 def _rank(row: sqlite3.Row, tie_break: str) -> tuple[Any, ...]:
     if tie_break == "duration":
-        return (row["score"], -row["duration_ms"], row["attempt_id"])
+        duration = row["duration_ms"]
+        return (
+            row["score"],
+            -(duration if duration is not None else float("inf")),
+            row["attempt_id"],
+        )
     return (row["score"], row["attempt_id"])
 
 
@@ -125,6 +130,15 @@ def consume_score_outbox(db_path: Path, *, group_id: str | None = None) -> int:
             candidates = _candidates_through(
                 conn, source["run_group_id"], source["scope_key"], source["seq"]
             )
+            if not candidates:
+                conn.execute(
+                    "UPDATE score_transition_outbox SET consumed_at=COALESCE(consumed_at,?) "
+                    "WHERE id=?",
+                    (_now_iso(), source["id"]),
+                )
+                conn.commit()
+                consumed += 1
+                continue
             tie_break = _tie_break(conn, source["run_group_id"])
             best = max(candidates, key=lambda row: _rank(row, tie_break))
             previous = conn.execute(

@@ -787,14 +787,20 @@ async def forward(
     try:
         resp = await client.send(req, stream=True)
     except httpx.HTTPError as exc:
-        await _finish_hop(
-            hop, status_code=None, streamed=False, partial=True,
-            ttft_ms=None, response_summary=None, response_body_ref=None,
-            redaction_status=redaction_status,
-        )
+        try:
+            await _finish_hop(
+                hop, status_code=None, streamed=False, partial=True,
+                ttft_ms=None, response_summary=None, response_body_ref=None,
+                redaction_status=redaction_status,
+            )
+        finally:
+            if entry is not None:
+                await _REGISTRY.end(entry)
+        raise ProxyError(502, scrub_text(f"upstream unreachable: {exc}")) from None
+    except BaseException:
         if entry is not None:
             await _REGISTRY.end(entry)
-        raise ProxyError(502, scrub_text(f"upstream unreachable: {exc}")) from None
+        raise
 
     out_headers = _upstream_response_headers(resp)
     media_type = resp.headers.get("content-type")
@@ -903,6 +909,45 @@ def _usage_from_obj(obj: object) -> UsagePayload | None:
     return UsagePayload(**values, estimated=False)
 
 
+_STREAM_MEDIA_TYPES = frozenset({
+    "text/event-stream",
+    "application/x-ndjson",
+    "application/ndjson",
+})
+
+
+def _is_streaming_content_type(content_type: str | None) -> bool:
+    if not content_type:
+        return False
+    media_type = content_type.split(";", 1)[0].strip().lower()
+    return media_type in _STREAM_MEDIA_TYPES
+
+
+def _merge_usage_payload(
+    base: UsagePayload | None, incoming: UsagePayload
+) -> UsagePayload:
+    """合并增量 SSE usage 事件的非 None 字段，保留早期事件上报的维度。
+
+    典型如 Anthropic SSE：`message_start` 带 input/cache_*，`message_delta` 只带
+    output_tokens；直接覆盖会把前者的 input/cache_* 抹成 None。
+    """
+    if base is None:
+        return incoming
+    updates = {
+        field: value
+        for field in (
+            "input_tokens",
+            "output_tokens",
+            "cache_read_tokens",
+            "cache_write_tokens",
+            "reasoning_tokens",
+            "estimated",
+        )
+        if (value := getattr(incoming, field)) is not None
+    }
+    return base.model_copy(update=updates)
+
+
 class _UsageProbe:
     """增量扫描 SSE/JSON usage，只留数字和有限未完成缓冲。
 
@@ -915,6 +960,7 @@ class _UsageProbe:
         self._raw_buf = bytearray()
         self._raw_truncated = False
         self.usage: UsagePayload | None = None
+        self.saw_sse = False
 
     def feed(self, chunk: bytes) -> None:
         if not self._raw_truncated:
@@ -950,6 +996,7 @@ class _UsageProbe:
     def _parse_sse_line(self, line: bytes) -> None:
         if not line.startswith(b"data:"):
             return
+        self.saw_sse = True
         payload = line[5:].strip()
         if not payload or payload == b"[DONE]":
             return
@@ -959,7 +1006,7 @@ class _UsageProbe:
             return
         usage = _usage_from_obj(parsed)
         if usage is not None:
-            self.usage = usage
+            self.usage = _merge_usage_payload(self.usage, usage)
 
 
 def _authority_of(base_url: str) -> str:
@@ -1049,47 +1096,52 @@ async def _stream_body(
         partial = True
     finally:
         try:
-            await resp.aclose()
-        except Exception:
-            pass
-        # 关闭采集队列并等 writer drain 完。哨兵用 put_nowait：队列满时（writer
-        # 落后）不能阻塞转发侧 cleanup——直接给 writer 有限时间自行 drain，超时则
-        # cancel（已落盘的 chunk 保留）。
-        if queue is not None and writer_task is not None:
             try:
-                queue.put_nowait(None)  # 哨兵：writer drain 到它后退出
-            except asyncio.QueueFull:
-                pass  # 队列满：writer 会先 drain 掉积压，靠 timeout/cancel 收尾
-            try:
-                await asyncio.wait_for(writer_task, timeout=5.0)
-            except (asyncio.TimeoutError, asyncio.CancelledError):
-                writer_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await writer_task
+                await resp.aclose()
             except Exception:
-                writer_task.cancel()
-        # 完成 hop：写 http_exchange summary。
-        if hop is not None:
-            if usage_probe is not None:
-                hop.usage = usage_probe.finish()
-            # provider call ID 主路径是转发时的 correlation probe（所有 policy 均生效）。
-            # 这里对 parsed/full 已缓存 body 做一次兜底提取——probe 因 id 靠后
-            # 超出 probe 上限而漏掉时，用完整缓存 body 补上。
-            if hop.provider_response_id is None and want_body and response_chunks:
-                hop.provider_response_id = _parse_provider_id(b"".join(response_chunks))
-            resp_summary, resp_body_ref, resp_redaction = _summarize_response(
-                response_chunks if want_body else None, policy, hop,
-            )
-            # 合并 request/response 脱敏状态：任一 failed → evidence
-            # redaction.status=failed，不能因 request applied 就掩盖 response 未安全落盘。
-            merged_redaction = _merge_redaction_status(redaction_status, resp_redaction)
-            await _finish_hop(
-                hop, status_code=resp.status_code, streamed=True, partial=partial,
-                ttft_ms=ttft_ms, response_summary=resp_summary,
-                response_body_ref=resp_body_ref, redaction_status=merged_redaction,
-            )
-        if entry is not None:
-            await _REGISTRY.end(entry)
+                pass
+            # 关闭采集队列并等 writer drain 完。哨兵用 put_nowait：队列满时（writer
+            # 落后）不能阻塞转发侧 cleanup——直接给 writer 有限时间自行 drain，超时则
+            # cancel（已落盘的 chunk 保留）。
+            if queue is not None and writer_task is not None:
+                try:
+                    queue.put_nowait(None)  # 哨兵：writer drain 到它后退出
+                except asyncio.QueueFull:
+                    pass  # 队列满：writer 会先 drain 掉积压，靠 timeout/cancel 收尾
+                try:
+                    await asyncio.wait_for(writer_task, timeout=5.0)
+                except (asyncio.TimeoutError, asyncio.CancelledError):
+                    writer_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await writer_task
+                except Exception:
+                    writer_task.cancel()
+            # 完成 hop：写 http_exchange summary。
+            if hop is not None:
+                if usage_probe is not None:
+                    hop.usage = usage_probe.finish()
+                # provider call ID 主路径是转发时的 correlation probe（所有 policy 均生效）。
+                # 这里对 parsed/full 已缓存 body 做一次兜底提取——probe 因 id 靠后
+                # 超出 probe 上限而漏掉时，用完整缓存 body 补上。
+                if hop.provider_response_id is None and want_body and response_chunks:
+                    hop.provider_response_id = _parse_provider_id(b"".join(response_chunks))
+                resp_summary, resp_body_ref, resp_redaction = _summarize_response(
+                    response_chunks if want_body else None, policy, hop,
+                )
+                # 合并 request/response 脱敏状态：任一 failed → evidence
+                # redaction.status=failed，不能因 request applied 就掩盖 response 未安全落盘。
+                merged_redaction = _merge_redaction_status(redaction_status, resp_redaction)
+                streamed = _is_streaming_content_type(resp.headers.get("content-type")) or (
+                    usage_probe is not None and usage_probe.saw_sse
+                )
+                await _finish_hop(
+                    hop, status_code=resp.status_code, streamed=streamed, partial=partial,
+                    ttft_ms=ttft_ms, response_summary=resp_summary,
+                    response_body_ref=resp_body_ref, redaction_status=merged_redaction,
+                )
+        finally:
+            if entry is not None:
+                await _REGISTRY.end(entry)
 
 
 async def _chunk_writer(queue: "asyncio.Queue", hop: "_HopContext", entry: "_Entry") -> None:

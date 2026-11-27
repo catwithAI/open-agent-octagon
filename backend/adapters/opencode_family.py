@@ -395,7 +395,7 @@ class OpencodeFamilyAdapter:
                 # `<repo>/REQUIREMENT.md` 失败后 glob 到上一个实验残留在仓库根
                 # 的 `SPEC.md`（火山喷发规格），把**别的实验的题目**当成本次
                 # 需求——跨实验串题，评测结果直接失去意义。
-                "--dir", str(workspace.resolve()),
+                "--dir", sandbox.path(workspace),
                 "-m", cli_model,
             ]
             if not is_first:

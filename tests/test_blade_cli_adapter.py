@@ -45,6 +45,14 @@ if group == "version":
     sys.exit(0)
 
 if group == "chat" and verb in ("run", "send"):
+    capture = os.environ.get("BLADE_STUB_CAPTURE_ATTEMPT")
+    if capture:
+        for i, a in enumerate(argv):
+            if a == "--file" and i + 1 < len(argv) and argv[i + 1].endswith("=.octagon/attempt.json"):
+                src_path = argv[i + 1].split("=", 1)[0]
+                with open(src_path, "r", encoding="utf-8") as sf, open(capture, "w", encoding="utf-8") as df:
+                    df.write(sf.read())
+                break
     code = int(os.environ.get("BLADE_STUB_EXIT", "0"))
     if code != 0:
         sys.stderr.write("stub failure\n")
@@ -167,6 +175,7 @@ def _argv_lines(log: Path) -> list[list[str]]:
 def test_completed_run_collects_trace_and_artifacts(
     tmp_path: Path, stub_cli: Path, argv_log: Path
 ) -> None:
+    pytest.importorskip("blade_agent_kit")
     data = tmp_path / "data"
     result = _run(_adapter(stub_cli), _task(tmp_path), _env(), data)
 
@@ -206,6 +215,7 @@ def test_token_usage_is_empty_by_design(tmp_path: Path, stub_cli: Path, argv_log
 
     横评矩阵读到空值应当理解为「该通道不采集」，填 0 会被误读成「没花 token」。
     """
+    pytest.importorskip("blade_agent_kit")
     result = _run(_adapter(stub_cli), _task(tmp_path), _env(), tmp_path / "data")
     assert result.token_usage == {}
     assert result.thinking_count == 0
@@ -215,6 +225,7 @@ def test_token_usage_is_empty_by_design(tmp_path: Path, stub_cli: Path, argv_log
 def test_history_failure_is_reported_without_discarding_artifacts(
     tmp_path: Path, stub_cli: Path, argv_log: Path, sdk_history,
 ) -> None:
+    pytest.importorskip("blade_agent_kit")
     sdk_history.mock(return_value=httpx.Response(503))
     result = _run(_adapter(stub_cli), _task(tmp_path), _env(), tmp_path / "data")
     assert result.status == "completed"
@@ -228,6 +239,7 @@ def test_history_failure_is_reported_without_discarding_artifacts(
 def test_sdk_history_preserves_parallel_tool_result_ids(
     tmp_path: Path, stub_cli: Path, argv_log: Path, sdk_history,
 ) -> None:
+    pytest.importorskip("blade_agent_kit")
     from backend.wire.normalizers.blade import BladeNormalizer
 
     sdk_history.mock(return_value=httpx.Response(200, json={"nodes": [
@@ -289,9 +301,11 @@ def test_chat_run_argv_carries_solution_model_and_uploads(
 
 
 def test_attempt_json_carries_env_token_and_sandbox_base_url(
-    tmp_path: Path, stub_cli: Path, argv_log: Path
+    tmp_path: Path, stub_cli: Path, argv_log: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """sandbox_env_base_url 覆盖 task.env_base_url，与 blade_service 同口径。"""
+    """sandbox_env_base_url 覆盖 task.env_base_url，与 blade_service 同口径，且临时凭据文件退出后清理。"""
+    captured = tmp_path / "captured_attempt.json"
+    monkeypatch.setenv("BLADE_STUB_CAPTURE_ATTEMPT", str(captured))
     adapter = _adapter(stub_cli, sandbox_env_base_url="http://host.docker.internal:9000")
     _run(adapter, _task(tmp_path), _env(), tmp_path / "data")
 
@@ -301,7 +315,9 @@ def test_attempt_json_carries_env_token_and_sandbox_base_url(
         for i, a in enumerate(run_argv)
         if a == "--file" and run_argv[i + 1].endswith("=.octagon/attempt.json")
     )
-    payload = json.loads(Path(spec.split("=", 1)[0]).read_text(encoding="utf-8"))
+    temp_path = Path(spec.split("=", 1)[0])
+    assert not temp_path.exists()
+    payload = json.loads(captured.read_text(encoding="utf-8"))
     assert payload["attempt_id"] == "att-1"
     assert payload["env_token"] == "env-token"
     assert payload["env_base_url"] == "http://host.docker.internal:9000"

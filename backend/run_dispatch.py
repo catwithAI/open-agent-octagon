@@ -12,6 +12,7 @@ import re
 import shutil
 import sqlite3
 import time
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
@@ -771,9 +772,9 @@ async def dispatch(
         # 把 env scripts 拷贝到 workspace（防止 agent 修改源文件）
         _copy_env_scripts(state.data_path, attempt_id, env)
         _copy_agent_materials(state.data_path, attempt_id, env, task_context)
-        # 把 uploaded_files 落到 workspace；物料缺失直接判失败，
+        # 把 uploaded_files 落到 workspace；物料缺失或越界直接判失败，
         # 不能让 agent 拿着"你有一段视频"的 prompt 在空 workspace 里瞎找
-        _copy_uploads(state.data_path, attempt_id, task_context)
+        _copy_uploads(state.data_path, attempt_id, task_context, env_name=env_name, env=env)
         # HITL 场景：把 task 预置的批复策略落到 attempt 目录，供
         # request_human_approval 工具读取。决策由 task 固定，不由 agent 代拟。
         _seed_approval_policy(state.data_path, attempt_id, task_context)
@@ -810,6 +811,16 @@ async def dispatch(
                 attempt_id=attempt_id,
                 status="session_create_failed",
                 error_code="missing_uploaded_file",
+                error_message=str(exc),
+                pass_threshold=60,
+            )
+        elif isinstance(exc, PermissionError):
+            logger.error("dispatch: upload path rejected attempt=%s: %s", attempt_id, exc)
+            result = _finalize_no_score(
+                db_path=state.db_path,
+                attempt_id=attempt_id,
+                status="session_create_failed",
+                error_code="invalid_uploaded_file_path",
                 error_message=str(exc),
                 pass_threshold=60,
             )
@@ -1180,19 +1191,99 @@ def _copy_dir_contents(src: Path, dest: Path, workspace: Path) -> list[str]:
     return copied
 
 
-def _copy_uploads(data_path: Path, attempt_id: str, task_context: dict[str, Any]) -> None:
-    """把任务物料落到 attempt workspace。缺失即抛 FileNotFoundError——
-    宁可 attempt 判失败，也不让 agent 在空 workspace 里搜文件。"""
+def _allowed_upload_roots(
+    data_path: Path,
+    *,
+    env_name: str | None = None,
+    env: Any = None,
+    allowed_roots: Iterable[Path] | None = None,
+) -> list[Path]:
+    """收集允许作为上传物料来源的根目录（Scheme A 纵深防御）。"""
+    roots: list[Path] = []
+    seen: set[Path] = set()
+
+    def _add(path: Path | str | None) -> None:
+        if path is None:
+            return
+        resolved = Path(path).resolve()
+        if resolved not in seen:
+            seen.add(resolved)
+            roots.append(resolved)
+
+    _add(data_path / "uploads")
+    if env is not None and getattr(env, "env_dir", None) is not None:
+        _add(env.env_dir)
+
+    try:
+        state = runtime_state.get()
+    except RuntimeError:
+        state = None
+
+    if state is not None:
+        if env_name and isinstance(state.envs, dict):
+            state_env = state.envs.get(env_name)
+            if state_env is not None and getattr(state_env, "env_dir", None) is not None:
+                _add(state_env.env_dir)
+        settings = getattr(state, "settings", None)
+        octagon = getattr(settings, "octagon", None)
+        if octagon is not None:
+            envs_path = getattr(octagon, "envs_path", None)
+            if envs_path is not None:
+                _add(envs_path)
+            selected_skills_path = getattr(octagon, "selected_skills_path", None)
+            if selected_skills_path is not None:
+                _add(selected_skills_path)
+
+    if allowed_roots is not None:
+        for root in allowed_roots:
+            _add(root)
+
+    return roots
+
+
+def _copy_uploads(
+    data_path: Path,
+    attempt_id: str,
+    task_context: dict[str, Any],
+    *,
+    env_name: str | None = None,
+    env: Any = None,
+    allowed_roots: Iterable[Path] | None = None,
+) -> None:
+    """把任务物料落到 attempt workspace。缺失即抛 FileNotFoundError，越界即抛 PermissionError——
+    宁可 attempt 判失败，也不让 agent 在空 workspace 里搜文件或越权读取宿主机文件。"""
     uploaded = task_context.get("uploaded_files")
     if not uploaded or not isinstance(uploaded, list):
         return
+    roots = _allowed_upload_roots(
+        data_path, env_name=env_name, env=env, allowed_roots=allowed_roots
+    )
     workspace = data_path / "attempts" / attempt_id / "skill_workspace"
     workspace.mkdir(parents=True, exist_ok=True)
     for f in uploaded:
-        src = Path(f.get("path", ""))
+        raw_path = f.get("path", "")
+        if isinstance(raw_path, Path):
+            raw_str = str(raw_path)
+        elif isinstance(raw_path, str):
+            raw_str = raw_path
+        else:
+            raw_str = ""
+        if not raw_str.strip():
+            raise FileNotFoundError(
+                f"任务物料不存在: {f.get('name') or ''} ({raw_path!r})"
+            )
+        src = Path(raw_str)
         if not src.is_absolute():
             src = Path(".").resolve() / src
-        if not src.is_file():
+        resolved = src.resolve()
+        if not any(
+            resolved != root and resolved.is_relative_to(root)
+            for root in roots
+        ):
+            raise PermissionError(
+                f"上传物料路径超出允许目录边界: {f.get('name') or src.name}"
+            )
+        if not resolved.is_file():
             raise FileNotFoundError(
                 f"任务物料不存在: {f.get('name') or src.name} ({src})"
             )
@@ -1202,8 +1293,8 @@ def _copy_uploads(data_path: Path, attempt_id: str, task_context: dict[str, Any]
         dest = workspace / name
         if dest.exists():
             continue
-        shutil.copy2(src, dest)
-        logger.info("_copy_uploads: %s -> %s", src, dest)
+        shutil.copy2(resolved, dest)
+        logger.info("_copy_uploads: %s -> %s", resolved, dest)
 
 
 def _normalize_upload_paths(task: AdapterRunInput) -> None:

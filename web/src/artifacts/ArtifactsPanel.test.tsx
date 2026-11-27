@@ -1,7 +1,8 @@
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { cleanup, fireEvent, screen, waitFor, within } from "@testing-library/react";
 import "@testing-library/jest-dom/vitest";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { useState } from "react";
+import { renderWithI18n as render } from "../i18n/test-utils";
 
 const { preview } = vi.hoisted(() => ({ preview: vi.fn() }));
 vi.mock("../api/client", async (orig) => {

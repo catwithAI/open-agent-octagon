@@ -36,11 +36,13 @@ class ArtifactCollector:
                 row['error']='artifact_total_limit';rows.append(row);gaps.append({'path':path,'reason':row['error']});continue
             try:
                 data=await self.runtime.download(session_id,path,max_bytes=max_bytes)
+                hash_=digest(data)
                 # A second read detects common concurrent changes. This is not a
                 # claim of a cross-file atomic filesystem snapshot.
                 second=await self.runtime.download(session_id,path,max_bytes=max_bytes)
-                if digest(data)!=digest(second):raise ValueError('file_changed_during_collection')
-                hash_=digest(data)
+                changed=digest(second)!=hash_
+                del second
+                if changed:raise ValueError('file_changed_during_collection')
                 if path in inputs:
                     if hash_!=inputs[path]['hash']:
                         observations.append({'kind':'input_modified','path':path,'scope':'unsupported_input_changes'})

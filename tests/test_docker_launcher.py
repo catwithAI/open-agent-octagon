@@ -212,17 +212,28 @@ def test_exec_argv_only_passes_adapter_set_env(tmp_path: Path, monkeypatch: pyte
     sb = _sandbox(tmp_path)
     env = {**os.environ, "ANTHROPIC_AUTH_TOKEN": "tok", "CLAUDE_CONFIG_DIR": "/home/agent/.claude",
            "HOME": "/home/agent", "PATH": "/host/bin"}
-    argv = sb.build_exec_argv(ExecSpec(argv=["claude", "-p", "hi"], cwd=str(sb.workspace), env=env))
-    s = " ".join(argv)
-    assert argv[:3] == ("docker", "exec", "-i")
-    assert f"-w {sb.workspace}" in s
-    assert "-e ANTHROPIC_AUTH_TOKEN=tok" in s and "-e CLAUDE_CONFIG_DIR=/home/agent/.claude" in s
-    assert "HOST_SECRET" not in s                         # 宿主机环境不透传
-    assert "-e PATH=" not in s                            # 镜像 PATH
-    assert "-e LANG=C.UTF-8" in s                         # 无害直通
-    assert "-e http_proxy=http://host.docker.internal:7890" in s
-    assert argv[-3:] == ("claude", "-p", "hi")
-    assert argv[argv.index("ctr123") - 1] != "-e"
+    try:
+        argv = sb.build_exec_argv(ExecSpec(argv=["claude", "-p", "hi"], cwd=str(sb.workspace), env=env))
+        s = " ".join(argv)
+        assert argv[:3] == ("docker", "exec", "-i")
+        assert f"-w {sb.workspace}" in s
+        # 凭据与单行环境变量改走 --env-file，不出现在 docker exec 命令行 argv 中
+        assert "ANTHROPIC_AUTH_TOKEN" not in s
+        assert "HOST_SECRET" not in s
+        assert "--env-file" in argv
+        env_file = Path(argv[argv.index("--env-file") + 1])
+        env_lines = set(env_file.read_text(encoding="utf-8").splitlines())
+        assert "ANTHROPIC_AUTH_TOKEN=tok" in env_lines
+        assert "CLAUDE_CONFIG_DIR=/home/agent/.claude" in env_lines
+        assert not any(line.startswith("HOST_SECRET=") for line in env_lines)   # 宿主机环境不透传
+        assert not any(line.startswith("PATH=") for line in env_lines)          # 镜像 PATH
+        assert "LANG=C.UTF-8" in env_lines                                      # 无害直通
+        assert "http_proxy=http://host.docker.internal:7890" in env_lines
+        assert argv[-3:] == ("claude", "-p", "hi")
+        assert argv[argv.index("ctr123") - 1] != "-e"
+    finally:
+        sb.cleanup_env_files()
+    assert not env_file.exists()
 
 
 def test_exec_cwd_is_resolved_to_absolute(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -487,12 +498,20 @@ def test_dsh_launch_args_override(tmp_path: Path) -> None:
            "DSH_CORDIS_CONFIG": "/attempt/dsh_cordis.yml", "DEEPSEEK_API_KEY": "k"}
     assert _launch_args_override(HostAttemptSandbox(_spec(tmp_path)), cwd="/w", env=env) is None
     sb = _sandbox(tmp_path)
-    argv = _launch_args_override(sb, cwd=str(sb.workspace), env=env)
-    assert argv[:3] == ["docker", "exec", "-i"] and argv[-1] == SANDBOX_RUNTIME_BIN
-    s = " ".join(argv)
-    for k, v in env.items():
-        assert f"-e {k}={v}" in s
-    assert "ctr123" in argv
+    try:
+        argv = _launch_args_override(sb, cwd=str(sb.workspace), env=env)
+        assert argv[:3] == ["docker", "exec", "-i"] and argv[-1] == SANDBOX_RUNTIME_BIN
+        s = " ".join(argv)
+        assert "DEEPSEEK_API_KEY" not in s
+        assert "--env-file" in argv
+        env_file = Path(argv[argv.index("--env-file") + 1])
+        env_lines = set(env_file.read_text(encoding="utf-8").splitlines())
+        for k, v in env.items():
+            assert f"{k}={v}" in env_lines
+        assert "ctr123" in argv
+    finally:
+        sb.cleanup_env_files()
+    assert not env_file.exists()
 
 
 def test_dsh_adapter_locus_follows_launcher(tmp_path: Path) -> None:
