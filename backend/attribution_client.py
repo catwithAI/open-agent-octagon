@@ -28,6 +28,8 @@ from typing import Any
 
 import httpx
 
+from .evals_scorer import judge_visible_path, resolve_attempt_dir
+
 logger = logging.getLogger(__name__)
 
 ATTRIBUTION_CLIENT_VERSION = "octagon-attribution-client-v1"
@@ -143,6 +145,13 @@ def attribute_dimension(
     return attribution
 
 
+def resolve_attribution_attempt_dir(
+    data_path: Path, attempt_id: str, *, db_path: Path | None = None
+) -> Path:
+    """解析归因读取的 attempt 目录：优先冻结 scoring-work 快照，否则回落实时目录。"""
+    return resolve_attempt_dir(data_path, attempt_id, db_path=db_path)
+
+
 def attribute_attempt(
     *,
     data_path: Path,
@@ -161,6 +170,16 @@ def attribute_attempt(
     单维失败不打断其余维度——归因是尽力而为的分析，部分结果仍然有用。返回
     ``{"attempt_id", "attributed": [...], "errors": [...], "skipped": [...]}``。
     """
+    resolved_dir = resolve_attribution_attempt_dir(data_path, attempt_id)
+    live_dir = (Path(data_path) / "attempts" / attempt_id).resolve()
+    effective_evidence = dict(evidence)
+    current_attempt_dir = effective_evidence.get("attempt_dir")
+    if resolved_dir.resolve() != live_dir and (
+        not current_attempt_dir
+        or Path(str(current_attempt_dir)).resolve() == live_dir
+    ):
+        effective_evidence["attempt_dir"] = judge_visible_path(resolved_dir)
+
     by_id = {str(d.get("id")): d for d in dimensions if d.get("id")}
     selected = select_dimensions(scores, threshold=threshold, max_dimensions=max_dimensions)
     attributed: list[dict[str, Any]] = []
@@ -182,7 +201,7 @@ def attribute_attempt(
                 attribution_id=f"{job_id}:{attempt_id}:{name}",
                 dimension=dimension,
                 score=score,
-                evidence=evidence,
+                evidence=effective_evidence,
             )
         except AttributionError as exc:
             logger.warning("归因失败 attempt=%s dimension=%s: %s", attempt_id, name, exc)

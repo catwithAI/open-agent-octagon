@@ -83,7 +83,8 @@ def mutation_input_from_task(task: Any) -> MutationInput:
     constraints = dict(value("constraints", {}))
     prompt = str(value("prompt", ""))
     task_id = value("id", None)
-    mutation_meta = context.get("_mutation") or {}
+    task_env_name = value("env_name", None)
+    mutation_meta = dict(context.get("_mutation") or {})
     protected = tuple(
         ProtectedSpan.model_validate(item)
         for item in mutation_meta.get("protected_spans", [])
@@ -95,6 +96,11 @@ def mutation_input_from_task(task: Any) -> MutationInput:
         constraints=constraints,
         material_hashes=material_hashes,
     )
+    if task_env_name:
+        context = {
+            **context,
+            "_mutation": {**mutation_meta, "env_name": str(task_env_name)},
+        }
     return MutationInput(
         source_task_id=task_id,
         prompt=prompt,
@@ -125,6 +131,7 @@ def build_preview(
     registry: MutatorRegistry,
     payload_store: PreviewPayloadStore,
     persist_execution_payloads: bool = False,
+    env_name: str | None = None,
 ) -> VariantPreview:
     variants: list[PreviewVariant] = []
     blocking: list[str] = []
@@ -218,12 +225,25 @@ def build_preview(
             blocking.append(f"{spec.mutator_id}: {message}")
 
     protocol_hash = canonical_hash(protocol)
+    effective_env_name = (
+        env_name
+        if env_name is not None
+        else (source.context.get("_mutation") or {}).get("env_name")
+    )
+    preview_token = canonical_hash(
+        {
+            "protocol_hash": protocol_hash,
+            "source_hash": source.source_hash,
+            "env_name": str(effective_env_name or ""),
+        }
+    )
     return VariantPreview(
         source_hash=source.source_hash,
         protocol_hash=protocol_hash,
-        # The canonical protocol hash is the stateless preview
-        # token.  Create regenerates the normalized protocol and compares it.
-        preview_token=protocol_hash,
+        # Bind preview_token to protocol_hash, source_hash, and env_name so a
+        # token from one task/environment cannot validate a different prompt/env
+        # that happens to reuse the same protocol.
+        preview_token=preview_token,
         cells=protocol.cell_count,
         attempts=protocol.attempt_count,
         variants=tuple(variants),

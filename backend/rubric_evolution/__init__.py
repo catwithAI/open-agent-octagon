@@ -1,4 +1,7 @@
-"""Offline, batch-driven Rubric Evolution.
+"""FROZEN (D1): Offline, batch-driven Rubric Evolution.
+
+This package is frozen: no new feature investment should be made until an
+executable rubric scoring backend exists.
 
 The package is deliberately outside the live judge path: judges execute the
 currently frozen rubric; this loop reads persisted evidence and proposes a new,

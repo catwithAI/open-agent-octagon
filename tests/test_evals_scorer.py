@@ -155,7 +155,8 @@ def test_no_lineage_skips_judge_result(tmp_path, monkeypatch):
     scorer, _ = _scorer(
         tmp_path, monkeypatch,
         responses=[{"status": "completed", "results": [
-            {"dimension_id": "d", "value": 0.5, "reason": "x", "lineage": {}},
+            {"dimension_id": "functional_correctness", "value": 0.5, "reason": "x", "lineage": {}},
+            {"dimension_id": "regression_safety", "value": 0.5, "reason": "x", "lineage": {}},
         ], "usage": None, "error": None}],
     )
     scorer(attempt_id="att1", task={}, env_db=None, trace=[], final_state={})

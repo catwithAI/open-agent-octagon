@@ -140,9 +140,15 @@ class RecommendationRepository:
         payload = recommendation.model_dump(mode="json")
         with _open_sync(Path(self.db_path)) as conn:
             conn.execute(
-                "INSERT OR IGNORE INTO profile_recommendations(id,scope_key,feature_hash,"
+                "INSERT INTO profile_recommendations(id,scope_key,feature_hash,"
                 "algorithm_version,recommendation_json,schema_version,created_at) "
-                "VALUES(?,?,?,?,?,?,?)",
+                "VALUES(?,?,?,?,?,?,?) "
+                "ON CONFLICT(id) DO UPDATE SET "
+                "scope_key=excluded.scope_key,"
+                "feature_hash=excluded.feature_hash,"
+                "algorithm_version=excluded.algorithm_version,"
+                "recommendation_json=excluded.recommendation_json,"
+                "schema_version=excluded.schema_version",
                 (
                     recommendation.id,
                     recommendation.scope_key,

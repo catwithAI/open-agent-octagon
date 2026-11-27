@@ -29,7 +29,7 @@ from typing import Any
 import httpx
 
 from .db import _now_iso, _open_sync
-from .evals_scorer import COMPARISON_METHODS
+from .evals_scorer import COMPARISON_METHODS, judge_visible_path, resolve_attempt_dir
 
 logger = logging.getLogger(__name__)
 
@@ -279,12 +279,12 @@ def run_comparisons(
     # 本身带偏，而不是被交付物质量带偏。路径必须绝对——judge 在自己的临时工作区
     # 里执行，相对路径它找不到，也不会报错，只会开始满盘乱找。
     from .atif_evidence import materialize_atif
-    from .evals_scorer import judge_visible_path
 
     evidence_by_attempt: dict[str, dict[str, Any]] = {}
     for aid in candidate_ids:
+        attempt_dir = resolve_attempt_dir(Path(data_path), aid, db_path=db_path)
         item: dict[str, Any] = {
-            "attempt_dir": judge_visible_path(data_path, "attempts", aid),
+            "attempt_dir": judge_visible_path(attempt_dir),
         }
         atif = materialize_atif(Path(data_path), aid)
         item["atif_trajectory_path"] = (

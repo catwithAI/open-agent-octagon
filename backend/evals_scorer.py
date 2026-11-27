@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import json
 import logging
+import math
+import sqlite3
 from pathlib import Path
 from typing import Any
 
@@ -170,6 +172,59 @@ def judge_visible_path(*parts: Any) -> str:
     return str(Path(*parts).resolve())
 
 
+def resolve_attempt_dir(
+    data_path: Path,
+    attempt_id: str,
+    *,
+    db_path: Path | None = None,
+) -> Path:
+    """解析 attempt 交付物目录：优先返回最新冻结评分快照，不存在则回落实时目录。
+
+    pointwise 评分评的是 ``scoring-work/<job_id>/attempts/<attempt_id>`` 冻结快照
+    （见 ``build_evidence`` 注释），comparison 与 attribution 共用此解析函数，
+    确保三者看到同一份交付物而非在快照与实时目录之间分叉。
+    """
+    root = Path(data_path)
+    scoring_work = root / "scoring-work"
+
+    if db_path is not None and Path(db_path).is_file():
+        try:
+            with sqlite3.connect(Path(db_path)) as conn:
+                rows = conn.execute(
+                    "SELECT id FROM scoring_jobs WHERE attempt_id=? "
+                    "ORDER BY CASE WHEN status='completed' THEN 0 ELSE 1 END, "
+                    "COALESCE(ended_at, created_at) DESC, created_at DESC",
+                    (attempt_id,),
+                ).fetchall()
+            for (job_id,) in rows:
+                candidate = scoring_work / str(job_id) / "attempts" / attempt_id
+                if candidate.is_dir():
+                    return candidate
+        except (sqlite3.Error, OSError):
+            pass
+
+    if scoring_work.is_dir():
+        matches: list[tuple[int, str, Path]] = []
+        try:
+            for job_dir in scoring_work.iterdir():
+                if not job_dir.is_dir():
+                    continue
+                candidate = job_dir / "attempts" / attempt_id
+                if candidate.is_dir():
+                    try:
+                        mtime_ns = candidate.stat().st_mtime_ns
+                    except OSError:
+                        mtime_ns = 0
+                    matches.append((mtime_ns, job_dir.name, candidate))
+        except OSError:
+            matches = []
+        if matches:
+            matches.sort(key=lambda entry: (entry[0], entry[1]), reverse=True)
+            return matches[0][2]
+
+    return root / "attempts" / attempt_id
+
+
 #: 非 agentic judge 的内联证据上限。它只能看 prompt，材料必须内联，但无上限
 #: 内联会把网关打挂：2026-09-24 实测 135KB 的 evidence 让单次请求挂了 10 分钟
 #: （0.4% CPU，纯等响应）。超限**显式截断并写明**，绝不静默丢。
@@ -249,11 +304,14 @@ def build_evidence(
     而冻结快照里没有 sandbox_home。轨迹是归因辅助材料，不是被评对象，这个
     不对称是有意的。
     """
+    attempt_dir = (
+        judge_visible_path(input_path, "attempts", attempt_id)
+        if input_path is not None
+        else judge_visible_path(resolve_attempt_dir(data_path, attempt_id))
+    )
     evidence: dict[str, Any] = {
         "final_state": final_state,
-        "attempt_dir": judge_visible_path(
-            input_path or data_path, "attempts", attempt_id
-        ),
+        "attempt_dir": attempt_dir,
     }
     env_dir = getattr(env, "env_dir", None)
     if env_dir:
@@ -392,30 +450,65 @@ def make_evals_scorer(
             body = resp.json()
         except ValueError as exc:
             raise EvalsJudgeError(f"octagon-evals 响应非 JSON: {exc}") from exc
+        if not isinstance(body, dict):
+            raise EvalsJudgeError(f"octagon-evals 响应非 JSON 对象: {body!r}")
         if body.get("status") != "completed":
             raise EvalsJudgeError(
                 f"octagon-evals 评分失败: {body.get('error') or body.get('status')}"
             )
+        raw_results = body.get("results")
+        if not isinstance(raw_results, list) or (dimensions and not raw_results):
+            raise EvalsJudgeError(
+                f"octagon-evals 响应缺少有效 results（预期 {len(dimensions)} 维）: {raw_results!r}"
+            )
+        expected_ids = {str(d["id"]) for d in dimensions}
+        seen_ids: set[str] = set()
         results: list[dict[str, Any]] = []
         models: set[str] = set()
         prompts: set[str] = set()
-        for item in body.get("results") or []:
+        for item in raw_results:
+            if not isinstance(item, dict):
+                raise EvalsJudgeError(f"evals 维度结果非法: {item!r}")
+            raw_value = item.get("value")
+            if isinstance(raw_value, bool) or raw_value is None:
+                raise EvalsJudgeError(f"evals 维度分非法: {item}")
             try:
-                value = int(round(float(item["value"]) * 100))
-            except (KeyError, TypeError, ValueError) as exc:
+                numeric = float(raw_value)
+            except (TypeError, ValueError, OverflowError) as exc:
                 raise EvalsJudgeError(f"evals 维度分非法: {item}") from exc
+            if not math.isfinite(numeric) or not (0.0 <= numeric <= 1.0):
+                raise EvalsJudgeError(
+                    f"evals 维度分非法（须为 [0, 1] 有限数值）: {item}"
+                )
+            value = int(round(numeric * 100))
+            dim_id = item.get("dimension_id")
+            if not isinstance(dim_id, str) or not dim_id.strip():
+                raise EvalsJudgeError(f"evals 维度结果缺少有效 dimension_id: {item}")
+            if dim_id in seen_ids:
+                raise EvalsJudgeError(f"evals 返回重复 dimension_id: {dim_id!r}")
+            if dim_id not in expected_ids:
+                raise EvalsJudgeError(
+                    f"evals 返回未知 dimension_id={dim_id!r}，预期: {sorted(expected_ids)}"
+                )
+            seen_ids.add(dim_id)
             results.append(
                 {
-                    "dimension": str(item.get("dimension_id", "")),
+                    "dimension": dim_id,
                     "value": value,
                     "detail": str(item.get("reason") or ""),
                 }
             )
             lineage = item.get("lineage") or {}
-            if lineage.get("model"):
-                models.add(str(lineage["model"]))
-            if lineage.get("prompt_version"):
-                prompts.add(str(lineage["prompt_version"]))
+            if isinstance(lineage, dict):
+                if lineage.get("model"):
+                    models.add(str(lineage["model"]))
+                if lineage.get("prompt_version"):
+                    prompts.add(str(lineage["prompt_version"]))
+        missing_ids = expected_ids - seen_ids
+        if missing_ids:
+            raise EvalsJudgeError(
+                f"evals 响应缺少预期维度: {sorted(missing_ids)}"
+            )
         _write_judge_result(data_path, job_id, models, prompts)
         return results
 
