@@ -25,6 +25,7 @@ class ReadClient:
 
 
 async def test_preflight_only_reads_and_never_executes():
+    pytest.importorskip("blade_agent_kit")
     args=probe.parser().parse_args(['--preflight'])
     ReadClient.calls=[]
     with respx.mock as router:
@@ -38,6 +39,7 @@ async def test_preflight_only_reads_and_never_executes():
 
 
 async def test_execute_requires_an_explicit_model_before_any_network():
+    pytest.importorskip("blade_agent_kit")
     args=probe.parser().parse_args(['--execute'])
     with pytest.raises(ValueError,match='requires --model'):
         await probe.verify(args,client_factory=ReadClient,settings=Settings(blade={'api_key':'fixture'}))

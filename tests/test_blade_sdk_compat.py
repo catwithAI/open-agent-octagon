@@ -6,6 +6,9 @@ from pathlib import Path
 import httpx
 import pytest
 import respx
+
+pytest.importorskip("blade_agent_kit")
+
 from blade_agent_kit import RawEvent
 
 from backend.adapters.blade_service import BladeAdapterConfig, BladeServiceAdapter

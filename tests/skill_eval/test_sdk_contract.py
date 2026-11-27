@@ -5,6 +5,9 @@ from importlib.metadata import version
 import httpx
 import pytest
 import respx
+
+pytest.importorskip("blade_agent_kit")
+
 from blade_agent_kit import BladeAgentClient, RawEvent
 from blade_agent_kit.events import ChatEnd
 

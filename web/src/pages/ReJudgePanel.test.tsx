@@ -5,10 +5,10 @@
 // 后端拒绝时错误如实渲染，不吞。
 import { describe, it, expect, afterEach, beforeEach, vi } from "vitest";
 import type { ComponentProps } from "react";
-import { render, screen, cleanup, waitFor, fireEvent } from "@testing-library/react";
+import { screen, cleanup, waitFor, fireEvent } from "@testing-library/react";
 import "@testing-library/jest-dom/vitest";
 
-import { I18nProvider } from "../i18n";
+import { renderWithI18n } from "../i18n/test-utils";
 import { api, type JudgeRun } from "../api/client";
 import { ReJudgePanel } from "../components/ReJudgePanel";
 
@@ -18,9 +18,6 @@ afterEach(() => {
 });
 
 beforeEach(() => {
-  // 语言态存 localStorage；先设成 zh，I18nProvider 挂载时 detectDefault 读到
-  // 中文，断言才能匹配中文文案（其它既有组件测试因没包 provider 已在此环境失败）。
-  localStorage.setItem("octagon.lang", "zh");
   // 挂载即拉历史；默认给空历史，避免真实 fetch 噪音
   vi.spyOn(api, "getJudgeRuns").mockResolvedValue({ attempt_id: "att1", items: [] });
 });
@@ -43,10 +40,8 @@ function judgeRun(over: Partial<JudgeRun> = {}): JudgeRun {
 }
 
 function mount(props: Partial<ComponentProps<typeof ReJudgePanel>> = {}) {
-  render(
-    <I18nProvider>
-      <ReJudgePanel runId="run1" attemptId="att1" scoringStatus="completed" {...props} />
-    </I18nProvider>,
+  renderWithI18n(
+    <ReJudgePanel runId="run1" attemptId="att1" scoringStatus="completed" {...props} />,
   );
 }
 

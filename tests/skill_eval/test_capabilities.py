@@ -1,3 +1,5 @@
+import importlib.metadata
+
 import httpx
 import pytest
 import respx
@@ -8,6 +10,11 @@ from backend.skill_eval.capabilities import Capabilities
 async def test_model_catalog_is_not_execution_verification(monkeypatch):
     cfg=Settings(blade={'base_url':'https://blade.test','api_key':'canary'},skill_eval={'enabled':True})
     capability=Capabilities(cfg)
+    orig_version=importlib.metadata.version
+    monkeypatch.setattr(
+        'backend.skill_eval.capabilities.importlib.metadata.version',
+        lambda name: '2612.0.0b41' if name == 'blade-agent-kit' else orig_version(name),
+    )
     monkeypatch.setattr('backend.skill_eval.capabilities.shutil.which',lambda _:None)
     with respx.mock as router:
         router.get('https://blade.test/api/version').respond(200,json={'version':'beta.42'})
