@@ -1470,7 +1470,7 @@ async def _stream_run_events(
         # walking artifact directories or reading wire manifests; otherwise
         # each reconnect from an already-open result tab repeats expensive
         # filesystem scans for a run that can no longer change.
-        if run.get("status") in {"completed", "failed"}:
+        if run.get("status") in {"completed", "failed", "cancelled"}:
             yield _sse("stream:end", {"run_id": run_id, "status": run.get("status")})
             return
 

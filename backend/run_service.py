@@ -364,6 +364,122 @@ def _resolve_timeout_seconds(
     return request.timeout_seconds
 
 
+def _validate_caller_uploaded_files(
+    raw_uploaded: Any,
+    uploads_root: Path,
+) -> list[dict[str, Any]]:
+    """Validate caller-supplied ``context.uploaded_files`` (D2 Scheme A).
+
+    Every entry must be a dict whose ``path`` resolves strictly inside
+    ``uploads_root`` (``<data_path>/uploads``) and exists as a regular file,
+    preventing HTTP callers from reading arbitrary host files via absolute
+    paths, ``..`` traversal, or symlinks.
+    """
+    if raw_uploaded is None:
+        return []
+    if not isinstance(raw_uploaded, list):
+        raise RunServiceError(
+            400, "context.uploaded_files must be a list of file objects"
+        )
+    if not raw_uploaded:
+        return []
+    resolved_root = uploads_root.resolve()
+    validated: list[dict[str, Any]] = []
+    for idx, entry in enumerate(raw_uploaded):
+        if not isinstance(entry, dict):
+            raise RunServiceError(
+                400, f"context.uploaded_files[{idx}] must be a dict"
+            )
+        raw_path = entry.get("path")
+        if not isinstance(raw_path, str) or not raw_path.strip():
+            raise RunServiceError(
+                400,
+                f"context.uploaded_files[{idx}].path must be a non-empty string",
+            )
+        try:
+            resolved = Path(raw_path).resolve()
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise RunServiceError(
+                400,
+                f"context.uploaded_files[{idx}].path is invalid: {exc}",
+            ) from exc
+        if not resolved.is_relative_to(resolved_root) or resolved == resolved_root:
+            raise RunServiceError(
+                400,
+                f"context.uploaded_files[{idx}].path must be inside uploads directory",
+            )
+        if not resolved.is_file():
+            raise RunServiceError(
+                400,
+                f"context.uploaded_files[{idx}].path does not exist or is not a regular file",
+            )
+        raw_name = entry.get("name")
+        if raw_name is not None:
+            if not isinstance(raw_name, str) or not raw_name.strip():
+                raise RunServiceError(
+                    400,
+                    f"context.uploaded_files[{idx}].name must be a non-empty string",
+                )
+            if Path(raw_name).name != raw_name or raw_name in {"", ".", ".."}:
+                raise RunServiceError(
+                    400,
+                    f"context.uploaded_files[{idx}].name must be a plain filename",
+                )
+        item = dict(entry)
+        item["path"] = str(resolved)
+        if not item.get("name"):
+            item["name"] = resolved.name
+        validated.append(item)
+    return validated
+
+
+def _merge_task_and_caller_context(
+    task_context: dict[str, Any],
+    caller_context: dict[str, Any],
+    validated_caller_uploads: list[dict[str, Any]],
+    *,
+    is_adhoc: bool,
+) -> dict[str, Any]:
+    """Merge server task context with caller context without clobbering server uploads."""
+    caller_without_uploads = {
+        k: v for k, v in caller_context.items() if k != "uploaded_files"
+    }
+    context = {**task_context, **caller_without_uploads}
+    if is_adhoc:
+        if validated_caller_uploads:
+            context["uploaded_files"] = validated_caller_uploads
+        elif "uploaded_files" in caller_context and caller_context.get("uploaded_files") == []:
+            context["uploaded_files"] = []
+        return context
+
+    server_uploads = task_context.get("uploaded_files")
+    if isinstance(server_uploads, list) and server_uploads:
+        if validated_caller_uploads:
+            merged: list[Any] = [copy.deepcopy(item) for item in server_uploads]
+            seen_names = {
+                str(item.get("name") or Path(str(item.get("path", ""))).name)
+                for item in merged
+                if isinstance(item, dict)
+            }
+            for item in validated_caller_uploads:
+                name = str(item.get("name") or Path(str(item["path"])).name)
+                if name not in seen_names:
+                    merged.append(item)
+                    seen_names.add(name)
+            context["uploaded_files"] = merged
+        else:
+            context["uploaded_files"] = copy.deepcopy(server_uploads)
+    elif validated_caller_uploads:
+        context["uploaded_files"] = validated_caller_uploads
+    elif (
+        "uploaded_files" in caller_context
+        and caller_context.get("uploaded_files") == []
+        and "uploaded_files" not in task_context
+    ):
+        context["uploaded_files"] = []
+    return context
+
+
 async def create_run_plan(
     request: NormalizedRunRequest,
     *,
@@ -436,130 +552,149 @@ async def create_run_plan(
                 return existing
 
         try:
+            caller_context = dict(request.context or {})
+            validated_caller_uploads = (
+                _validate_caller_uploaded_files(
+                    caller_context.get("uploaded_files"),
+                    state.data_path / "uploads",
+                )
+                if "uploaded_files" in caller_context
+                else []
+            )
             task_id, env_name = _get_or_create_task(state.db_path, request)
-        except Exception:
+            with _open_sync(state.db_path) as conn:
+                row = conn.execute(
+                    "SELECT prompt, context_json, constraints_json, timeout_seconds "
+                    "FROM tasks WHERE id=?",
+                    (task_id,),
+                ).fetchone()
+            prompt = row[0] if row else (request.prompt or "")
+            task_context = json.loads(row[1]) if row and row[1] else {}
+            context = _merge_task_and_caller_context(
+                task_context,
+                caller_context,
+                validated_caller_uploads,
+                is_adhoc=request.task_id is None,
+            )
+            constraints = (
+                json.loads(row[2]) if row and row[2] else (request.constraints or {})
+            )
+            task_timeout_seconds = row[3] if row else None
+            timeout_seconds = _resolve_timeout_seconds(task_timeout_seconds, request)
+            if input_override is not None:
+                if request.task_id is None:
+                    raise RunServiceError(
+                        400, "input_override requires source task_id lineage"
+                    )
+                prompt = input_override.prompt
+                context = copy.deepcopy(input_override.context)
+                constraints = copy.deepcopy(input_override.constraints)
+                timeout_seconds = input_override.timeout_seconds
+
+            from .conversation.plan import (
+                CONVERSATION_CONTEXT_KEY,
+                ConversationPlanError,
+                parse_conversation,
+            )
+
+            if CONVERSATION_CONTEXT_KEY in (context or {}):
+                try:
+                    parse_conversation(context[CONVERSATION_CONTEXT_KEY], task_id=task_id)
+                except ConversationPlanError as exc:
+                    raise RunServiceError(400, f"invalid conversation: {exc}") from exc
+
+            attempts_info: list[dict[str, Any]] = []
+            dispatch_jobs: list[dict[str, Any]] = []
+            refs = dict(parent_refs or {})
+            for agent_name, agent_model in job_plan:
+                blade_thinking = (
+                    request.blade_enable_thinking if agent_name == "blade-agent" else None
+                )
+                attempt, env_token = await create_attempt(
+                    task_id=task_id,
+                    agent_name=agent_name,
+                    run_id=run_id,
+                    compare_mode=request.compare_mode,
+                    model=agent_model,
+                    input_prompt=prompt,
+                    input_context=copy.deepcopy(context),
+                    input_constraints=copy.deepcopy(constraints),
+                    input_timeout_seconds=timeout_seconds,
+                    variant_id=(str(refs["variant_id"]) if refs.get("variant_id") else None),
+                    external_refs=refs,
+                )
+                dispatch_jobs.append(
+                    {
+                        "settings": settings,
+                        "attempt_id": attempt.id,
+                        "agent_name": agent_name,
+                        "task_id": task_id,
+                        "task_prompt": prompt,
+                        "task_context": copy.deepcopy(context),
+                        "timeout_seconds": timeout_seconds,
+                        "env_name": env_name,
+                        "env_token": env_token,
+                        "model": agent_model,
+                        "compare_mode": request.compare_mode,
+                        "blade_enable_thinking": blade_thinking,
+                        "capture_policy": request.capture_policy,
+                    }
+                )
+                attempts_info.append(
+                    {
+                        "attempt_id": attempt.id,
+                        "agent": agent_name,
+                        "model": agent_model,
+                        "status": attempt.status,
+                    }
+                )
+
+            with _open_sync(state.db_path) as conn:
+                conn.execute("UPDATE runs SET execution=? WHERE id=?", (execution, run_id))
+                conn.commit()
+
+            # 成本核算起点：**必须在任何 agent 进程启动前**建 key 并落
+            # usage_start——它是进程重启后能重新结算的唯一锚点（内存里的明文 key
+            # 会丢，但读 usage 只需 Management Key + hash，两者重启后都能重新拿到）。
+            # 放在这里而非 API 层：experiments / recovery 等入口也走 create_run_plan，
+            # 挂在这里才不会漏。成本核算失败绝不阻断 run（begin_run 内部已兜底）。
+            await _begin_cost_audit(
+                state.db_path, run_id, settings=settings, agents=list(request.agents)
+            )
+
+            created_run = CreatedRun(
+                run_id=run_id,
+                task_id=task_id,
+                env_name=env_name,
+                agents=list(request.agents),
+                attempts=attempts_info,
+                execution=execution,
+                dispatch_jobs=dispatch_jobs,
+            )
             if create_key:
                 with _open_sync(state.db_path) as conn:
-                    fail_idempotency(
-                        conn, operation="legacy_run:create", key=create_key
+                    complete_idempotency(
+                        conn,
+                        operation="legacy_run:create",
+                        key=create_key,
+                        result_id=run_id,
+                        response=created_run.response(),
                     )
                     conn.commit()
+            return created_run
+        except BaseException:
+            if create_key:
+                try:
+                    with _open_sync(state.db_path) as conn:
+                        fail_idempotency(
+                            conn, operation="legacy_run:create", key=create_key
+                        )
+                        conn.commit()
+                except Exception:
+                    logger.exception(
+                        "failed to mark idempotency key failed key=%s", create_key
+                    )
             raise
-        with _open_sync(state.db_path) as conn:
-            row = conn.execute(
-                "SELECT prompt, context_json, constraints_json, timeout_seconds "
-                "FROM tasks WHERE id=?",
-                (task_id,),
-            ).fetchone()
-        prompt = row[0] if row else (request.prompt or "")
-        task_context = json.loads(row[1]) if row and row[1] else {}
-        context = {**task_context, **(request.context or {})}
-        constraints = (
-            json.loads(row[2]) if row and row[2] else (request.constraints or {})
-        )
-        task_timeout_seconds = row[3] if row else None
-        timeout_seconds = _resolve_timeout_seconds(task_timeout_seconds, request)
-        if input_override is not None:
-            if request.task_id is None:
-                raise RunServiceError(
-                    400, "input_override requires source task_id lineage"
-                )
-            prompt = input_override.prompt
-            context = copy.deepcopy(input_override.context)
-            constraints = copy.deepcopy(input_override.constraints)
-            timeout_seconds = input_override.timeout_seconds
-
-        from .conversation.plan import (
-            CONVERSATION_CONTEXT_KEY,
-            ConversationPlanError,
-            parse_conversation,
-        )
-
-        if CONVERSATION_CONTEXT_KEY in (context or {}):
-            try:
-                parse_conversation(context[CONVERSATION_CONTEXT_KEY], task_id=task_id)
-            except ConversationPlanError as exc:
-                raise RunServiceError(400, f"invalid conversation: {exc}") from exc
-
-        attempts_info: list[dict[str, Any]] = []
-        dispatch_jobs: list[dict[str, Any]] = []
-        refs = dict(parent_refs or {})
-        for agent_name, agent_model in job_plan:
-            blade_thinking = (
-                request.blade_enable_thinking if agent_name == "blade-agent" else None
-            )
-            attempt, env_token = await create_attempt(
-                task_id=task_id,
-                agent_name=agent_name,
-                run_id=run_id,
-                compare_mode=request.compare_mode,
-                model=agent_model,
-                input_prompt=prompt,
-                input_context=copy.deepcopy(context),
-                input_constraints=copy.deepcopy(constraints),
-                input_timeout_seconds=timeout_seconds,
-                variant_id=(str(refs["variant_id"]) if refs.get("variant_id") else None),
-                external_refs=refs,
-            )
-            dispatch_jobs.append(
-                {
-                    "settings": settings,
-                    "attempt_id": attempt.id,
-                    "agent_name": agent_name,
-                    "task_id": task_id,
-                    "task_prompt": prompt,
-                    "task_context": copy.deepcopy(context),
-                    "timeout_seconds": timeout_seconds,
-                    "env_name": env_name,
-                    "env_token": env_token,
-                    "model": agent_model,
-                    "compare_mode": request.compare_mode,
-                    "blade_enable_thinking": blade_thinking,
-                    "capture_policy": request.capture_policy,
-                }
-            )
-            attempts_info.append(
-                {
-                    "attempt_id": attempt.id,
-                    "agent": agent_name,
-                    "model": agent_model,
-                    "status": attempt.status,
-                }
-            )
-
-        with _open_sync(state.db_path) as conn:
-            conn.execute("UPDATE runs SET execution=? WHERE id=?", (execution, run_id))
-            conn.commit()
-
-        # 成本核算起点：**必须在任何 agent 进程启动前**建 key 并落
-        # usage_start——它是进程重启后能重新结算的唯一锚点（内存里的明文 key
-        # 会丢，但读 usage 只需 Management Key + hash，两者重启后都能重新拿到）。
-        # 放在这里而非 API 层：experiments / recovery 等入口也走 create_run_plan，
-        # 挂在这里才不会漏。成本核算失败绝不阻断 run（begin_run 内部已兜底）。
-        await _begin_cost_audit(
-            state.db_path, run_id, settings=settings, agents=list(request.agents)
-        )
-
-        created_run = CreatedRun(
-            run_id=run_id,
-            task_id=task_id,
-            env_name=env_name,
-            agents=list(request.agents),
-            attempts=attempts_info,
-            execution=execution,
-            dispatch_jobs=dispatch_jobs,
-        )
-        if create_key:
-            with _open_sync(state.db_path) as conn:
-                complete_idempotency(
-                    conn,
-                    operation="legacy_run:create",
-                    key=create_key,
-                    result_id=run_id,
-                    response=created_run.response(),
-                )
-                conn.commit()
-        return created_run
 
 
 async def _begin_cost_audit(

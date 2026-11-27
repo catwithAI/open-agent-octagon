@@ -59,6 +59,7 @@ class RunService(SkillService):
                   (SELECT json_extract(r.payload_json,'$.body.payload.content')
                    FROM skill_eval_events r
                    WHERE r.run_id=e.run_id AND r.type='llm:response:done'
+                     AND r.seq<e.seq
                      AND r.seq>COALESCE((SELECT max(p.seq) FROM skill_eval_events p WHERE p.run_id=e.run_id AND p.type='chat:end' AND p.seq<e.seq),0)
                      AND json_extract(r.payload_json,'$.loop_name')='root'
                      AND json_extract(r.payload_json,'$.body.payload.role')='assistant'
@@ -167,6 +168,7 @@ class RunService(SkillService):
             if previous:return self._message_result(c.execute('SELECT * FROM skill_eval_messages WHERE id=?',(previous,)).fetchone())
             if run['finish_requested_at'] or run['run_status'] in TERMINAL:raise EvalError('run_finishing','Run no longer accepts messages')
             if run['run_status'] in ('queued','preparing'):raise EvalError('run_not_ready','Wait for session preparation')
+            if run['run_status']=='active' or run['generation_status'] in ('queued','running','stopping'):raise EvalError('generation_in_progress','Wait for the current generation to finish or stop before sending another message',409)
             if run['run_status']=='waiting_input' and not interaction_id:raise EvalError('answer_required','Answer the pending question first')
             interaction=None
             if interaction_id:

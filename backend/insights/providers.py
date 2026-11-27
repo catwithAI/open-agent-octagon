@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,6 +18,8 @@ from backend.insights.workspace import (
     OPENAI_WORKSPACE_TOOLS,
     EvidenceWorkspace,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class InsightProviderError(RuntimeError):
@@ -110,7 +113,7 @@ class OpenAICompatibleProvider:
         else:
             payload["tools"] = OPENAI_WORKSPACE_TOOLS
             payload["tool_choice"] = "auto"
-        usage: dict[str, Any] = {}
+        usage: dict[str, int] = {}
         try:
             async with httpx.AsyncClient(
                 timeout=self.config.timeout_seconds,
@@ -124,7 +127,18 @@ class OpenAICompatibleProvider:
                     )
                     response.raise_for_status()
                     body = response.json()
-                    usage = body.get("usage") or usage
+                    step_usage = body.get("usage")
+                    if isinstance(step_usage, dict):
+                        for key in (
+                            "prompt_tokens",
+                            "input_tokens",
+                            "completion_tokens",
+                            "output_tokens",
+                            "total_tokens",
+                        ):
+                            val = step_usage.get(key)
+                            if isinstance(val, (int, float)) and not isinstance(val, bool):
+                                usage[key] = usage.get(key, 0) + int(val)
                     choice = body["choices"][0]
                     message = choice.get("message") or {}
                     tool_calls = list(message.get("tool_calls") or [])
@@ -168,12 +182,18 @@ class OpenAICompatibleProvider:
                     text = message.get("content")
                     if not isinstance(text, str) or not text.strip():
                         raise ValueError("empty provider content")
+                    input_tokens = usage.get("prompt_tokens")
+                    if input_tokens is None:
+                        input_tokens = usage.get("input_tokens")
+                    output_tokens = usage.get("completion_tokens")
+                    if output_tokens is None:
+                        output_tokens = usage.get("output_tokens")
                     return ProviderResult(
                         text=text,
                         provider="openai_compatible",
                         model=self.config.model,
-                        input_tokens=usage.get("prompt_tokens"),
-                        output_tokens=usage.get("completion_tokens"),
+                        input_tokens=input_tokens,
+                        output_tokens=output_tokens,
                     )
                 raise ValueError("workspace tool loop exceeded 16 steps")
         except (httpx.HTTPError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
@@ -222,7 +242,8 @@ class BladeProvider:
         if not self.config.blade_primary_skill_id:
             raise InsightProviderError("blade_primary_skill_id is required for blade insights")
         session_id: str | None = None
-        parts: list[str] = []
+        delta_parts: list[str] = []
+        turn_end_parts: list[str] = []
         usage: dict[str, Any] = {}
         try:
             client = self._client(_api_key(self.config))
@@ -234,34 +255,46 @@ class BladeProvider:
                     memory_enabled=False,
                 )
                 session_id = session.id
-                if workspace is not None:
-                    await _upload_workspace(client, session_id, workspace)
-                stream = client.chat(session_id, prompt, headless=True)
                 try:
-                    async for event in stream:
-                        raw = event.raw if isinstance(event.raw, dict) else {}
-                        if event.kind == "llm:text:delta":
-                            content = (raw.get("payload") or {}).get("content")
-                            if content:
-                                parts.append(str(content))
-                        elif event.kind == "turn:end":
-                            for block in raw.get("blocks") or []:
-                                if block.get("type") in {"text", "output_text"}:
-                                    parts.append(str(block.get("content") or ""))
-                            usage = raw.get("usage") or usage
+                    if workspace is not None:
+                        await _upload_workspace(client, session_id, workspace)
+                    stream = client.chat(session_id, prompt, headless=True)
+                    try:
+                        async for event in stream:
+                            raw = event.raw if isinstance(event.raw, dict) else {}
+                            if event.kind == "llm:text:delta":
+                                content = (raw.get("payload") or {}).get("content")
+                                if content:
+                                    delta_parts.append(str(content))
+                            elif event.kind == "turn:end":
+                                for block in raw.get("blocks") or []:
+                                    if block.get("type") in {"text", "output_text"}:
+                                        content = block.get("content")
+                                        if content:
+                                            turn_end_parts.append(str(content))
+                                usage = raw.get("usage") or usage
+                    finally:
+                        closer = getattr(stream, "aclose", None)
+                        if closer is not None:
+                            result = closer()
+                            if inspect.isawaitable(result):
+                                await result
                 finally:
-                    closer = getattr(stream, "aclose", None)
-                    if closer is not None:
-                        result = closer()
-                        if inspect.isawaitable(result):
-                            await result
-                if session_id and not self.config.keep_blade_session:
-                    await client.delete_session(session_id)
+                    if session_id and not self.config.keep_blade_session:
+                        try:
+                            await client.delete_session(session_id)
+                        except Exception:
+                            logger.warning(
+                                "failed to delete blade session %s",
+                                session_id,
+                                exc_info=True,
+                            )
         except InsightProviderError:
             raise
         except Exception as exc:
             raise InsightProviderError(f"blade generation failed: {exc}") from exc
-        text = "".join(parts).strip()
+        delta_text = "".join(delta_parts).strip()
+        text = delta_text or "".join(turn_end_parts).strip()
         if not text:
             raise InsightProviderError("blade generation returned empty content")
         return ProviderResult(

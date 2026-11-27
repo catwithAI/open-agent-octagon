@@ -93,33 +93,45 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             allow_unavailable_core=True,
         )
         logger.info("loaded envs: %s", list(app.state.envs))
-        # Pre-executor releases could activate model-generated Product Rubrics
-        # while official scoring still ran the native environment scorer. Repair
-        # those pointers before any Run can freeze an invalid version, even when
-        # the evolution scheduler is disabled on this deployment.
-        from .rubric_evolution.cross_layer import (
-            reconcile_unversioned_process_evidence_sync,
-        )
-        from .rubric_evolution.store import reconcile_unexecutable_active_rubrics_sync
+        # 纯展示边界：HTTP 中间件拦不住进程内的启动写入、恢复与常驻任务——
+        # 它们不经过请求路径，却会改写 DB/文件系统或派发 judge（真实模型调用）。
+        # 因此在任何写操作前判定 display_only，只保留读路径所需的初始化。
+        from .display_only import BACKGROUND_WORK_SKIPPED, skip_background_work
 
-        repaired_rubrics = reconcile_unexecutable_active_rubrics_sync(
-            resolve_db_path(cfg.octagon.data_path)
-        )
-        if repaired_rubrics:
-            logger.error(
-                "quarantined unexecutable Active Product Rubrics: %s",
-                repaired_rubrics,
+        display_only = skip_background_work(cfg.octagon.display_only)
+        if display_only:
+            logger.warning(
+                "纯展示部署：跳过全部启动写入、恢复与常驻后台任务（%s）",
+                "；".join(f"{k}（{v}）" for k, v in BACKGROUND_WORK_SKIPPED.items()),
             )
-        repaired_process_evidence = reconcile_unversioned_process_evidence_sync(
-            resolve_db_path(cfg.octagon.data_path)
-        )
-        if any(repaired_process_evidence.values()):
-            logger.error(
-                "quarantined Process/Association evidence without version provenance: %s",
-                repaired_process_evidence,
+        if not display_only:
+            # Pre-executor releases could activate model-generated Product Rubrics
+            # while official scoring still ran the native environment scorer. Repair
+            # those pointers before any Run can freeze an invalid version, even when
+            # the evolution scheduler is disabled on this deployment.
+            from .rubric_evolution.cross_layer import (
+                reconcile_unversioned_process_evidence_sync,
             )
-        synced = sync_blade_skills(cfg.octagon.envs_path, cfg.blade.skills_path)
-        logger.info("synced blade skills: %s", synced)
+            from .rubric_evolution.store import reconcile_unexecutable_active_rubrics_sync
+
+            repaired_rubrics = reconcile_unexecutable_active_rubrics_sync(
+                resolve_db_path(cfg.octagon.data_path)
+            )
+            if repaired_rubrics:
+                logger.error(
+                    "quarantined unexecutable Active Product Rubrics: %s",
+                    repaired_rubrics,
+                )
+            repaired_process_evidence = reconcile_unversioned_process_evidence_sync(
+                resolve_db_path(cfg.octagon.data_path)
+            )
+            if any(repaired_process_evidence.values()):
+                logger.error(
+                    "quarantined Process/Association evidence without version provenance: %s",
+                    repaired_process_evidence,
+                )
+            synced = sync_blade_skills(cfg.octagon.envs_path, cfg.blade.skills_path)
+            logger.info("synced blade skills: %s", synced)
         runtime_state.bind(
             data_path=cfg.octagon.data_path,
             db_path=resolve_db_path(cfg.octagon.data_path),
@@ -148,7 +160,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
 
         install_signal_handlers()
-        record_startup(resolve_db_path(cfg.octagon.data_path))
+        if not display_only:
+            record_startup(resolve_db_path(cfg.octagon.data_path))
         # 同进程内反复启停（测试、reload）时不得继承上一轮的关停标志，
         # 否则本轮的 Stop / 超时会误以为在关停而不杀进程组。teardown 也会清
         # 一次；这里再清是为了容错——上一轮若在 finally 之前就崩了，标志会
@@ -156,17 +169,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         from .process.lifecycle import begin_shutdown, end_shutdown
 
         end_shutdown()
-        # 纯展示边界：HTTP 中间件拦不住进程内的恢复与常驻任务——
-        # 它们不经过请求路径，却会派发 judge（真实模型调用）并改写历史状态。
-        # 因此这里整段跳过；只保留读路径所需的初始化。
-        from .display_only import BACKGROUND_WORK_SKIPPED, skip_background_work
-
-        display_only = skip_background_work(cfg.octagon.display_only)
-        if display_only:
-            logger.warning(
-                "纯展示部署：跳过全部启动恢复与常驻后台任务（%s）",
-                "；".join(f"{k}（{v}）" for k, v in BACKGROUND_WORK_SKIPPED.items()),
-            )
         if not display_only:
             from .scoring_queue import schedule_startup_scoring_recovery
 
@@ -419,12 +421,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 await asyncio.gather(*pending, return_exceptions=True)
             await close_proxy_client(app)
             # 退出归因：在关掉 DB 之前写，否则这条记录永远落不了盘。
-            try:
-                from .platform_events import record_shutdown
+            if not display_only:
+                try:
+                    from .platform_events import record_shutdown
 
-                record_shutdown(resolve_db_path(cfg.octagon.data_path))
-            except Exception:
-                logger.exception("退出事件记录失败（忽略）")
+                    record_shutdown(resolve_db_path(cfg.octagon.data_path))
+                except Exception:
+                    logger.exception("退出事件记录失败（忽略）")
             await app.state.db.close()
             runtime_state.reset()
             # 关停标志的作用域到此为止。它是模块级的，不清掉会泄漏到同进程内

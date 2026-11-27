@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import mimetypes
 import uuid
 from datetime import timedelta
@@ -13,6 +14,8 @@ from .events import EventStore
 from .runs import TERMINAL
 from .service import new_id
 from .storage import digest,guarded
+
+logger=logging.getLogger(__name__)
 
 
 class Worker:
@@ -124,6 +127,7 @@ class Worker:
         finally:
             renewal.cancel()
             await asyncio.gather(renewal,return_exceptions=True)
+            self.signals.pop(id_,None)
 
     def _cancel_unsent(self,job):
         message_id=json.loads(job['payload_json']).get('message_id')
@@ -221,9 +225,6 @@ class Worker:
                         self.refs(run['id'],last_stop_receipt=redact_json(receipt),last_stop_error=None)
                     except Exception as error:
                         self.refs(run['id'],last_stop_error={'status':'unconfirmed','error_type':type(error).__name__})
-                with self.repo.transaction() as c:
-                    lease=(self.service.clock()+timedelta(seconds=self.service.settings.skill_eval.lease_seconds)).isoformat()
-                    c.execute('UPDATE skill_eval_jobs SET lease_until=? WHERE id=? AND owner=?',(lease,job['id'],self.owner))
                 try:await asyncio.wait_for(wake.wait(),timeout=0.2)
                 except TimeoutError:pass
         control=asyncio.create_task(controls())
@@ -245,8 +246,12 @@ class Worker:
                 if ended is None:raise RuntimeError('Generation ended without a terminal receipt')
         except TimeoutError:
             if remote_id and not stop_sent:
-                receipt=await self.runtime.stop(session_id,remote_id)
-                self.refs(run['id'],last_stop_receipt=redact_json(receipt))
+                try:
+                    receipt=await asyncio.wait_for(self.runtime.stop(session_id,remote_id),timeout=10)
+                    self.refs(run['id'],last_stop_receipt=redact_json(receipt))
+                except Exception as error:
+                    logger.warning('Failed to stop timed-out generation %s for run %s: %s',remote_id,run['id'],type(error).__name__)
+                    self.refs(run['id'],last_stop_error={'status':'unconfirmed','error_type':type(error).__name__})
             raise
         finally:
             control.cancel();await asyncio.gather(control,return_exceptions=True)
@@ -389,18 +394,32 @@ class Worker:
         try:
             while not self.closing:
                 tick=asyncio.get_running_loop().time()
+                failed=False
                 if tick-last_recovery>=self.service.settings.skill_eval.recovery_poll_seconds:
                     from .recovery import Recovery
-                    await Recovery(self.service,self.runtime).reconcile()
-                    last_recovery=tick
+                    try:
+                        await Recovery(self.service,self.runtime).reconcile()
+                        last_recovery=tick
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        logger.exception('Skill Eval recovery poll failed')
+                        failed=True
                 done=[id_ for id_,task in self.active.items() if task.done()]
                 for id_ in done:
                     task=self.active.pop(id_)
                     await asyncio.gather(task,return_exceptions=True)
                 if len(self.active)<self.service.settings.skill_eval.max_active_runs:
-                    job=self.claim()
+                    try:
+                        job=self.claim()
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        logger.exception('Skill Eval job claim failed')
+                        job=None
+                        failed=True
                     if job:self.active[job['id']]=asyncio.create_task(self.execute(job))
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(1.0 if failed else 0.1)
         finally:
             await self.close()
 
@@ -410,3 +429,4 @@ class Worker:
         for task in tasks:task.cancel()
         if tasks:await asyncio.gather(*tasks,return_exceptions=True)
         self.active.clear()
+        self.signals.clear()

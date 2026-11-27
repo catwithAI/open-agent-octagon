@@ -15,6 +15,7 @@ from .api import RequestBody
 from .capture import Capture
 from .events import EventStore
 from .process import project
+from .runs import TERMINAL
 from .service import EvalError
 
 
@@ -77,6 +78,14 @@ def register_routes(app:FastAPI,service,capabilities):
     def call(function,*args,**kwargs):
         try:return function(*args,**kwargs)
         except ValueError as error:raise HTTPException(422,detail={'code':'invalid_run_input','message':str(error)}) from error
+        except FileNotFoundError as error:raise EvalError('content_unavailable','Stored content is unavailable',410) from error
+
+    def is_display_only()->bool:
+        return bool(getattr(getattr(getattr(service,'settings',None),'octagon',None),'display_only',False))
+
+    def run_status(id_:str)->str:
+        with service.repo.connection() as c:
+            return service._run(c,id_)['run_status']
 
     @router.post('/runs',status_code=202)
     async def create_run(body:CreateRun,idempotency_key:str=Header(alias='Idempotency-Key')):
@@ -175,6 +184,15 @@ def register_routes(app:FastAPI,service,capabilities):
                     # by ID rather than embedding large bodies in every SSE frame.
                     yield f'id: {cursor}\nevent: event\ndata: '+json.dumps({'seq':cursor,'event_id':event['event_id'],'type':event['type']})+'\n\n'
                 if not page['has_more']:
+                    status=await run_in_threadpool(run_status,id_)
+                    if status in TERMINAL:
+                        tail=await run_in_threadpool(store.read,id_,after=cursor,limit=100)
+                        for event in tail['items']:
+                            cursor=event['seq']
+                            yield f'id: {cursor}\nevent: event\ndata: '+json.dumps({'seq':cursor,'event_id':event['event_id'],'type':event['type']})+'\n\n'
+                        if tail['has_more']:continue
+                        yield 'event: end\ndata: '+json.dumps({'status':status})+'\n\n'
+                        return
                     heartbeat+=1
                     if heartbeat%10==0:yield ': heartbeat\n\n'
                     await asyncio.sleep(0.5)
@@ -191,14 +209,14 @@ def register_routes(app:FastAPI,service,capabilities):
             row=service._row(c,'SELECT a.* FROM skill_eval_artifacts a JOIN skill_eval_runs r ON r.id=a.run_id JOIN skill_eval_skills s ON s.id=r.skill_id WHERE a.id=? AND s.scope_id=?',(artifact_id,service.scope))
         if row['state']!='complete' or not row['hash']:raise EvalError('artifact_unavailable','Artifact unavailable',410)
         from .previews import descriptor
-        return descriptor(service.store,row['hash'],row['relative_path'],artifact_id)
+        return call(descriptor,service.store,row['hash'],row['relative_path'],artifact_id,read_only=is_display_only())
 
     @router.get('/artifacts/{artifact_id}')
     def artifact(artifact_id:str):
         with service.repo.connection() as c:
             row=service._row(c,'SELECT a.* FROM skill_eval_artifacts a JOIN skill_eval_runs r ON r.id=a.run_id JOIN skill_eval_skills s ON s.id=r.skill_id WHERE a.id=? AND s.scope_id=?',(artifact_id,service.scope))
         if row['state']!='complete' or not row['hash']:raise EvalError('artifact_unavailable','Artifact is unavailable',410)
-        data=service.store.read_blob(row['hash'])
+        data=call(service.store.read_blob,row['hash'])
         filename=quote(row['relative_path'].split('/')[-1],safe='')
         return Response(data,media_type='application/octet-stream',headers={'Content-Disposition':f"attachment; filename*=UTF-8''{filename}",'X-Content-Type-Options':'nosniff'})
 
@@ -244,7 +262,7 @@ def register_routes(app:FastAPI,service,capabilities):
         column=next((column for column in manifest['columns'] if column['run_id']==run_id and not column.get('missing')),None)
         artifact=next((item for item in ((column.get('result') or {}).get('artifacts',[]) if column else []) if item['relative_path']==path),None)
         if not artifact or not artifact.get('hash'):raise EvalError('artifact_unavailable','Frozen comparison artifact unavailable',410)
-        return Response(service.store.read_blob(artifact['hash']),media_type='application/octet-stream',headers={'Content-Disposition':f"attachment; filename*=UTF-8''{quote(path.split('/')[-1],safe='')}",'X-Content-Type-Options':'nosniff'})
+        return Response(call(service.store.read_blob,artifact['hash']),media_type='application/octet-stream',headers={'Content-Disposition':f"attachment; filename*=UTF-8''{quote(path.split('/')[-1],safe='')}",'X-Content-Type-Options':'nosniff'})
 
     @router.get('/comparisons/{id_}/artifact-preview')
     def fixed_artifact_preview(id_:str,run_id:str,path:str):
@@ -253,7 +271,7 @@ def register_routes(app:FastAPI,service,capabilities):
         artifact=next((item for item in ((column.get('result') or {}).get('artifacts',[]) if column else []) if item['relative_path']==path),None)
         if not artifact or not artifact.get('hash'):raise EvalError('artifact_unavailable','Comparison artifact unavailable',410)
         from .previews import descriptor
-        return descriptor(service.store,artifact['hash'],path,id_+':'+run_id+':'+path)
+        return call(descriptor,service.store,artifact['hash'],path,id_+':'+run_id+':'+path,read_only=is_display_only())
 
     @router.post('/runs/{id_}/collect',status_code=202)
     def recollect(id_:str,idempotency_key:str=Header(alias='Idempotency-Key')):

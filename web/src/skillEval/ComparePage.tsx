@@ -14,7 +14,8 @@ export function ComparePage(){
   const ids=params.get("runs")||"",comparisonId=params.get("comparison"),baseline=params.get("baseline")||comparison?.baseline_run_id||"";
   useEffect(()=>{let active=true;const key=comparisonId||ids;if(!key){setError(c("请从历史中选择至少两次已结束运行。","Select at least two ended runs from history."));return;}
     if(pending.current?.key!==key)pending.current={key,promise:comparisonId?request<Comparison>(`/comparisons/${comparisonId}`):post<Comparison>("/comparisons/query",{run_ids:ids.split(",").filter(Boolean),baseline_run_id:params.get("baseline")||undefined})};
-    pending.current.promise.then(result=>{if(!active)return;setComparison(result);setNarrowCurrent(current=>current||result.columns.find(column=>column.run_id!==result.baseline_run_id)?.run_id||"");if(!comparisonId){const next=new URLSearchParams(params);next.set("comparison",result.id);setParams(next,{replace:true});}}).catch(e=>{if(active)setError(e);});return()=>{active=false;};
+    const currentPending=pending.current;
+    currentPending.promise.then(result=>{if(!active)return;setComparison(result);setNarrowCurrent(current=>current||result.columns.find(column=>column.run_id!==result.baseline_run_id)?.run_id||"");if(!comparisonId){const next=new URLSearchParams(params);next.set("comparison",result.id);setParams(next,{replace:true});}}).catch(e=>{if(pending.current===currentPending)pending.current=null;if(active)setError(e);});return()=>{active=false;};
   },[comparisonId,ids]);
   const columns=comparison?[...comparison.columns].sort((a,b)=>(a.run_id===baseline?-1:b.run_id===baseline?1:0)):[];
   useLayoutEffect(()=>{diffRequest.current++;setDiff(null);if(comparison&&!comparison.columns.some(column=>column.run_id===narrowCurrent&&column.run_id!==baseline))setNarrowCurrent(comparison.columns.find(column=>column.run_id!==baseline)?.run_id||"");},[baseline,comparison?.id]);

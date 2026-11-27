@@ -145,7 +145,7 @@ def register_routes(app: FastAPI, service: SkillService, catalog: SkillCatalog |
         draft=call(service.get_draft,id_)
         entry=next((entry for entry in draft['entries'] if entry['path']==call(safe_path,path)),None)
         if entry is None:raise EvalError('not_found','Draft file not found',404)
-        return Response(service.store.read_blob(entry['hash']),media_type='application/octet-stream',headers={'Content-Disposition':'attachment; filename="resource"','X-Content-Type-Options':'nosniff'})
+        return Response(call(service.store.read_blob,entry['hash']),media_type='application/octet-stream',headers={'Content-Disposition':'attachment; filename="resource"','X-Content-Type-Options':'nosniff'})
 
     @router.patch('/drafts/{id_}')
     def patch(id_:str,body:Changes):return call(service.patch_draft,id_,body.expected_revision,body.changes)
@@ -168,7 +168,7 @@ def register_routes(app: FastAPI, service: SkillService, catalog: SkillCatalog |
         with service.repo.connection() as c:
             snapshot=service._version(c,id_)
         from dataclasses import asdict
-        return {**snapshot,'entries':[asdict(entry) for entry in service.store.get_manifest(snapshot['manifest_ref'])]}
+        return {**snapshot,'entries':[asdict(entry) for entry in call(service.store.get_manifest,snapshot['manifest_ref'])]}
 
     @router.get('/versions/{id_}/files')
     def snapshot_file(id_:str,path:str):return call(service.read_snapshot_file,id_,path)

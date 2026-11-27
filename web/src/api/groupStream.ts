@@ -23,40 +23,56 @@ export const initialGroupStreamState: GroupStreamState = {
   timeline: [],
 };
 
-function projectEvent(snapshot: RunGroupSnapshot, event: RunGroupEvent): RunGroupSnapshot {
+type ProjectResult =
+  | { ok: true; value: RunGroupSnapshot }
+  | { ok: false; error: ResearchProtocolError };
+
+function projectEvent(snapshot: RunGroupSnapshot, event: RunGroupEvent): ProjectResult {
   const data = event.data as Record<string, unknown>;
   if (event.event_type.startsWith("cell.") && typeof data.cell_id === "string") {
     return {
-      ...snapshot,
-      cursor: event.sequence,
-      cells: snapshot.cells.map((cell) => cell.id === data.cell_id ? {
-        ...cell,
-        ...(typeof data.status === "string" ? { status: data.status } : {}),
-        ...(data.run_id === null || typeof data.run_id === "string" ? { run_id: data.run_id } : {}),
-        ...(data.error_code === null || typeof data.error_code === "string"
-          ? { error_code: data.error_code }
-          : {}),
-      } : cell),
+      ok: true,
+      value: {
+        ...snapshot,
+        cursor: event.sequence,
+        cells: snapshot.cells.map((cell) => cell.id === data.cell_id ? {
+          ...cell,
+          ...(typeof data.status === "string" ? { status: data.status } : {}),
+          ...(data.run_id === null || typeof data.run_id === "string" ? { run_id: data.run_id } : {}),
+          ...(data.error_code === null || typeof data.error_code === "string"
+            ? { error_code: data.error_code }
+            : {}),
+        } : cell),
+      },
     };
   }
   if (event.event_type.startsWith("group.") && typeof data.status === "string") {
-    return { ...snapshot, cursor: event.sequence, group: { ...snapshot.group, status: data.status } };
-  }
-  if (event.event_type === "leader_event" && typeof data.scope_key === "string") {
-    const parsed = parseRunGroupSnapshot({
-      ...snapshot,
-      leaders: [data],
-    }).leaders[0];
     return {
-      ...snapshot,
-      cursor: event.sequence,
-      leaders: [
-        ...snapshot.leaders.filter((leader) => leader.scope_key !== parsed.scope_key),
-        parsed,
-      ].sort((left, right) => left.scope_key.localeCompare(right.scope_key)),
+      ok: true,
+      value: { ...snapshot, cursor: event.sequence, group: { ...snapshot.group, status: data.status } },
     };
   }
-  return { ...snapshot, cursor: event.sequence };
+  if (event.event_type === "leader_event" && typeof data.scope_key === "string") {
+    const parsed = boundary(parseRunGroupSnapshot, {
+      ...snapshot,
+      leaders: [data],
+    });
+    if (!parsed.ok) return { ok: false, error: parsed.error };
+    const leader = parsed.value.leaders[0];
+    if (!leader) return { ok: true, value: { ...snapshot, cursor: event.sequence } };
+    return {
+      ok: true,
+      value: {
+        ...snapshot,
+        cursor: event.sequence,
+        leaders: [
+          ...snapshot.leaders.filter((item) => item.scope_key !== leader.scope_key),
+          leader,
+        ].sort((left, right) => left.scope_key.localeCompare(right.scope_key)),
+      },
+    };
+  }
+  return { ok: true, value: { ...snapshot, cursor: event.sequence } };
 }
 
 export function reduceGroupStream(
@@ -81,8 +97,10 @@ export function reduceGroupStream(
   if (event.sequence !== state.cursor + 1 || state.snapshot === null) {
     return { ...state, stale: true };
   }
+  const projected = projectEvent(state.snapshot, event);
+  if (!projected.ok) return { ...state, protocolError: projected.error };
   return {
-    snapshot: projectEvent(state.snapshot, event),
+    snapshot: projected.value,
     cursor: event.sequence,
     stale: false,
     protocolError: null,

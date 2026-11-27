@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import json
 import logging
 import os
@@ -239,22 +240,6 @@ class BladeCliAdapter:
             "blade_transport": "cli",
             "blade_cli_path": cli_path,
         }
-        code, cli_version, _ = await self._run_cli(
-            cli_path, ["version"], timeout=self.config.request_timeout_seconds
-        )
-        if code == 0 and cli_version.strip():
-            external_refs["cli_version"] = cli_version.strip()
-        try:
-            external_refs["blade_sdk_version"] = version("blade-agent-kit")
-        except PackageNotFoundError:
-            pass
-        checkpoint_state: dict[str, Any] = {
-            "blade_cli_path": cli_path,
-            "blade_session_id": None,
-            "last_completed_turn_index": None,
-            "recoverability": "checkpoint-only",
-        }
-
         session_id: str | None = None
         status = "completed"
         error_code: str | None = None
@@ -262,171 +247,191 @@ class BladeCliAdapter:
         # 未声明的提问（waiting_for_input 终态）被自动拒绝话术应答的次数。
         interaction_auto_answered_count = 0
 
-        writer.conversation_started(
-            turn_count=len(plan.turns),
-            is_legacy=plan.is_legacy,
-            score_turn_id=plan.score_turn.turn_id,
-        )
+        try:
+            code, cli_version, _ = await self._run_cli(
+                cli_path, ["version"], timeout=self.config.request_timeout_seconds
+            )
+            if code == 0 and cli_version.strip():
+                external_refs["cli_version"] = cli_version.strip()
+            try:
+                external_refs["blade_sdk_version"] = version("blade-agent-kit")
+            except PackageNotFoundError:
+                pass
+            checkpoint_state: dict[str, Any] = {
+                "blade_cli_path": cli_path,
+                "blade_session_id": None,
+                "last_completed_turn_index": None,
+                "recoverability": "checkpoint-only",
+            }
 
-        async def _run_turn(turn: Any) -> tuple[str, str | None, str | None]:
-            """跑一轮，返回 (status, error_code, error_message)。
+            writer.conversation_started(
+                turn_count=len(plan.turns),
+                is_legacy=plan.is_legacy,
+                score_turn_id=plan.score_turn.turn_id,
+            )
 
-            首轮 `chat run` 建会话，后续轮 `chat send` 复用同一 session——
-            这是 CLI 通道能做到的「同一逻辑会话」的全部含义。
+            async def _run_turn(turn: Any) -> tuple[str, str | None, str | None]:
+                """跑一轮，返回 (status, error_code, error_message)。
 
-            BA 可能在本轮中途提出未预声明的提问：chat run/send 阻塞到终态
-            waiting_for_input，说明 agent 在等用户应答。answer_unexpected_interaction
-            打开时自动 `chat send` 一句无信息的拒绝话术把会话解出来继续跑
-            （再次被提问则循环应答，由 deadline 兜底）；关闭时维持原语义：
-            waiting_for_input 视作本轮完成。
-            """
-            nonlocal session_id
-            nonlocal interaction_auto_answered_count
-            prompt = _render_turn_prompt(task, turn, env, data_path)
-            remaining = deadline.remaining()
+                首轮 `chat run` 建会话，后续轮 `chat send` 复用同一 session——
+                这是 CLI 通道能做到的「同一逻辑会话」的全部含义。
 
-            if session_id is None:
-                code, out, err = await self._chat_run(
-                    cli_path, task, env, prompt, workspace, remaining
-                )
-            else:
-                code, out, err = await self._chat_send(
-                    cli_path, session_id, prompt, remaining
-                )
-
-            result = _parse_chat_result(out)
-            if result.get("session_id") and session_id is None:
-                session_id = str(result["session_id"])
-                external_refs["blade_session_id"] = session_id
-                checkpoint_state["blade_session_id"] = session_id
-                write_checkpoint(attempt_dir, checkpoint_state)
-                # 会话一建立就通知 dispatch：动态续聊靠这个钩子确认送达。
-                if task.prompt_delivery_handler is not None:
-                    task.prompt_delivery_handler()
-
-            if code != 0:
-                turn_status, turn_error = _EXIT_CODE_MAP.get(
-                    code, ("cli_error", "blade_cli_error")
-                )
-                return turn_status, turn_error, (err or out).strip()[:2000]
-
-            # 自动应答未声明的提问：CLI 的终态 waiting_for_input 说明 agent 在
-            # 等应答，不续就会让 attempt 静默停在「没真正完成」。
-            while self.config.answer_unexpected_interaction and session_id is not None:
-                session_status = str(result.get("status") or "completed")
-                if session_status != "waiting_for_input":
-                    break
-                interaction_auto_answered_count += 1
-                logger.warning(
-                    "blade-cli attempt=%s 收到未声明的交互请求（waiting_for_input），"
-                    "自动应答「%s」续跑",
-                    task.attempt_id, UNEXPECTED_INTERACTION_AUTO_ANSWER,
-                )
+                BA 可能在本轮中途提出未预声明的提问：chat run/send 阻塞到终态
+                waiting_for_input，说明 agent 在等用户应答。answer_unexpected_interaction
+                打开时自动 `chat send` 一句无信息的拒绝话术把会话解出来继续跑
+                （再次被提问则循环应答，由 deadline 兜底）；关闭时维持原语义：
+                waiting_for_input 视作本轮完成。
+                """
+                nonlocal session_id
+                nonlocal interaction_auto_answered_count
+                prompt = _render_turn_prompt(task, turn, env, data_path)
                 remaining = deadline.remaining()
-                code, out, err = await self._chat_send(
-                    cli_path, session_id, UNEXPECTED_INTERACTION_AUTO_ANSWER, remaining
-                )
+
+                if session_id is None:
+                    code, out, err = await self._chat_run(
+                        cli_path, task, env, prompt, workspace, remaining
+                    )
+                else:
+                    code, out, err = await self._chat_send(
+                        cli_path, session_id, prompt, remaining
+                    )
+
+                result = _parse_chat_result(out)
+                if result.get("session_id") and session_id is None:
+                    session_id = str(result["session_id"])
+                    external_refs["blade_session_id"] = session_id
+                    checkpoint_state["blade_session_id"] = session_id
+                    write_checkpoint(attempt_dir, checkpoint_state)
+                    # 会话一建立就通知 dispatch：动态续聊靠这个钩子确认送达。
+                    if task.prompt_delivery_handler is not None:
+                        delivered = task.prompt_delivery_handler()
+                        if inspect.isawaitable(delivered):
+                            await delivered
+
                 if code != 0:
                     turn_status, turn_error = _EXIT_CODE_MAP.get(
                         code, ("cli_error", "blade_cli_error")
                     )
                     return turn_status, turn_error, (err or out).strip()[:2000]
-                result = _parse_chat_result(out)
 
-            session_status = str(result.get("status") or "completed")
-            if session_status not in ("completed", "waiting_for_input"):
-                return (
-                    _SESSION_STATUS_MAP.get(session_status, "chat_failed"),
-                    f"blade_session_{session_status}",
-                    f"blade session ended with status {session_status}",
-                )
-            return "completed", None, None
-
-        completed_all_turns = False
-        try:
-            for turn in plan.turns:
-                deadline.check_before_turn()
-                writer.turn_started(turn, producer_session_id=session_id)
-                status, error_code, error_message = await _run_turn(turn)
-                if status != "completed":
-                    writer.turn_failed(
-                        turn,
-                        producer_session_id=session_id,
-                        error_code=error_code,
-                        error_summary=error_message,
-                    )
-                    break
-
-                checkpoint_state["last_completed_turn_index"] = turn.turn_index
-                write_checkpoint(attempt_dir, checkpoint_state)
-                writer.turn_completed(turn, producer_session_id=session_id)
-            else:
-                completed_all_turns = True
-
-            # 动态返工：静态轮跑完后由平台决定还要不要继续发消息。
-            # capabilities.iterative_session=True 就必须真的消费这个 handler，
-            # 否则迭代类 env 会静默停在静态轮，被读成"agent 不返工"。
-            handler = task.iteration_turn_handler
-            if completed_all_turns and handler is not None:
-                with deadline.suspend():
-                    decision = await handler.on_turn_completed(
-                        producer_session_id=session_id
-                    )
-                while decision is not None and decision.next_prompt is not None:
-                    turn_index = int(decision.round_index) + 1
-                    dynamic_turn = ConversationTurn(
-                        turn_id=f"iteration-{turn_index}",
-                        turn_index=turn_index,
-                        purpose="task",
-                        prompt=decision.next_prompt,
-                    )
-                    try:
-                        deadline.check_before_turn()
-                    except AttemptBudgetExhausted:
-                        status = "timeout"
-                        error_code = ERROR_BUDGET_EXHAUSTED_BETWEEN_TURNS
-                        error_message = "time budget exhausted between turns"
-                        writer.turn_failed(
-                            dynamic_turn,
-                            producer_session_id=session_id,
-                            error_code=error_code,
-                            error_summary=error_message,
-                        )
+                # 自动应答未声明的提问：CLI 的终态 waiting_for_input 说明 agent 在
+                # 等应答，不续就会让 attempt 静默停在「没真正完成」。
+                while self.config.answer_unexpected_interaction and session_id is not None:
+                    session_status = str(result.get("status") or "completed")
+                    if session_status != "waiting_for_input":
                         break
-                    handler.mark_feedback_sending(decision)
-                    writer.turn_started(
-                        dynamic_turn, producer_session_id=session_id
+                    interaction_auto_answered_count += 1
+                    logger.warning(
+                        "blade-cli attempt=%s 收到未声明的交互请求（waiting_for_input），"
+                        "自动应答「%s」续跑",
+                        task.attempt_id, UNEXPECTED_INTERACTION_AUTO_ANSWER,
                     )
-                    handler.mark_feedback_delivered(decision)
-                    status, error_code, error_message = await _run_turn(dynamic_turn)
+                    remaining = deadline.remaining()
+                    code, out, err = await self._chat_send(
+                        cli_path, session_id, UNEXPECTED_INTERACTION_AUTO_ANSWER, remaining
+                    )
+                    if code != 0:
+                        turn_status, turn_error = _EXIT_CODE_MAP.get(
+                            code, ("cli_error", "blade_cli_error")
+                        )
+                        return turn_status, turn_error, (err or out).strip()[:2000]
+                    result = _parse_chat_result(out)
+
+                session_status = str(result.get("status") or "completed")
+                if session_status not in ("completed", "waiting_for_input"):
+                    return (
+                        _SESSION_STATUS_MAP.get(session_status, "chat_failed"),
+                        f"blade_session_{session_status}",
+                        f"blade session ended with status {session_status}",
+                    )
+                return "completed", None, None
+
+            completed_all_turns = False
+            try:
+                for turn in plan.turns:
+                    deadline.check_before_turn()
+                    writer.turn_started(turn, producer_session_id=session_id)
+                    status, error_code, error_message = await _run_turn(turn)
                     if status != "completed":
                         writer.turn_failed(
-                            dynamic_turn,
+                            turn,
                             producer_session_id=session_id,
                             error_code=error_code,
                             error_summary=error_message,
                         )
-                        handler.finalize_last_successful_submission()
                         break
-                    writer.turn_completed(
-                        dynamic_turn, producer_session_id=session_id
-                    )
+
+                    checkpoint_state["last_completed_turn_index"] = turn.turn_index
+                    write_checkpoint(attempt_dir, checkpoint_state)
+                    writer.turn_completed(turn, producer_session_id=session_id)
+                else:
+                    completed_all_turns = True
+
+                # 动态返工：静态轮跑完后由平台决定还要不要继续发消息。
+                # capabilities.iterative_session=True 就必须真的消费这个 handler，
+                # 否则迭代类 env 会静默停在静态轮，被读成"agent 不返工"。
+                handler = task.iteration_turn_handler
+                if completed_all_turns and handler is not None:
                     with deadline.suspend():
                         decision = await handler.on_turn_completed(
                             producer_session_id=session_id
                         )
-        except AttemptBudgetExhausted:
-            status = "timeout"
-            error_code = ERROR_BUDGET_EXHAUSTED_BETWEEN_TURNS
-            error_message = "time budget exhausted between turns"
+                    while decision is not None and decision.next_prompt is not None:
+                        turn_index = int(decision.round_index) + 1
+                        dynamic_turn = ConversationTurn(
+                            turn_id=f"iteration-{turn_index}",
+                            turn_index=turn_index,
+                            purpose="task",
+                            prompt=decision.next_prompt,
+                        )
+                        try:
+                            deadline.check_before_turn()
+                        except AttemptBudgetExhausted:
+                            status = "timeout"
+                            error_code = ERROR_BUDGET_EXHAUSTED_BETWEEN_TURNS
+                            error_message = "time budget exhausted between turns"
+                            writer.turn_failed(
+                                dynamic_turn,
+                                producer_session_id=session_id,
+                                error_code=error_code,
+                                error_summary=error_message,
+                            )
+                            break
+                        handler.mark_feedback_sending(decision)
+                        writer.turn_started(
+                            dynamic_turn, producer_session_id=session_id
+                        )
+                        handler.mark_feedback_delivered(decision)
+                        status, error_code, error_message = await _run_turn(dynamic_turn)
+                        if status != "completed":
+                            writer.turn_failed(
+                                dynamic_turn,
+                                producer_session_id=session_id,
+                                error_code=error_code,
+                                error_summary=error_message,
+                            )
+                            handler.finalize_last_successful_submission()
+                            break
+                        writer.turn_completed(
+                            dynamic_turn, producer_session_id=session_id
+                        )
+                        with deadline.suspend():
+                            decision = await handler.on_turn_completed(
+                                producer_session_id=session_id
+                            )
+            except AttemptBudgetExhausted:
+                status = "timeout"
+                error_code = ERROR_BUDGET_EXHAUSTED_BETWEEN_TURNS
+                error_message = "time budget exhausted between turns"
 
-        if status == "completed":
-            writer.conversation_completed()
-        else:
-            writer.conversation_failed(
-                error_code=error_code, error_summary=error_message
-            )
-        writer.close()
+            if status == "completed":
+                writer.conversation_completed()
+            else:
+                writer.conversation_failed(
+                    error_code=error_code, error_summary=error_message
+                )
+        finally:
+            writer.close()
 
         events_count = 0
         last_event_at: str | None = None
@@ -509,10 +514,16 @@ class BladeCliAdapter:
             )
         if self.config.model:
             args += ["--model", self.config.model]
-        args += self._upload_args(task, workspace)
-        if timeout is not None:
-            args += ["--timeout", f"{int(timeout)}s"]
-        return await self._run_cli(cli_path, args, timeout=_hard_timeout(timeout))
+        cleanup_paths: list[Path] = []
+        try:
+            args += self._upload_args(task, workspace, cleanup_paths=cleanup_paths)
+            if timeout is not None:
+                args += ["--timeout", f"{int(timeout)}s"]
+            return await self._run_cli(cli_path, args, timeout=_hard_timeout(timeout))
+        finally:
+            for path in cleanup_paths:
+                with contextlib.suppress(OSError):
+                    path.unlink(missing_ok=True)
 
     async def _chat_send(
         self,
@@ -529,7 +540,11 @@ class BladeCliAdapter:
         return await self._run_cli(cli_path, args, timeout=_hard_timeout(timeout))
 
     def _upload_args(
-        self, task: AdapterRunInput, workspace: Path
+        self,
+        task: AdapterRunInput,
+        workspace: Path,
+        *,
+        cleanup_paths: list[Path] | None = None,
     ) -> list[str]:
         """把 attempt.json 与任务物料变成 `--file LOCAL=REMOTE`。
 
@@ -537,24 +552,7 @@ class BladeCliAdapter:
         与 blade_service._upload_materials 的远端路径逐字对齐。
         """
         args: list[str] = []
-        attempt_json = json.dumps(
-            {
-                "attempt_id": task.attempt_id,
-                "env_base_url": (
-                    self.config.sandbox_env_base_url or task.env_base_url
-                ),
-                "env_token": task.env_token,
-            },
-            ensure_ascii=False,
-        )
-        # 临时文件交给 CLI 读；attempt_dir 下留一份会被产物扫描误判为 agent 产出，
-        # 所以放系统临时目录，run 结束由 OS 回收。
-        fd = tempfile.NamedTemporaryFile(
-            mode="w", suffix="_attempt.json", delete=False, encoding="utf-8"
-        )
-        with fd:
-            fd.write(attempt_json)
-        args += ["--file", f"{fd.name}=.octagon/attempt.json"]
+        file_specs: list[str] = []
 
         uploaded = task.task_context.get("uploaded_files")
         if isinstance(uploaded, list):
@@ -569,14 +567,42 @@ class BladeCliAdapter:
                     raise FileNotFoundError(
                         f"任务物料不在本地 workspace: {name} ({src})"
                     )
-                args += ["--file", f"{src}={name}"]
+                file_specs.append(f"{src}={name}")
 
         material_files = task.task_context.get("_agent_material_files")
         if isinstance(material_files, list):
             for rel in sorted({str(x) for x in material_files}):
                 src = workspace / rel
                 if src.is_file():
-                    args += ["--file", f"{src}={rel}"]
+                    file_specs.append(f"{src}={rel}")
+
+        attempt_json = json.dumps(
+            {
+                "attempt_id": task.attempt_id,
+                "env_base_url": (
+                    self.config.sandbox_env_base_url or task.env_base_url
+                ),
+                "env_token": task.env_token,
+            },
+            ensure_ascii=False,
+        )
+        # 临时文件以 0o600 权限创建并交给 CLI 读；attempt_dir 下留一份会被产物扫描
+        # 误判为 agent 产出，所以放系统临时目录并在子进程退出后于 finally 立即删除。
+        raw_fd, raw_path = tempfile.mkstemp(suffix="_attempt.json")
+        temp_path = Path(raw_path)
+        try:
+            os.chmod(raw_fd, 0o600)
+            with os.fdopen(raw_fd, "w", encoding="utf-8") as fh:
+                fh.write(attempt_json)
+        except Exception:
+            with contextlib.suppress(OSError):
+                temp_path.unlink(missing_ok=True)
+            raise
+        if cleanup_paths is not None:
+            cleanup_paths.append(temp_path)
+        args += ["--file", f"{temp_path}=.octagon/attempt.json"]
+        for spec in file_specs:
+            args += ["--file", spec]
         return args
 
     # ---------- 事后回收 ----------
@@ -657,6 +683,7 @@ class BladeCliAdapter:
                 return {"error": (err or f"copy-dir exit {code}").strip()[:500]}
 
             extracted = 0
+            workspace_root = workspace.resolve()
             try:
                 with zipfile.ZipFile(zip_path) as zf:
                     for member in zf.infolist():
@@ -666,8 +693,8 @@ class BladeCliAdapter:
                         if any(part in _ARTIFACT_SKIP_DIRS for part in rel.parts):
                             continue
                         # zip slip 防护：解出来的路径必须留在 workspace 里。
-                        target = (workspace / rel).resolve()
-                        if not str(target).startswith(str(workspace.resolve())):
+                        target = (workspace_root / rel).resolve()
+                        if target == workspace_root or not target.is_relative_to(workspace_root):
                             logger.warning("skip unsafe zip member: %s", rel)
                             continue
                         target.parent.mkdir(parents=True, exist_ok=True)

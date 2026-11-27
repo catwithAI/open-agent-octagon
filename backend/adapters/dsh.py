@@ -274,7 +274,7 @@ class DshAdapter:
         # runtime-bin 是平台 wheel，自带 Node，无本机二进制依赖。
         system_requires=(),
         interaction_answer=False,
-        iterative_session=True,
+        iterative_session=False,
     )
 
     def __init__(
@@ -378,7 +378,10 @@ class DshAdapter:
         }
         return row, api_key, max_tokens
 
-    def _mcp_rows(self, task: AdapterRunInput, workspace: Path) -> list[dict[str, Any]]:
+    def _mcp_rows(
+        self, task: AdapterRunInput, workspace: Path,
+        *, sandbox: AttemptSandbox | None = None,
+    ) -> list[dict[str, Any]]:
         """`McpServerSpec` → dsh `StdioConfig` 插件行（每个 server 一行）。
 
         三处不是逐字段直译：serverName 长度、cwd 的 None、
@@ -386,6 +389,14 @@ class DshAdapter:
         """
         rows: list[dict[str, Any]] = []
         seen: dict[str, str] = {}
+        workspace_path = (
+            sandbox.path(workspace) if sandbox is not None else str(workspace.resolve())
+        )
+        base_url = (
+            sandbox.translate_url(task.env_base_url)
+            if sandbox is not None and task.env_base_url
+            else task.env_base_url
+        )
         for spec in task.mcp_servers:
             server_name = dsh_server_name(spec.name)
             if server_name in seen:
@@ -412,11 +423,11 @@ class DshAdapter:
                     "args": args,
                     # dsh 的 cwd schema 是 z.string().default('')，且原样传给
                     # spawn——空串是非法路径，不是"继承父进程 cwd"。
-                    "cwd": spec.cwd or str(workspace.resolve()),
+                    "cwd": spec.cwd or workspace_path,
                     "env": {
                         "OCTAGON_ATTEMPT_ID": task.attempt_id,
                         "OCTAGON_ENV_TOKEN": task.env_token,
-                        "OCTAGON_BASE_URL": task.env_base_url,
+                        "OCTAGON_BASE_URL": base_url,
                     },
                     "toolCallTimeoutMs": 60000,
                     # 默认 false 会在连不上时静默无工具——评测里等于白跑却
@@ -437,6 +448,9 @@ class DshAdapter:
         显式**不挂** web 插件（其余六家无内建搜索）与 approval/telemetry。
         """
         llm_row, api_key, max_tokens = self._llm_row(task, model_ref, sandbox=sandbox)
+        workspace_path = (
+            sandbox.path(workspace) if sandbox is not None else str(workspace.resolve())
+        )
         rows: list[dict[str, Any]] = [
             # 删了就没法通信。
             {"id": "sdk-jsonrpc-server", "name": "@deepseek-ai/dsh-sdk-jsonrpc-server"},
@@ -465,14 +479,14 @@ class DshAdapter:
             {
                 "id": "bash",
                 "name": "@deepseek-ai/dsh-bash-local",
-                "config": {"cwd": str(workspace.resolve()), "timeoutMs": 60000},
+                "config": {"cwd": workspace_path, "timeoutMs": 60000},
             },
             # 文件工具三件套：SDK 默认只有 fs-local(provider)，没有 tool-fs，
             # 不补的话 agent 只能用 bash 改文件。
             {
                 "id": "fs-local",
                 "name": "@deepseek-ai/dsh-fs-local",
-                "config": {"cwd": str(workspace.resolve())},
+                "config": {"cwd": workspace_path},
             },
             {"id": "fs-observation-policy",
              "name": "@deepseek-ai/dsh-fs-observation-policy"},
@@ -504,7 +518,7 @@ class DshAdapter:
                            "maxTokens": 8192, "compactionRetries": 1},
             },
         ]
-        rows.extend(self._mcp_rows(task, workspace))
+        rows.extend(self._mcp_rows(task, workspace, sandbox=sandbox))
         return rows, api_key, max_tokens
 
     def _write_cordis(

@@ -119,7 +119,8 @@ class BladeSkillRuntime:
         async with httpx.AsyncClient(timeout=cfg.request_timeout_seconds,headers={'Authorization':'Bearer '+cfg.api_key.get_secret_value()},follow_redirects=False) as client:
             async with client.stream('GET',url) as response:
                 response.raise_for_status()
-                if int(response.headers.get('content-length','0'))>max_bytes:raise ValueError('Artifact file size limit')
+                content_length=(response.headers.get('content-length') or '').strip()
+                if content_length.isascii() and content_length.isdigit() and int(content_length)>max_bytes:raise ValueError('Artifact file size limit')
                 parts=[];size=0
                 async for chunk in response.aiter_bytes():
                     size+=len(chunk)
