@@ -1,7 +1,10 @@
 """Committed event cursor is the source of truth; notifications are advisory."""
 from __future__ import annotations
 
+import asyncio
+from contextlib import contextmanager
 import json
+import threading
 import uuid
 from datetime import datetime,timezone
 from typing import Callable
@@ -9,8 +12,42 @@ from typing import Callable
 from .capture import Capture
 from .repository import Repository
 
+_SUBSCRIBERS_LOCK = threading.Lock()
+_SUBSCRIBERS: dict[str, set[tuple[asyncio.AbstractEventLoop, asyncio.Event]]] = {}
+
+
+def notify_run_subscribers(run_id: str) -> None:
+    with _SUBSCRIBERS_LOCK:
+        targets = list(_SUBSCRIBERS.get(run_id, ()))
+    for loop, event in targets:
+        try:
+            if not loop.is_closed():
+                loop.call_soon_threadsafe(event.set)
+        except RuntimeError:
+            pass
+
+
+@contextmanager
+def subscribe_run_events(run_id: str):
+    loop = asyncio.get_running_loop()
+    event = asyncio.Event()
+    entry = (loop, event)
+    with _SUBSCRIBERS_LOCK:
+        _SUBSCRIBERS.setdefault(run_id, set()).add(entry)
+    try:
+        yield event
+    finally:
+        with _SUBSCRIBERS_LOCK:
+            subs = _SUBSCRIBERS.get(run_id)
+            if subs is not None:
+                subs.discard(entry)
+                if not subs:
+                    _SUBSCRIBERS.pop(run_id, None)
+
 
 class EventStore:
+    subscribe = staticmethod(subscribe_run_events)
+
     def __init__(self, repository:Repository,capture:Capture,notify:Callable|None=None):
         self.repo,self.capture,self.notify=repository,capture,notify
 
@@ -34,6 +71,7 @@ class EventStore:
             c.execute('INSERT INTO skill_eval_events(run_id,seq,event_id,source,source_key,type,payload_json,observed_at) VALUES(?,?,?,?,?,?,?,?)',
                 (run_id,seq,id_,source,source_key,kind,json.dumps(encoded,ensure_ascii=False),observed))
             result=self._decode(c.execute('SELECT * FROM skill_eval_events WHERE run_id=? AND seq=?',(run_id,seq)).fetchone())
+        notify_run_subscribers(run_id)
         if self.notify:
             try:self.notify({'run_id':run_id,'seq':seq,'event_id':id_})
             except Exception:pass  # Readers recover committed facts with their DB cursor.

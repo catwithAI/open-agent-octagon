@@ -26,10 +26,12 @@ import secrets
 import sqlite3
 import threading
 import uuid
+from collections import OrderedDict
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 import aiosqlite
 
@@ -743,15 +745,48 @@ CREATE INDEX IF NOT EXISTS idx_run_comparison_jobs_run
 
 # ---------- 同步路径(短连接 + asyncio.to_thread) -------------------------
 
+_WAL_INITIALIZED_DBS: set[tuple[str, int, int]] = set()
+_WAL_LOCK = threading.Lock()
 
-def _open_sync(db_path: Path) -> sqlite3.Connection:
+_INITIALIZED_DBS: set[tuple[str, int, int]] = set()
+_INIT_LOCK = threading.Lock()
+
+
+def _db_file_key(db_path: Path) -> tuple[str, int, int] | None:
+    try:
+        resolved = db_path.resolve()
+        st = resolved.stat()
+        return (str(resolved), st.st_dev, st.st_ino)
+    except OSError:
+        return None
+
+
+@contextmanager
+def _open_sync(
+    db_path: Path, *, immediate: bool = False
+) -> Iterator[sqlite3.Connection]:
     db_path = Path(db_path)
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(db_path)
-    conn.execute("PRAGMA busy_timeout=5000")
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")
-    return conn
+    conn = sqlite3.connect(db_path, timeout=30.0)
+    try:
+        conn.execute("PRAGMA busy_timeout=30000")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA foreign_keys=ON")
+        key = _db_file_key(db_path)
+        with _WAL_LOCK:
+            needs_wal = key is None or key not in _WAL_INITIALIZED_DBS
+        if needs_wal:
+            conn.execute("PRAGMA journal_mode=WAL")
+            final_key = _db_file_key(db_path)
+            if final_key is not None:
+                with _WAL_LOCK:
+                    _WAL_INITIALIZED_DBS.add(final_key)
+        with conn:
+            if immediate:
+                conn.execute("BEGIN IMMEDIATE")
+            yield conn
+    finally:
+        conn.close()
 
 
 def _migrate_runs_table(conn: sqlite3.Connection) -> None:
@@ -1064,9 +1099,10 @@ def _migrate_execution_scoring(conn: sqlite3.Connection) -> None:
         "WHEN status='queued' THEN 'queued' "
         "WHEN status IN ('running','starting_blade_session') THEN 'running' "
         "WHEN status='timeout' THEN 'timeout' "
+        "WHEN status='cancelled' THEN 'cancelled' "
         "WHEN status IN ('completed','gave_up','scoring_failed') THEN 'completed' "
         "ELSE 'failed' END "
-        "WHERE execution_status IS NULL OR execution_status='queued' AND status<>'queued'"
+        "WHERE execution_status IS NULL OR (execution_status='queued' AND status<>'queued')"
     )
     score_completed = (
         "score_total IS NOT NULL" if "score_total" in cols else "0"
@@ -1292,24 +1328,37 @@ def _migrate_research_columns(conn: sqlite3.Connection) -> None:
 
 
 def _init_db_sync(db_path: Path) -> None:
-    with _open_sync(db_path) as conn:
-        conn.executescript(_SCHEMA)
-        _migrate_runs_table(conn)
-        _migrate_attempts_model(conn)
-        _migrate_attempts_security(conn)
-        _migrate_attempts_wire(conn)
-        _migrate_attempts_cost(conn)
-        _migrate_attempts_archive(conn)
-        _migrate_attempts_model_integrity(conn)
-        _migrate_run_cost_audits(conn)
-        _migrate_cost_key_ledgers(conn)
-        _migrate_execution_scoring(conn)
-        _migrate_attempt_observability(conn)
-        _migrate_rubric_evolution(conn)
-        _migrate_research_columns(conn)
-        from .skill_eval.schema import migrate as migrate_skill_eval
-        migrate_skill_eval(conn)
-        conn.commit()
+    db_path = Path(db_path)
+    key = _db_file_key(db_path)
+    if key is not None:
+        with _INIT_LOCK:
+            if key in _INITIALIZED_DBS:
+                return
+    with _INIT_LOCK:
+        key = _db_file_key(db_path)
+        if key is not None and key in _INITIALIZED_DBS:
+            return
+        with _open_sync(db_path) as conn:
+            conn.executescript(_SCHEMA)
+            _migrate_runs_table(conn)
+            _migrate_attempts_model(conn)
+            _migrate_attempts_security(conn)
+            _migrate_attempts_wire(conn)
+            _migrate_attempts_cost(conn)
+            _migrate_attempts_archive(conn)
+            _migrate_attempts_model_integrity(conn)
+            _migrate_run_cost_audits(conn)
+            _migrate_cost_key_ledgers(conn)
+            _migrate_execution_scoring(conn)
+            _migrate_attempt_observability(conn)
+            _migrate_rubric_evolution(conn)
+            _migrate_research_columns(conn)
+            from .skill_eval.schema import migrate as migrate_skill_eval
+            migrate_skill_eval(conn)
+            conn.commit()
+        final_key = _db_file_key(db_path)
+        if final_key is not None and db_path.exists():
+            _INITIALIZED_DBS.add(final_key)
 
 
 def _list_tables_sync(db_path: Path) -> list[str]:
@@ -1347,8 +1396,10 @@ async def open_db(data_path: Path | str) -> aiosqlite.Connection:
     db_path = resolve_db_path(data_path)
     await init_db(db_path)
     conn = await aiosqlite.connect(db_path)
-    await conn.execute("PRAGMA journal_mode=WAL")
-    await conn.execute("PRAGMA foreign_keys=ON")
+    await conn.execute("PRAGMA busy_timeout = 30000")
+    await conn.execute("PRAGMA journal_mode = WAL")
+    await conn.execute("PRAGMA synchronous = NORMAL")
+    await conn.execute("PRAGMA foreign_keys = ON")
     await conn.commit()
     return conn
 
@@ -1474,6 +1525,8 @@ def claim_idempotency(
     Experiment repositories call this on the same connection/transaction that
     creates their result row, making key claim and result creation atomic.
     """
+    if not conn.in_transaction:
+        conn.execute("BEGIN IMMEDIATE")
     row = conn.execute(
         "SELECT request_hash, result_id, status, response_json "
         "FROM idempotency_keys WHERE operation=? AND key=?",
@@ -1694,7 +1747,8 @@ def _create_attempt_with_snapshot_sync(
 
 # ---------- blade_events.jsonl + 概览 -------------------------------------
 
-_event_data_paths: dict[str, Path] = {}
+_MAX_EVENT_DATA_PATHS = 2048
+_event_data_paths: OrderedDict[str, Path] = OrderedDict()
 _event_lock = threading.Lock()
 
 
@@ -1714,6 +1768,9 @@ def _append_event_sync(data_path: Path, attempt_id: str, event: dict[str, Any]) 
         with p.open("a", encoding="utf-8") as fp:
             fp.write(line)
         _event_data_paths[attempt_id] = data_path
+        _event_data_paths.move_to_end(attempt_id)
+        while len(_event_data_paths) > _MAX_EVENT_DATA_PATHS:
+            _event_data_paths.popitem(last=False)
 
 
 async def append_blade_event(
@@ -1734,6 +1791,8 @@ class AttemptEventSummary:
 def _summary_sync(attempt_id: str) -> AttemptEventSummary:
     with _event_lock:
         data_path = _event_data_paths.get(attempt_id)
+        if data_path is not None:
+            _event_data_paths.move_to_end(attempt_id)
     if data_path is None:
         return AttemptEventSummary(attempt_id=attempt_id, count=0, last_event_at=None)
     p = _events_path(data_path, attempt_id)
@@ -1784,7 +1843,7 @@ def _append_attempt_observation_sync(
     分析器提供稳定的事件信封。重复 operation_id 由调用方保证幂等；事件自身
     通过 event_id + (attempt_id, sequence) 防止重复写入。
     """
-    with _open_sync(db_path) as conn:
+    with _open_sync(db_path, immediate=True) as conn:
         conn.row_factory = sqlite3.Row
         attempt = conn.execute(
             "SELECT run_id,status FROM attempts WHERE id=?", (attempt_id,)

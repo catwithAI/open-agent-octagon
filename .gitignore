@@ -35,7 +35,7 @@ docs/insights/
 
 # 本地协作工作树与生成式分析报告
 .claude/
-reports/
+/reports/
 report/
 coding_world
 RUNTRACE_*.html

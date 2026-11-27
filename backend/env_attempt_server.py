@@ -23,15 +23,18 @@
 
 from __future__ import annotations
 
+import hmac
 import json
 import logging
 import sqlite3
 import threading
 import time
+from collections import OrderedDict
+from contextlib import contextmanager
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Request
 
@@ -98,7 +101,7 @@ def _verify_attempt_token(
         raise HTTPException(status_code=404, detail=f"attempt not found: {attempt_id}")
     env_name, env_session_id, token_hash, status = found
     # token 错误和 terminal 都返回 401(语义都是"无权访问"),只是 detail 区分:
-    if hash_env_token(token) != token_hash:
+    if not hmac.compare_digest(hash_env_token(token), token_hash or ""):
         raise HTTPException(status_code=401, detail="invalid env token")
     if status in _TERMINAL_STATUSES:
         raise HTTPException(
@@ -147,20 +150,54 @@ def _attempt_dir(data_path: Path, attempt_id: str) -> Path:
     return p
 
 
+_ENV_DB_INIT_LOCKS: dict[str, tuple[threading.Lock, int]] = {}
+_ENV_DB_INIT_GUARD = threading.Lock()
+
+
+@contextmanager
+def _env_db_init_lock(lock_key: str) -> Iterator[None]:
+    with _ENV_DB_INIT_GUARD:
+        lock, refs = _ENV_DB_INIT_LOCKS.get(lock_key, (None, 0))
+        if lock is None:
+            lock = threading.Lock()
+        _ENV_DB_INIT_LOCKS[lock_key] = (lock, refs + 1)
+    lock.acquire()
+    try:
+        yield
+    finally:
+        lock.release()
+        with _ENV_DB_INIT_GUARD:
+            cur_lock, cur_refs = _ENV_DB_INIT_LOCKS.get(lock_key, (None, 0))
+            if cur_lock is lock:
+                if cur_refs <= 1:
+                    _ENV_DB_INIT_LOCKS.pop(lock_key, None)
+                else:
+                    _ENV_DB_INIT_LOCKS[lock_key] = (lock, cur_refs - 1)
+
+
 def _open_env_db(data_path: Path, attempt_id: str, env_dir: Path) -> sqlite3.Connection:
     """返回该 attempt 的 env DB 连接;不存在则按 env 的 schema.sql init。"""
     env_db_path = _attempt_dir(data_path, attempt_id) / "env.db"
-    needs_init = not env_db_path.exists()
-    conn = sqlite3.connect(env_db_path)
-    conn.execute("PRAGMA foreign_keys=ON")
-    if needs_init:
-        schema_path = env_dir / "schema.sql"
-        if schema_path.is_file():
-            conn.executescript(schema_path.read_text(encoding="utf-8"))
-            conn.commit()
-        else:
-            logger.warning("env %s 没有 schema.sql,跳过 init", env_dir.name)
-    return conn
+    lock_key = str(env_db_path.resolve())
+    with _env_db_init_lock(lock_key):
+        needs_init = not env_db_path.exists()
+        conn = sqlite3.connect(env_db_path, timeout=30.0)
+        try:
+            conn.execute("PRAGMA busy_timeout=30000")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA foreign_keys=ON")
+            if needs_init:
+                conn.execute("PRAGMA journal_mode=WAL")
+                schema_path = env_dir / "schema.sql"
+                if schema_path.is_file():
+                    conn.executescript(schema_path.read_text(encoding="utf-8"))
+                    conn.commit()
+                else:
+                    logger.warning("env %s 没有 schema.sql,跳过 init", env_dir.name)
+        except BaseException:
+            conn.close()
+            raise
+        return conn
 
 
 def _resolve_tool(env: LoadedEnv, tool_name: str) -> RegisteredTool:
@@ -185,7 +222,8 @@ def _serialize_result(result: Any) -> Any:
 # 每 attempt 的 evidence 序号（evidence ID 去重用）。线程安全。
 # 进程重启后续接同一 attempt，序号从**已落盘 spool 的行数**恢复，
 # 不从 0 重来——否则重启后新 evidence 与旧行撞 raw_ref → 重复 evidence/record ID。
-_inbound_seq: dict[str, int] = {}
+_MAX_INBOUND_SEQ = 2048
+_inbound_seq: OrderedDict[str, int] = OrderedDict()
 _inbound_seq_lock = threading.Lock()
 
 
@@ -226,6 +264,9 @@ def _next_inbound_seq(attempt_id: str, data_path: Path | None = None) -> int:
             _inbound_seq[attempt_id] = _recover_inbound_seq(data_path, attempt_id)
         n = _inbound_seq.get(attempt_id, 0)
         _inbound_seq[attempt_id] = n + 1
+        _inbound_seq.move_to_end(attempt_id)
+        while len(_inbound_seq) > _MAX_INBOUND_SEQ:
+            _inbound_seq.popitem(last=False)
         return n
 
 

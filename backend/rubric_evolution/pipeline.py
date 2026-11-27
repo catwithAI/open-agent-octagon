@@ -18,6 +18,7 @@ from pydantic import ValidationError
 
 from backend.db import _now_iso
 from backend.experiments.hashing import canonical_hash
+from backend.insights.jsonutil import parse_json_object
 from backend.insights.providers import InsightProvider, InsightProviderError, invoke_generate
 from backend.insights.workspace import EvidenceWorkspace
 
@@ -47,20 +48,6 @@ def _atomic_json(path: Path, value: Any) -> None:
         handle.flush()
         os.fsync(handle.fileno())
     os.replace(tmp, path)
-
-
-def _parse_json(text: str) -> dict[str, Any]:
-    value = text.strip()
-    if value.startswith("```"):
-        lines = value.splitlines()
-        if len(lines) >= 3 and lines[-1].strip() == "```":
-            value = "\n".join(lines[1:-1])
-            if value.lstrip().startswith("json\n"):
-                value = value.lstrip()[5:]
-    parsed = json.loads(value)
-    if not isinstance(parsed, dict):
-        raise ValueError("rubric evolution output must be a JSON object")
-    return parsed
 
 
 def _collect_refs(value: Any, *, field: str | None = None) -> set[str]:
@@ -219,7 +206,7 @@ async def evolve_rubric(
             "cost": generated.cost,
             "received_at": _now_iso(),
         })
-        result = RubricEvolutionResult.model_validate(_parse_json(generated.text))
+        result = RubricEvolutionResult.model_validate(parse_json_object(generated.text))
         _validate_result_against_inputs(
             result=result,
             batch=batch,

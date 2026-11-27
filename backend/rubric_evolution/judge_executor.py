@@ -7,10 +7,10 @@ judge that executes the supplied checklist and may not author new criteria.
 from __future__ import annotations
 
 import json
-from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from backend.insights.jsonutil import parse_json_object
 from backend.insights.providers import InsightProvider
 
 from .models import CandidateRubric, JudgeCheckRecord
@@ -24,20 +24,6 @@ class RubricJudgeExecution(BaseModel):
 
     schema_version: str = Field(pattern=r"^octagon-rubric-judge-execution-v1$")
     checks: list[JudgeCheckRecord]
-
-
-def _parse_json(text: str) -> dict[str, Any]:
-    value = text.strip()
-    if value.startswith("```"):
-        lines = value.splitlines()
-        if len(lines) >= 3 and lines[-1].strip() == "```":
-            value = "\n".join(lines[1:-1])
-            if value.lstrip().startswith("json\n"):
-                value = value.lstrip()[5:]
-    parsed = json.loads(value)
-    if not isinstance(parsed, dict):
-        raise ValueError("rubric judge output must be a JSON object")
-    return parsed
 
 
 class ProviderRubricExecutor:
@@ -61,7 +47,7 @@ class ProviderRubricExecutor:
             f"Evidence snapshot: {json.dumps(case.evidence_snapshot, ensure_ascii=False, default=str)}"
         )
         generated = await self.provider.generate(prompt)
-        execution = RubricJudgeExecution.model_validate(_parse_json(generated.text))
+        execution = RubricJudgeExecution.model_validate(parse_json_object(generated.text))
         expected = {item.check_id: item for item in rubric.checks}
         actual_ids = [item.check_id for item in execution.checks]
         if len(actual_ids) != len(set(actual_ids)):

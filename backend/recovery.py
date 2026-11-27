@@ -459,7 +459,15 @@ async def _recover_blade_attempt(
         iteration_turn_handler=iteration_handler,
     )
     scorer = _resolve_scorer(env)
-    if scorer is None:
+    judge_cfg = getattr(settings, "judge", None)
+    eval_plan = (getattr(env, "meta", None) or {}).get("eval", {})
+    local_scorer = isinstance(eval_plan, dict) and eval_plan.get("backend") == "local"
+    use_evals = (
+        judge_cfg is not None
+        and getattr(judge_cfg, "backend", None) == "evals"
+        and not local_scorer
+    )
+    if scorer is None and not use_evals:
         _mark_interrupted(
             row,
             code="recovery_scorer_missing",
@@ -514,7 +522,15 @@ async def _recover_blade_attempt(
         bound = _RecoveryAdapter(
             adapter, task, None, session_id, state.data_path
         )
-    await run_attempt(adapter=bound, scorer=scorer)
+    if use_evals:
+        await run_attempt(
+            adapter=bound,
+            scorer=scorer,
+            defer_scoring=True,
+            scoring_capacity=int(settings.octagon.max_active_scoring_jobs),
+        )
+    else:
+        await run_attempt(adapter=bound, scorer=scorer)
     _refresh_run_status(state.db_path, row["id"])
 
 

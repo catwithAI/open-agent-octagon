@@ -30,7 +30,7 @@ import sqlite3
 from pathlib import Path
 
 from . import runtime_state
-from .convergence import cancel_attempt_tasks, converge_attempts
+from .convergence import cancel_attempt_tasks, cancel_scoring_tasks, converge_attempts
 from .db import _now_iso, _open_sync
 
 logger = logging.getLogger(__name__)
@@ -111,11 +111,18 @@ def sweep_once(db_path: Path, *, grace_seconds: int = DEFAULT_GRACE_SECONDS) -> 
     )
 
     scoring_ids = _expired_scoring(db_path, cutoff)
-    # 注意：评分轴**有和执行轴一样的闸门占用问题，且尚未修**。
-    # `_execute_job`（scoring_queue.py:317）同样 `async with _scoring_semaphore`
-    # 跨整个 job 持有，这里只改 DB 不取消协程，卡住的 scorer 会一直占着评分
-    # 并发位。当前只修了执行轴，评分轴留待单独处理——需要一套评分 job 的
-    # 登记表，与 attempt_tasks 不是同一个东西。
+    # 与执行轴同理：先发起取消超期评分协程，释放 scoring_semaphore 槽位并触发
+    # scorer 取消钩子；取消失败不阻断 DB 收敛。
+    if scoring_ids:
+        try:
+            scheduled_scoring = cancel_scoring_tasks(scoring_ids)
+        except Exception:
+            logger.exception("sweeper 取消超期评分协程失败（继续收敛 DB）")
+        else:
+            if scheduled_scoring:
+                logger.warning(
+                    "sweeper 已发起取消超期评分协程 %d 个", scheduled_scoring
+                )
     swept_scoring = converge_attempts(
         db_path,
         scoring_ids,

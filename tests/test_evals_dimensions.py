@@ -136,7 +136,12 @@ def _capture(monkeypatch):
 
     def fake_post(url, *, json=None, timeout=None):
         captured.append(json)
-        return httpx.Response(200, json={"status": "completed", "results": []},
+        dims = (json or {}).get("dimensions") or []
+        results = [
+            {"dimension_id": d["id"], "value": 0.5, "reason": "stub", "lineage": {}}
+            for d in dims
+        ]
+        return httpx.Response(200, json={"status": "completed", "results": results},
                               request=httpx.Request("POST", url))
 
     monkeypatch.setattr("backend.evals_scorer.httpx.post", fake_post)

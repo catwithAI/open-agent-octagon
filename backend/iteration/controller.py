@@ -8,7 +8,10 @@ import hashlib
 import importlib.util
 import inspect
 import json
+import logging
 import os
+import shutil
+import sqlite3
 import threading
 import uuid
 from contextlib import suppress
@@ -25,6 +28,8 @@ from .repository import IterationRepository
 from .snapshot import freeze_submission_snapshot
 from .summary import summarize_iteration
 from .writer import atomic_write_json, now_iso
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,7 +134,14 @@ class _ExecutionDeadlineLease:
         interval = max(0.02, self.lease_seconds / 3)
         while True:
             await asyncio.sleep(interval)
-            self._renew()
+            try:
+                self._renew()
+            except (sqlite3.OperationalError, OSError) as exc:
+                logger.warning(
+                    "evaluator deadline lease 续租遇到瞬时错误，下个周期继续重试 attempt=%s: %s",
+                    self.attempt_id,
+                    exc,
+                )
 
     async def __aenter__(self) -> "_ExecutionDeadlineLease":
         self._load_original_and_renew()
@@ -479,28 +491,37 @@ class IterativeAttemptController:
 
     @staticmethod
     async def _run_callable_in_daemon_thread(
-        func: Callable[..., Any], *, thread_name: str, kwargs: dict[str, Any]
+        func: Callable[..., Any],
+        *,
+        thread_name: str,
+        kwargs: dict[str, Any],
+        timeout: float | None = None,
     ) -> Any:
         """运行同步 callable；timeout 后的迟到线程不会阻止事件循环退出。"""
         context = contextvars.copy_context()
-        done = threading.Event()
-        outcome: dict[str, Any] = {}
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future[Any] = loop.create_future()
+
+        def _resolve(result: Any = None, error: BaseException | None = None) -> None:
+            if fut.done():
+                return
+            if error is not None:
+                fut.set_exception(error)
+            else:
+                fut.set_result(result)
 
         def run() -> None:
             try:
-                outcome["result"] = context.run(func, **kwargs)
+                value = context.run(func, **kwargs)
             except BaseException as exc:
-                outcome["error"] = exc
-            finally:
-                done.set()
+                with suppress(RuntimeError):
+                    loop.call_soon_threadsafe(_resolve, None, exc)
+            else:
+                with suppress(RuntimeError):
+                    loop.call_soon_threadsafe(_resolve, value, None)
 
         threading.Thread(target=run, name=thread_name, daemon=True).start()
-        while not done.is_set():
-            await asyncio.sleep(0.01)
-        error = outcome.get("error")
-        if error is not None:
-            raise error
-        return outcome["result"]
+        return await asyncio.wait_for(fut, timeout=timeout)
 
     @classmethod
     async def _run_judge_in_daemon_thread(cls, **kwargs: Any) -> SubmissionEvaluation:
@@ -545,6 +566,48 @@ class IterativeAttemptController:
             work_dir.rmdir()
         except OSError:
             pass
+
+    @staticmethod
+    def _stage_reviewer_work_dir(submission_dir: Path) -> tuple[Path, set[str]]:
+        """为 Product Reviewer 构造隔离工作目录，防止超时迟到线程污染冻结 Submission 目录。"""
+        work_dir = submission_dir / f".reviewer-work-{uuid.uuid4().hex[:12]}"
+        work_dir.mkdir(parents=True, exist_ok=False)
+        staged_names: set[str] = set()
+        for entry in sorted(submission_dir.iterdir(), key=lambda path: path.name):
+            if entry.name.startswith((".evaluation-work-", ".reviewer-work-")):
+                continue
+            target = work_dir / entry.name
+            if entry.is_dir() and not entry.is_symlink():
+                shutil.copytree(entry, target, symlinks=True)
+            else:
+                shutil.copy2(entry, target, follow_symlinks=False)
+            staged_names.add(entry.name)
+        return work_dir, staged_names
+
+    @staticmethod
+    def _cleanup_work_dir(work_dir: Path) -> None:
+        def _handle_readonly(func: Callable[..., Any], path: str, _exc: Any) -> None:
+            with suppress(OSError):
+                os.chmod(path, 0o700)
+                func(path)
+
+        with suppress(OSError):
+            if work_dir.exists():
+                shutil.rmtree(work_dir, onerror=_handle_readonly)
+
+    @classmethod
+    def _promote_reviewer_artifacts(
+        cls, work_dir: Path, submission_dir: Path, staged_names: set[str]
+    ) -> None:
+        reserved = staged_names | {"product-review.json", "public-feedback.json"}
+        for source in sorted(work_dir.iterdir(), key=lambda path: path.name):
+            if source.name in reserved:
+                continue
+            target = submission_dir / source.name
+            if target.exists():
+                continue
+            os.replace(source, target)
+        cls._cleanup_work_dir(work_dir)
 
     async def _process_round(
         self, *, round_index: int, producer_session_id: str | None
@@ -732,13 +795,16 @@ class IterativeAttemptController:
 
         safe_feedback = self._load_json(submission_dir / "product-review.json")
         if safe_feedback is None:
+            reviewer_work_dir, staged_names = self._stage_reviewer_work_dir(
+                submission_dir
+            )
             try:
                 reviewer_call = self._run_product_reviewer(
                     task_prompt=str(self.task.get("prompt") or ""),
                     facts=facts,
                     previous_feedback=self._previous_feedback,
                     max_required_changes=self.policy.reviewer.max_required_changes,
-                    artifact_dir=submission_dir,
+                    artifact_dir=reviewer_work_dir,
                 )
                 if self.reviewer_deadline_seconds is None:
                     feedback = await reviewer_call
@@ -757,7 +823,12 @@ class IterativeAttemptController:
                     error_code="iteration_reviewer_deadline_exceeded",
                 ) from exc
             except Exception:
+                self._cleanup_work_dir(reviewer_work_dir)
                 feedback = None
+            else:
+                self._promote_reviewer_artifacts(
+                    reviewer_work_dir, submission_dir, staged_names
+                )
             try:
                 safe_feedback = self._reviewer_module.guard_public_feedback(
                     feedback,

@@ -2,7 +2,10 @@
 from __future__ import annotations
 
 import asyncio
+from collections import OrderedDict
 import json
+import threading
+import time
 from typing import Any,Literal
 from urllib.parse import quote
 
@@ -13,7 +16,7 @@ from starlette.concurrency import run_in_threadpool
 
 from .api import RequestBody
 from .capture import Capture
-from .events import EventStore
+from .events import EventStore,subscribe_run_events
 from .process import project
 from .runs import TERMINAL
 from .service import EvalError
@@ -141,6 +144,25 @@ def register_routes(app:FastAPI,service,capabilities):
             cursor=page['next_cursor']
             if not page['has_more']:break
 
+    _PROCESS_CACHE_MAX = 64
+    _process_cache_lock = threading.Lock()
+    _process_cache: OrderedDict[tuple[str, int], dict[str, Any]] = OrderedDict()
+
+    def projected_process(id_:str,head:int)->dict[str,Any]:
+        key=(id_,head)
+        with _process_cache_lock:
+            cached=_process_cache.get(key)
+            if cached is not None:
+                _process_cache.move_to_end(key)
+                return cached
+        value=project(all_events(id_,head))
+        with _process_cache_lock:
+            _process_cache[key]=value
+            _process_cache.move_to_end(key)
+            while len(_process_cache)>_PROCESS_CACHE_MAX:
+                _process_cache.popitem(last=False)
+        return value
+
     @router.get('/runs/{id_}/process')
     def process(id_:str,limit:int=100,cursor:str|None=None,search:str=''):
         call(service.get_run,id_)
@@ -153,7 +175,7 @@ def register_routes(app:FastAPI,service,capabilities):
             if token.get('run_id')!=id_ or token.get('search')!=search or not isinstance(token.get('head'),int) or not isinstance(token.get('offset'),int) or token['offset']<0:raise HTTPException(422,'Invalid process cursor')
             if token['head']>head or token['head']<0:raise EvalError('snapshot_required','Process cursor is unavailable; reopen the process',409)
             head=token['head'];offset=token['offset']
-        value=project(all_events(id_,head));turns=value['turns']
+        value=projected_process(id_,head);turns=value['turns']
         if search:
             matched={turn['id'] for turn in turns if search.casefold() in json.dumps(turn,ensure_ascii=False).casefold()}
             matched.update(action['turn_id'] for action in value['actions'] if search.casefold() in json.dumps(action,ensure_ascii=False).casefold())
@@ -171,31 +193,38 @@ def register_routes(app:FastAPI,service,capabilities):
         if cursor<0:raise HTTPException(422,'Invalid event cursor')
         async def generate():
             nonlocal cursor
-            heartbeat=0
+            last_heartbeat=time.monotonic()
             head=await run_in_threadpool(store.head,id_)
             if cursor>head:
                 cursor=0
                 yield 'id: 0\nevent: reset\ndata: '+json.dumps({'seq':0,'reason':'cursor_ahead_of_stream'})+'\n\n'
-            while not await request.is_disconnected():
-                page=await run_in_threadpool(store.read,id_,after=cursor,limit=100)
-                for event in page['items']:
-                    cursor=event['seq']
-                    # Small notifications; clients fetch policy-filtered evidence
-                    # by ID rather than embedding large bodies in every SSE frame.
-                    yield f'id: {cursor}\nevent: event\ndata: '+json.dumps({'seq':cursor,'event_id':event['event_id'],'type':event['type']})+'\n\n'
-                if not page['has_more']:
-                    status=await run_in_threadpool(run_status,id_)
-                    if status in TERMINAL:
-                        tail=await run_in_threadpool(store.read,id_,after=cursor,limit=100)
-                        for event in tail['items']:
-                            cursor=event['seq']
-                            yield f'id: {cursor}\nevent: event\ndata: '+json.dumps({'seq':cursor,'event_id':event['event_id'],'type':event['type']})+'\n\n'
-                        if tail['has_more']:continue
-                        yield 'event: end\ndata: '+json.dumps({'status':status})+'\n\n'
-                        return
-                    heartbeat+=1
-                    if heartbeat%10==0:yield ': heartbeat\n\n'
-                    await asyncio.sleep(0.5)
+            with subscribe_run_events(id_) as wake:
+                while not await request.is_disconnected():
+                    wake.clear()
+                    page=await run_in_threadpool(store.read,id_,after=cursor,limit=100)
+                    for event in page['items']:
+                        cursor=event['seq']
+                        # Small notifications; clients fetch policy-filtered evidence
+                        # by ID rather than embedding large bodies in every SSE frame.
+                        yield f'id: {cursor}\nevent: event\ndata: '+json.dumps({'seq':cursor,'event_id':event['event_id'],'type':event['type']})+'\n\n'
+                    if not page['has_more']:
+                        status=await run_in_threadpool(run_status,id_)
+                        if status in TERMINAL:
+                            tail=await run_in_threadpool(store.read,id_,after=cursor,limit=100)
+                            for event in tail['items']:
+                                cursor=event['seq']
+                                yield f'id: {cursor}\nevent: event\ndata: '+json.dumps({'seq':cursor,'event_id':event['event_id'],'type':event['type']})+'\n\n'
+                            if tail['has_more']:continue
+                            yield 'event: end\ndata: '+json.dumps({'status':status})+'\n\n'
+                            return
+                        now=time.monotonic()
+                        if now-last_heartbeat>=5.0:
+                            last_heartbeat=now
+                            yield ': heartbeat\n\n'
+                        try:
+                            await asyncio.wait_for(wake.wait(),timeout=2.0)
+                        except asyncio.TimeoutError:
+                            pass
         return StreamingResponse(generate(),media_type='text/event-stream',headers={'Cache-Control':'no-cache','X-Accel-Buffering':'no'})
 
     @router.get('/runs/{id_}/artifacts')
