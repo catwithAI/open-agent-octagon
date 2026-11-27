@@ -14,7 +14,6 @@ from __future__ import annotations
 import json
 import inspect
 import logging
-import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -378,10 +377,10 @@ def write_scores_sync(
     evaluation_manifest_ref: str | None = None,
 ) -> None:
     """把维度分写 scores 表。重复调用时先清掉旧行(M1 attempt 不重评,但保险)。"""
-    from .db import _now_iso
+    from .db import _now_iso, _open_sync
 
     scored_at = _now_iso()
-    with sqlite3.connect(db_path) as conn:
+    with _open_sync(db_path) as conn:
         conn.execute("DELETE FROM scores WHERE attempt_id=?", (attempt_id,))
         for s in scores:
             conn.execute(
@@ -400,7 +399,9 @@ def write_scores_sync(
 
 
 def write_attempt_score_sync(db_path: Path, attempt_id: str, score_total: int) -> None:
-    with sqlite3.connect(db_path) as conn:
+    from .db import _open_sync
+
+    with _open_sync(db_path) as conn:
         conn.execute(
             "UPDATE attempts SET score_total=? WHERE id=?",
             (score_total, attempt_id),
@@ -414,7 +415,9 @@ def write_security_summary_sync(
     """把安全汇总写 attempts 的 security_* 列。与 score_total 独立。"""
     if not security:
         return
-    with sqlite3.connect(db_path) as conn:
+    from .db import _open_sync
+
+    with _open_sync(db_path) as conn:
         conn.execute(
             "UPDATE attempts SET security_event_count=?, security_max_severity=?, "
             "security_hitl_json=?, security_reaction=?, security_coverage_json=? "

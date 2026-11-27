@@ -28,10 +28,11 @@ import json
 import logging
 import re
 import threading
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from backend.wire import correlate, evidence as ev, ids, paths, spool, writer
 from backend.wire import turn_correlation as correlate_turn
@@ -43,13 +44,30 @@ MANIFEST_SCHEMA_VERSION = "octagon-wire-manifest-v1"
 
 # per-attempt finalize 锁（进程内）：两个并发 finalizer（如 attempt_end 与
 # rebuild）串行执行，避免生成相同 generation 或交错写坏三个输出文件。
-_FINALIZE_LOCKS: dict[str, threading.Lock] = {}
+# 引用计数确保无竞争回收，避免长跑进程字典无限增长。
+_FINALIZE_LOCKS: dict[str, tuple[threading.Lock, int]] = {}
 _FINALIZE_LOCKS_GUARD = threading.Lock()
 
 
-def _finalize_lock(attempt_id: str) -> threading.Lock:
+@contextmanager
+def _finalize_lock(attempt_id: str) -> Iterator[None]:
     with _FINALIZE_LOCKS_GUARD:
-        return _FINALIZE_LOCKS.setdefault(attempt_id, threading.Lock())
+        lock, refs = _FINALIZE_LOCKS.get(attempt_id, (None, 0))
+        if lock is None:
+            lock = threading.Lock()
+        _FINALIZE_LOCKS[attempt_id] = (lock, refs + 1)
+    lock.acquire()
+    try:
+        yield
+    finally:
+        lock.release()
+        with _FINALIZE_LOCKS_GUARD:
+            cur_lock, cur_refs = _FINALIZE_LOCKS.get(attempt_id, (None, 0))
+            if cur_lock is lock:
+                if cur_refs <= 1:
+                    _FINALIZE_LOCKS.pop(attempt_id, None)
+                else:
+                    _FINALIZE_LOCKS[attempt_id] = (lock, cur_refs - 1)
 
 # wire-sources/ 下不是 evidence spool 的框架文件。
 _NON_SPOOL_FILES = ("correlation-map.json", "phase-state.json")
@@ -1082,7 +1100,7 @@ def _build_manifest(
 
 def update_db_summary(db_path: Path, attempt_id: str, manifest: dict[str, Any]) -> None:
     """attempts 表 wire 摘要列：只写摘要，不搬 payload。幂等。"""
-    import sqlite3
+    from backend.db import _open_sync
 
     sources = manifest.get("sources", [])
     errors = sum(
@@ -1091,7 +1109,7 @@ def update_db_summary(db_path: Path, attempt_id: str, manifest: dict[str, Any]) 
         + int(s.get("errors", 0))
         for s in sources
     ) + len(manifest.get("gaps", []))
-    with sqlite3.connect(db_path) as conn:
+    with _open_sync(db_path) as conn:
         conn.execute(
             "UPDATE attempts SET wire_status=?, wire_record_count=?,"
             " wire_call_count=?, wire_error_count=?, wire_manifest_version=?"

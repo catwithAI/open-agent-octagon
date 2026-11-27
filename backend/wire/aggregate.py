@@ -14,11 +14,11 @@
 from __future__ import annotations
 
 import json
-import sqlite3
 from pathlib import Path
 from typing import Any
 
 from backend.cost.estimate import apply_cost_columns
+from backend.db import _open_sync
 from backend.wire import paths
 
 _USAGE_FIELDS = (
@@ -92,7 +92,7 @@ def backfill_token_usage(db_path: Path, data_path: Path, attempt_id: str) -> str
     wire_path = paths.wire_file(data_path, attempt_id)
     wire_usage = aggregate_agent_run_usage(_iter_wire_records(wire_path))
 
-    with sqlite3.connect(db_path) as conn:
+    with _open_sync(db_path) as conn:
         row = conn.execute(
             "SELECT token_usage_json, external_refs_json FROM attempts WHERE id=?",
             (attempt_id,),
