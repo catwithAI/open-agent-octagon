@@ -31,6 +31,7 @@ import json
 import logging
 import re
 import uuid as _uuid
+from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -180,12 +181,13 @@ class _SpoolRegistry:
     def __init__(self) -> None:
         self._guard = asyncio.Lock()
         self._entries: dict[tuple[str, str], _Entry] = {}
-        self._sealed: set[tuple[str, str]] = set()
+        self._sealed: OrderedDict[tuple[str, str], None] = OrderedDict()
 
     async def begin(self, data_path: Path, attempt_id: str) -> _Entry | None:
         key = (str(data_path), attempt_id)
         async with self._guard:
             if key in self._sealed:
+                self._sealed.move_to_end(key)
                 return None
             entry = self._entries.get(key)
             if entry is None:
@@ -214,7 +216,10 @@ class _SpoolRegistry:
         key = (str(data_path), attempt_id)
         async with self._guard:
             already = key in self._sealed
-            self._sealed.add(key)
+            self._sealed[key] = None
+            self._sealed.move_to_end(key)
+            while len(self._sealed) > _MAX_CACHE_ENTRIES:
+                self._sealed.popitem(last=False)
             entry = self._entries.pop(key, None)
         if entry is None or already:
             return
@@ -258,6 +263,7 @@ def reset() -> None:
     """测试 teardown。"""
     global _REGISTRY
     _REGISTRY = _SpoolRegistry()
+    _ATTEMPT_RUN_CACHE.clear()
     # model-integrity hot-path caches share the proxy lifecycle.
     from backend.model_integrity import reset_caches
 
@@ -500,9 +506,11 @@ def _build_upstream_url(provider_cfg: ModelProviderSection, path: str) -> str:
     return f"{base}/{suffix}" if suffix else base
 
 
-#: attempt_id → run_id 的进程级缓存。转发是热路径，每个请求查一次库不可接受；
-#: attempt 与 run 的归属一经建立就不再变化，缓存无失效问题。
-_ATTEMPT_RUN_CACHE: dict[str, str | None] = {}
+_MAX_CACHE_ENTRIES = 4096
+
+#: attempt_id → run_id 的进程级有界缓存。转发是热路径，每个请求查一次库不可接受；
+#: attempt 与 run 的归属一经建立就不再变化，但绝不缓存 None，避免把瞬时查库竞态固化。
+_ATTEMPT_RUN_CACHE: OrderedDict[str, str] = OrderedDict()
 
 
 def _run_id_for(attempt_id: str) -> str | None:
@@ -511,8 +519,10 @@ def _run_id_for(attempt_id: str) -> str | None:
     查不到（脱离 runtime_state 的单测、attempt 尚未落库）返回 None，
     调用方回落 provider 配置——**不抛错**：成本核算绝不能拖垮转发本身。
     """
-    if attempt_id in _ATTEMPT_RUN_CACHE:
-        return _ATTEMPT_RUN_CACHE[attempt_id]
+    cached = _ATTEMPT_RUN_CACHE.get(attempt_id)
+    if cached is not None:
+        _ATTEMPT_RUN_CACHE.move_to_end(attempt_id)
+        return cached
     run_id: str | None = None
     try:
         from backend import runtime_state
@@ -525,7 +535,11 @@ def _run_id_for(attempt_id: str) -> str | None:
         run_id = row[0] if row else None
     except Exception:  # pragma: no cover - fail-open，转发优先
         return None
-    _ATTEMPT_RUN_CACHE[attempt_id] = run_id
+    if run_id is not None:
+        _ATTEMPT_RUN_CACHE[attempt_id] = run_id
+        _ATTEMPT_RUN_CACHE.move_to_end(attempt_id)
+        while len(_ATTEMPT_RUN_CACHE) > _MAX_CACHE_ENTRIES:
+            _ATTEMPT_RUN_CACHE.popitem(last=False)
     return run_id
 
 

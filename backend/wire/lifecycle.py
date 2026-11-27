@@ -819,7 +819,8 @@ class WireCaptureSession:
             try:
                 from backend.wire import finalize as _finalize
 
-                manifest = _finalize.finalize_attempt(
+                manifest = await _to_thread(
+                    _finalize.finalize_attempt,
                     data_path=self.data_path,
                     attempt_id=self.attempt_id,
                     policy=self.policy,
@@ -837,11 +838,13 @@ class WireCaptureSession:
                     from backend.wire.aggregate import backfill_token_usage
 
                     state = runtime_state.get()
-                    _finalize.update_db_summary(
-                        state.db_path, self.attempt_id, manifest
+                    await _to_thread(
+                        _finalize.update_db_summary,
+                        state.db_path, self.attempt_id, manifest,
                     )
-                    backfill_token_usage(
-                        state.db_path, self.data_path, self.attempt_id
+                    await _to_thread(
+                        backfill_token_usage,
+                        state.db_path, self.data_path, self.attempt_id,
                     )
             except Exception:
                 logger.exception("wire finalize fail-open: manifest/canonical 生成失败")

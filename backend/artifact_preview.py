@@ -19,6 +19,7 @@ import sys
 import tempfile
 import threading
 import zipfile
+from collections import OrderedDict
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
@@ -39,6 +40,10 @@ _BACKGROUND_EXECUTOR = ThreadPoolExecutor(
 )
 _BACKGROUND_LOCK = threading.Lock()
 _BACKGROUND_JOBS: dict[str, Future[dict[str, Any]]] = {}
+
+_CACHE_KEY_MAX_ENTRIES = 1024
+_CACHE_KEY_LOCK = threading.Lock()
+_CACHE_KEY_CACHE: OrderedDict[tuple[str, int, int], str] = OrderedDict()
 
 MAX_SOURCE_BYTES = 128 * 1024 * 1024
 MAX_ZIP_ENTRIES = 10_000
@@ -274,13 +279,33 @@ def inspect_artifact(path: Path) -> Inspection:
 
 
 def cache_key(path: Path) -> str:
+    stat_key: tuple[str, int, int] | None = None
+    try:
+        resolved = path.resolve()
+        st = resolved.stat()
+        stat_key = (str(resolved), st.st_mtime_ns, st.st_size)
+    except OSError:
+        stat_key = None
+    if stat_key is not None:
+        with _CACHE_KEY_LOCK:
+            cached = _CACHE_KEY_CACHE.get(stat_key)
+            if cached is not None:
+                _CACHE_KEY_CACHE.move_to_end(stat_key)
+                return cached
     digest = hashlib.sha256()
     digest.update(PREVIEW_CONTRACT_VERSION.encode("ascii"))
     digest.update(b"\0octagon-office-renderers-v2\0")
     with path.open("rb") as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
-    return f"sha256:{digest.hexdigest()}"
+    value = f"sha256:{digest.hexdigest()}"
+    if stat_key is not None:
+        with _CACHE_KEY_LOCK:
+            _CACHE_KEY_CACHE[stat_key] = value
+            _CACHE_KEY_CACHE.move_to_end(stat_key)
+            while len(_CACHE_KEY_CACHE) > _CACHE_KEY_MAX_ENTRIES:
+                _CACHE_KEY_CACHE.popitem(last=False)
+    return value
 
 
 def _worker_result(
@@ -442,6 +467,7 @@ def preview_descriptor(
     status = inspection.status
     error_code = inspection.error_code
     error_message = inspection.error_message
+    error_transient = False
     gaps = list(inspection.capability_gaps)
 
     renderer_spec: tuple[str, str, str, list[str]] | None = None
@@ -477,11 +503,13 @@ def preview_descriptor(
             error = result.get("error") if isinstance(result.get("error"), dict) else {}
             error_code = str(error.get("code") or "renderer_failed")
             error_message = str(error.get("message") or "Office 预览失败")
+            error_transient = bool(result.get("transient"))
         else:
             content = result.get("content")
             status = "ready"
             error_code = None
             error_message = None
+            error_transient = False
             renderer = {"name": renderer_name, "version": renderer_version}
             gaps = [gap for gap in gaps if gap != "content-renderer-not-installed"]
             gaps.extend(renderer_gaps)
@@ -489,6 +517,11 @@ def preview_descriptor(
                 gaps.append("embedded-images-omitted")
             if isinstance(content, dict) and isinstance(content.get("features"), list):
                 gaps.extend(str(item) for item in content["features"])
+    error_payload: dict[str, Any] | None = None
+    if error_code:
+        error_payload = {"code": error_code, "message": error_message}
+        if error_transient:
+            error_payload["transient"] = True
     return {
         "version": PREVIEW_CONTRACT_VERSION,
         "artifact": {
@@ -501,10 +534,7 @@ def preview_descriptor(
         "status": status,
         "counts": inspection.counts,
         "renderer": renderer,
-        "error": (
-            {"code": error_code, "message": error_message}
-            if error_code else None
-        ),
+        "error": error_payload,
         "cache_key": source_cache_key,
         "poll_after_ms": None,
         "security": inspection.security,
@@ -615,6 +645,15 @@ def scheduled_preview_descriptor(
     if not future.done():
         return _pending_descriptor(path, artifact_ref, inspection, key)
     try:
-        return future.result()
+        result = future.result()
     except BaseException:
+        with _BACKGROUND_LOCK:
+            if _BACKGROUND_JOBS.get(job_key) is future:
+                _BACKGROUND_JOBS.pop(job_key, None)
         return _background_failure(path, artifact_ref, inspection, key)
+    error = result.get("error") if isinstance(result, dict) else None
+    if isinstance(error, dict) and error.get("transient") is True:
+        with _BACKGROUND_LOCK:
+            if _BACKGROUND_JOBS.get(job_key) is future:
+                _BACKGROUND_JOBS.pop(job_key, None)
+    return result

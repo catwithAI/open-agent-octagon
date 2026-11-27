@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -42,14 +44,17 @@ class ModelDecision:
 
 # attempt models are immutable after creation.  Include the database path in
 # cache keys because tests and multi-instance deployments may reuse attempt IDs.
-_EXPECTED_CACHE: dict[tuple[str, str], str | None] = {}
-_RECORDED_MATCHES: set[tuple[str, str, str]] = set()
+_MAX_CACHE_ENTRIES = 4096
+_CACHE_LOCK = threading.Lock()
+_EXPECTED_CACHE: OrderedDict[tuple[str, str], str | None] = OrderedDict()
+_RECORDED_MATCHES: OrderedDict[tuple[str, str, str], None] = OrderedDict()
 
 
 def reset_caches() -> None:
     """Clear process-local hot-path caches (primarily for runtime/test reset)."""
-    _EXPECTED_CACHE.clear()
-    _RECORDED_MATCHES.clear()
+    with _CACHE_LOCK:
+        _EXPECTED_CACHE.clear()
+        _RECORDED_MATCHES.clear()
 
 
 def _runtime_db_path() -> Path | None:
@@ -64,8 +69,10 @@ def _runtime_db_path() -> Path | None:
 
 def _expected_model(db_path: Path, attempt_id: str) -> tuple[bool, str | None]:
     key = (str(db_path), attempt_id)
-    if key in _EXPECTED_CACHE:
-        return True, _EXPECTED_CACHE[key]
+    with _CACHE_LOCK:
+        if key in _EXPECTED_CACHE:
+            _EXPECTED_CACHE.move_to_end(key)
+            return True, _EXPECTED_CACHE[key]
     with _open_sync(db_path) as conn:
         row = conn.execute(
             "SELECT model FROM attempts WHERE id=?", (attempt_id,)
@@ -73,7 +80,11 @@ def _expected_model(db_path: Path, attempt_id: str) -> tuple[bool, str | None]:
     if row is None:
         return False, None
     expected = row[0] if isinstance(row[0], str) and row[0].strip() else None
-    _EXPECTED_CACHE[key] = expected
+    with _CACHE_LOCK:
+        _EXPECTED_CACHE[key] = expected
+        _EXPECTED_CACHE.move_to_end(key)
+        while len(_EXPECTED_CACHE) > _MAX_CACHE_ENTRIES:
+            _EXPECTED_CACHE.popitem(last=False)
     return True, expected
 
 
@@ -109,8 +120,11 @@ def _record(
         attempt_id,
         observed or "",
     )
-    if not violation and match_key in _RECORDED_MATCHES:
-        return
+    if not violation:
+        with _CACHE_LOCK:
+            if match_key in _RECORDED_MATCHES:
+                _RECORDED_MATCHES.move_to_end(match_key)
+                return
 
     with _open_sync(db_path) as conn:
         # Serialize read-modify-write of the observed-model set.  Several child
@@ -171,7 +185,11 @@ def _record(
         )
         conn.commit()
     if not violation:
-        _RECORDED_MATCHES.add(match_key)
+        with _CACHE_LOCK:
+            _RECORDED_MATCHES[match_key] = None
+            _RECORDED_MATCHES.move_to_end(match_key)
+            while len(_RECORDED_MATCHES) > _MAX_CACHE_ENTRIES:
+                _RECORDED_MATCHES.popitem(last=False)
 
 
 def validate_proxy_model(

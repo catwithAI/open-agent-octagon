@@ -154,7 +154,7 @@ class Store:
                 manifest = json.loads(row[0])
                 for column in manifest.get('columns',[]):
                     blobs.update(item['hash'] for item in (column.get('result') or {}).get('artifacts',[]) if item.get('hash'))
-            removed = {'blobs':0,'manifests':0,'temporary':0}
+            removed = {'blobs':0,'manifests':0,'temporary':0,'previews':0}
             candidates = []
             for path in (self.root / 'blobs' / 'sha256').glob('*/*'):
                 if _DIGEST.fullmatch(path.name) and path.name not in blobs:
@@ -162,6 +162,23 @@ class Store:
             for path in (self.root / 'manifests').glob('*.json'):
                 if _DIGEST.fullmatch(path.stem) and path.stem not in manifests:
                     candidates.append((path,'manifests',path.stem))
+            preview_dirs: list[Path] = []
+            previews_root = self.root / 'previews'
+            if previews_root.is_dir() and not previews_root.is_symlink():
+                for hash_dir in previews_root.iterdir():
+                    if hash_dir.is_symlink() or not hash_dir.is_dir():
+                        continue
+                    if _DIGEST.fullmatch(hash_dir.name) and hash_dir.name not in blobs:
+                        preview_dirs.append(hash_dir)
+                        for dirpath, _dirnames, filenames in os.walk(hash_dir, followlinks=False):
+                            base = Path(dirpath)
+                            if base.is_symlink():
+                                continue
+                            for filename in filenames:
+                                path = base / filename
+                                if path.suffix == '.tmp':
+                                    continue
+                                candidates.append((path, 'previews', hash_dir.name))
             candidates.extend((p,'temporary',None) for p in self.root.rglob('*.tmp'))
             for path,kind,hash_ in candidates:
                 if path.is_symlink() or not path.is_file() or path.stat().st_mtime >= older_than:
@@ -170,6 +187,15 @@ class Store:
                 removed[kind] += 1
                 if kind=='blobs':
                     conn.execute('DELETE FROM skill_eval_blobs WHERE hash=?',(hash_,))
+            for hash_dir in preview_dirs:
+                for dirpath, _dirnames, _filenames in os.walk(hash_dir, topdown=False, followlinks=False):
+                    target = Path(dirpath)
+                    if target.is_symlink():
+                        continue
+                    try:
+                        target.rmdir()
+                    except OSError:
+                        pass
             return removed
 
     def blob_path(self, hash_: str) -> Path:

@@ -164,6 +164,135 @@ def require_feature(request: Request, feature: str) -> None:
         )
 
 
+async def _require_features_async(request: Request, *features: str) -> None:
+    projection = await asyncio.to_thread(
+        detect_capabilities, request.app.state.settings, runtime_state.get().db_path
+    )
+    for feature in features:
+        if not projection["features"].get(feature, False):
+            raise ResearchApiException(
+                status_code=404,
+                code="feature_unavailable",
+                message=f"research feature is unavailable: {feature}",
+                subsystem=feature,
+            )
+
+
+def _list_experiments_sync(db_path: Any) -> dict[str, Any]:
+    with _open_sync(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT id,title,question,env_name,source_task_id,protocol_hash,status,"
+            "protocol_json,created_at,updated_at "
+            "FROM experiments ORDER BY created_at DESC,id DESC"
+        ).fetchall()
+        # 每个 agent 在该实验全部 repeat 里的最佳分——列表页展示用，
+        # 一条 GROUP BY 覆盖所有 experiment 避免 N+1。只取有分数的 attempt
+        # （score_total 非空，即已评分终态 completed/gave_up）。
+        best_rows = conn.execute(
+            "SELECT g.experiment_id,a.agent_name,MAX(a.score_total) AS best_score "
+            "FROM attempts a "
+            "JOIN run_group_cells c ON c.run_id=a.run_id "
+            "JOIN run_groups g ON g.id=c.run_group_id "
+            "WHERE a.score_total IS NOT NULL "
+            "GROUP BY g.experiment_id,a.agent_name"
+        ).fetchall()
+    best_by_experiment: dict[str, dict[str, int]] = {}
+    for row in best_rows:
+        best_by_experiment.setdefault(row["experiment_id"], {})[row["agent_name"]] = (
+            row["best_score"]
+        )
+    items = []
+    for row in rows:
+        item = dict(row)
+        protocol_json = item.pop("protocol_json")
+        try:
+            agents = [
+                a["agent"] for a in json.loads(protocol_json).get("agents", [])
+                if isinstance(a, dict) and a.get("agent")
+            ]
+        except (json.JSONDecodeError, AttributeError, TypeError):
+            agents = []
+        best_for_experiment = best_by_experiment.get(row["id"], {})
+        # 参与该实验的每个 agent 都出一行，即便还没有任何 repeat 评上分
+        # （None）——前端据此区分"agent 完全没跑通"和"跑通但低分"。
+        item["best_scores"] = [
+            {"agent": agent, "best_score": best_for_experiment.get(agent)}
+            for agent in agents
+        ]
+        items.append(item)
+    return {"items": items}
+
+
+def _check_experiment_finalized_sync(db_path: Any, experiment_id: str) -> tuple[Any, int]:
+    with _open_sync(db_path) as conn:
+        experiment = conn.execute(
+            "SELECT status FROM experiments WHERE id=?", (experiment_id,)
+        ).fetchone()
+        nonterminal = conn.execute(
+            "SELECT COUNT(*) FROM run_groups WHERE experiment_id=? AND status NOT IN "
+            "('completed','partial','failed','cancelled')",
+            (experiment_id,),
+        ).fetchone()[0]
+    return experiment, nonterminal
+
+
+def _list_run_groups_sync(db_path: Any, experiment_id: str) -> dict[str, Any]:
+    with _open_sync(db_path) as conn:
+        rows = conn.execute(
+            "SELECT id FROM run_groups WHERE experiment_id=? ORDER BY created_at,id",
+            (experiment_id,),
+        ).fetchall()
+    return {
+        "items": [
+            group_snapshot(db_path, row[0], experiment_id=experiment_id)
+            for row in rows
+        ]
+    }
+
+
+def _get_normalized_output_sync(
+    db_path: Any, data_path: Any, attempt_id: str
+) -> dict[str, Any]:
+    with _open_sync(db_path) as conn:
+        attempt = conn.execute(
+            "SELECT status FROM attempts WHERE id=?", (attempt_id,)
+        ).fetchone()
+    if attempt is None:
+        raise ResearchApiException(
+            404, "attempt_not_found", "attempt not found", "normalized_output"
+        )
+    source = data_path / "attempts" / attempt_id / "final_state.json"
+    source_available = source.is_file() and not source.is_symlink()
+    source_finalized = attempt[0] in TERMINAL_ATTEMPT_STATUSES
+    repository = NormalizationRepository(
+        db_path, DerivedPayloadStore(data_path)
+    )
+    item = repository.get(
+        attempt_id,
+        pipeline_hash=PIPELINE_HASH,
+        current_source_hash=current_source_hash(data_path, attempt_id),
+    )
+    return {
+        "attempt_id": attempt_id,
+        "status": item["status"] if item else "not_generated",
+        "raw_ref": f"attempts/{attempt_id}/final_state.json",
+        "generation_available": source_available and source_finalized,
+        "generation_unavailable_reason": (
+            None
+            if source_available and source_finalized
+            else "source_not_finalized"
+            if not source_finalized
+            else "final_output_unavailable"
+        ),
+        "normalized": item,
+        "search_projection": {
+            "source": "normalized-derived" if item and item["status"] == "current" else None,
+            "raw_source": "final_state",
+        },
+    }
+
+
 def build_router() -> APIRouter:
     router = APIRouter(tags=["research"])
 
@@ -194,17 +323,11 @@ def build_router() -> APIRouter:
         *,
         source_version: int | None = None,
     ) -> dict[str, Any]:
-        require_feature(request, "insights")
+        await _require_features_async(request, "insights")
         state = runtime_state.get()
-        with _open_sync(state.db_path) as conn:
-            experiment = conn.execute(
-                "SELECT status FROM experiments WHERE id=?", (experiment_id,)
-            ).fetchone()
-            nonterminal = conn.execute(
-                "SELECT COUNT(*) FROM run_groups WHERE experiment_id=? AND status NOT IN "
-                "('completed','partial','failed','cancelled')",
-                (experiment_id,),
-            ).fetchone()[0]
+        experiment, nonterminal = await asyncio.to_thread(
+            _check_experiment_finalized_sync, state.db_path, experiment_id
+        )
         if experiment is None:
             raise ResearchApiException(
                 404, "experiment_not_found", "experiment not found", "insights"
@@ -217,7 +340,8 @@ def build_router() -> APIRouter:
                 "insights",
                 retryable=True,
             )
-        bundle = build_evidence_bundle(
+        bundle = await asyncio.to_thread(
+            build_evidence_bundle,
             db_path=state.db_path,
             data_path=state.data_path,
             experiment_id=experiment_id,
@@ -256,9 +380,11 @@ def build_router() -> APIRouter:
 
     @router.get("/profiles")
     async def list_profiles(request: Request) -> dict[str, Any]:
-        require_feature(request, "profiles")
+        await _require_features_async(request, "profiles")
         try:
-            catalog = load_profiles(request.app.state.settings.octagon.profiles_path)
+            catalog = await asyncio.to_thread(
+                load_profiles, request.app.state.settings.octagon.profiles_path
+            )
         except ValueError as exc:
             raise ResearchApiException(
                 409, "profile_catalog_invalid", str(exc), "profiles"
@@ -272,11 +398,12 @@ def build_router() -> APIRouter:
     async def get_profile(
         request: Request, profile_id: str, version: str | None = None
     ) -> dict[str, Any]:
-        require_feature(request, "profiles")
+        await _require_features_async(request, "profiles")
         try:
-            item = load_profiles(
-                request.app.state.settings.octagon.profiles_path
-            ).get(profile_id, version)
+            catalog = await asyncio.to_thread(
+                load_profiles, request.app.state.settings.octagon.profiles_path
+            )
+            item = catalog.get(profile_id, version)
         except ValueError as exc:
             raise ResearchApiException(
                 409, "profile_catalog_invalid", str(exc), "profiles"
@@ -291,7 +418,7 @@ def build_router() -> APIRouter:
     async def recommend_profile(
         request: Request, body: AutoProfileRequest
     ) -> dict[str, Any]:
-        require_feature(request, "auto_profile")
+        await _require_features_async(request, "auto_profile")
         state = runtime_state.get()
         env = state.envs.get(body.env_name)
         if env is None:
@@ -305,12 +432,16 @@ def build_router() -> APIRouter:
                 raise ResearchApiException(
                     404, "task_not_found", "task not found", "auto_profile"
                 )
-        try:
-            result = recommend(extract_features(env=env, task=task, db_path=state.db_path))
-            result = apply_learned_nudge(
-                result, LearningRepository(state.db_path).get(result.scope_key)
+        def _compute_recommendation() -> Any:
+            rec = recommend(extract_features(env=env, task=task, db_path=state.db_path))
+            rec = apply_learned_nudge(
+                rec, LearningRepository(state.db_path).get(rec.scope_key)
             )
-            RecommendationRepository(state.db_path).put(result)
+            RecommendationRepository(state.db_path).put(rec)
+            return rec
+
+        try:
+            result = await asyncio.to_thread(_compute_recommendation)
         except Exception as exc:
             raise ResearchApiException(
                 409,
@@ -324,9 +455,10 @@ def build_router() -> APIRouter:
     async def get_profile_recommendation(
         request: Request, recommendation_id: str
     ) -> dict[str, Any]:
-        require_feature(request, "auto_profile")
-        result = RecommendationRepository(runtime_state.get().db_path).get(
-            recommendation_id
+        await _require_features_async(request, "auto_profile")
+        result = await asyncio.to_thread(
+            RecommendationRepository(runtime_state.get().db_path).get,
+            recommendation_id,
         )
         if result is None:
             raise ResearchApiException(
@@ -345,9 +477,10 @@ def build_router() -> APIRouter:
         idempotency_key: str = Header(min_length=1, alias="Idempotency-Key"),
         actor: str = Header(default="local:anonymous", alias="X-Octagon-Actor"),
     ) -> dict[str, Any]:
-        require_feature(request, "research_feedback")
-        recommendation = RecommendationRepository(runtime_state.get().db_path).get(
-            recommendation_id
+        await _require_features_async(request, "research_feedback")
+        db_path = runtime_state.get().db_path
+        recommendation = await asyncio.to_thread(
+            RecommendationRepository(db_path).get, recommendation_id
         )
         if recommendation is None:
             raise ResearchApiException(
@@ -360,17 +493,19 @@ def build_router() -> APIRouter:
             actor=actor,
             **body.model_dump(),
         )
-        response = _append_feedback(payload, idempotency_key)
+        response = await asyncio.to_thread(_append_feedback, payload, idempotency_key)
         try:
-            LearningRepository(runtime_state.get().db_path).rebuild_and_save(
-                recommendation["scope_key"]
+            await asyncio.to_thread(
+                LearningRepository(db_path).rebuild_and_save,
+                recommendation["scope_key"],
             )
         except LearningConflict:
             # Feedback is authoritative and already committed; a concurrent
             # learner will rebuild from the append-only log on its next pass.
             pass
-        append_research_audit(
-            runtime_state.get().db_path,
+        await asyncio.to_thread(
+            append_research_audit,
+            db_path,
             action="feedback.append",
             target_type="profile-recommendation",
             target_id=recommendation_id,
@@ -382,59 +517,19 @@ def build_router() -> APIRouter:
 
     @router.get("/experiments")
     async def list_experiments(request: Request) -> dict[str, Any]:
-        require_feature(request, "experiments")
-        with _open_sync(runtime_state.get().db_path) as conn:
-            conn.row_factory = sqlite3.Row
-            rows = conn.execute(
-                "SELECT id,title,question,env_name,source_task_id,protocol_hash,status,"
-                "protocol_json,created_at,updated_at "
-                "FROM experiments ORDER BY created_at DESC,id DESC"
-            ).fetchall()
-            # 每个 agent 在该实验全部 repeat 里的最佳分——列表页展示用，
-            # 一条 GROUP BY 覆盖所有 experiment 避免 N+1。只取有分数的 attempt
-            # （score_total 非空，即已评分终态 completed/gave_up）。
-            best_rows = conn.execute(
-                "SELECT g.experiment_id,a.agent_name,MAX(a.score_total) AS best_score "
-                "FROM attempts a "
-                "JOIN run_group_cells c ON c.run_id=a.run_id "
-                "JOIN run_groups g ON g.id=c.run_group_id "
-                "WHERE a.score_total IS NOT NULL "
-                "GROUP BY g.experiment_id,a.agent_name"
-            ).fetchall()
-        best_by_experiment: dict[str, dict[str, int]] = {}
-        for row in best_rows:
-            best_by_experiment.setdefault(row["experiment_id"], {})[row["agent_name"]] = (
-                row["best_score"]
-            )
-        items = []
-        for row in rows:
-            item = dict(row)
-            protocol_json = item.pop("protocol_json")
-            try:
-                agents = [
-                    a["agent"] for a in json.loads(protocol_json).get("agents", [])
-                    if isinstance(a, dict) and a.get("agent")
-                ]
-            except (json.JSONDecodeError, AttributeError, TypeError):
-                agents = []
-            best_for_experiment = best_by_experiment.get(row["id"], {})
-            # 参与该实验的每个 agent 都出一行，即便还没有任何 repeat 评上分
-            # （None）——前端据此区分"agent 完全没跑通"和"跑通但低分"。
-            item["best_scores"] = [
-                {"agent": agent, "best_score": best_for_experiment.get(agent)}
-                for agent in agents
-            ]
-            items.append(item)
-        return {"items": items}
+        await _require_features_async(request, "experiments")
+        return await asyncio.to_thread(
+            _list_experiments_sync, runtime_state.get().db_path
+        )
 
     @router.post("/experiments/preview", response_model=VariantPreview)
     async def preview_experiment(
         request: Request, body: ExperimentPreviewRequest
     ) -> VariantPreview:
-        require_feature(request, "experiments")
-        require_feature(request, "task_variants")
+        await _require_features_async(request, "experiments", "task_variants")
         try:
-            prepared = prepare_experiment_preview(
+            prepared = await asyncio.to_thread(
+                prepare_experiment_preview,
                 settings=request.app.state.settings,
                 env_name=body.env_name,
                 task_id=body.task_id,
@@ -461,10 +556,12 @@ def build_router() -> APIRouter:
         body: ExperimentCreateRequest,
         idempotency_key: str = Header(min_length=1, alias="Idempotency-Key"),
     ) -> dict[str, Any]:
-        for feature in ("experiments", "task_variants", "run_groups"):
-            require_feature(request, feature)
+        await _require_features_async(
+            request, "experiments", "task_variants", "run_groups"
+        )
         try:
-            created = create_experiment(
+            created = await asyncio.to_thread(
+                create_experiment,
                 settings=request.app.state.settings,
                 title=body.title,
                 question=body.question,
@@ -503,10 +600,11 @@ def build_router() -> APIRouter:
 
     @router.get("/experiments/{experiment_id}")
     async def get_experiment(request: Request, experiment_id: str) -> dict[str, Any]:
-        require_feature(request, "experiments")
+        await _require_features_async(request, "experiments")
         state = runtime_state.get()
-        bundle = ExperimentRepository(state.db_path, state.data_path).get_bundle(
-            experiment_id
+        bundle = await asyncio.to_thread(
+            ExperimentRepository(state.db_path, state.data_path).get_bundle,
+            experiment_id,
         )
         if bundle is None:
             raise ResearchApiException(
@@ -524,10 +622,12 @@ def build_router() -> APIRouter:
         body: ExperimentCloneRequest,
         idempotency_key: str = Header(min_length=1, alias="Idempotency-Key"),
     ) -> dict[str, Any]:
-        for feature in ("experiments", "task_variants", "run_groups"):
-            require_feature(request, feature)
+        await _require_features_async(
+            request, "experiments", "task_variants", "run_groups"
+        )
         try:
-            created = clone_experiment(
+            created = await asyncio.to_thread(
+                clone_experiment,
                 experiment_id=experiment_id,
                 idempotency_key=idempotency_key,
                 title=body.title,
@@ -559,7 +659,7 @@ def build_router() -> APIRouter:
     async def stop_run_group_route(
         request: Request, experiment_id: str, group_id: str
     ) -> dict[str, Any]:
-        require_feature(request, "run_groups")
+        await _require_features_async(request, "run_groups")
         try:
             stopped = stop_group(group_id, experiment_id=experiment_id)
         except CoordinatorError as exc:
@@ -569,7 +669,8 @@ def build_router() -> APIRouter:
                 message=str(exc),
                 subsystem="run_groups",
             ) from exc
-        append_research_audit(
+        await asyncio.to_thread(
+            append_research_audit,
             runtime_state.get().db_path,
             action="run_group.stop",
             target_type="run_group",
@@ -583,28 +684,18 @@ def build_router() -> APIRouter:
     async def list_run_groups(
         request: Request, experiment_id: str
     ) -> dict[str, Any]:
-        require_feature(request, "run_groups")
-        state = runtime_state.get()
-        with _open_sync(state.db_path) as conn:
-            rows = conn.execute(
-                "SELECT id FROM run_groups WHERE experiment_id=? ORDER BY created_at,id",
-                (experiment_id,),
-            ).fetchall()
-        return {
-            "items": [
-                group_snapshot(
-                    state.db_path, row[0], experiment_id=experiment_id
-                )
-                for row in rows
-            ]
-        }
+        await _require_features_async(request, "run_groups")
+        return await asyncio.to_thread(
+            _list_run_groups_sync, runtime_state.get().db_path, experiment_id
+        )
 
     @router.get("/experiments/{experiment_id}/groups/{group_id}")
     async def get_run_group(
         request: Request, experiment_id: str, group_id: str
     ) -> dict[str, Any]:
-        require_feature(request, "run_groups")
-        snapshot = group_snapshot(
+        await _require_features_async(request, "run_groups")
+        snapshot = await asyncio.to_thread(
+            group_snapshot,
             runtime_state.get().db_path,
             group_id,
             experiment_id=experiment_id,
@@ -625,10 +716,10 @@ def build_router() -> APIRouter:
         group_id: str,
         once: bool = False,
     ) -> StreamingResponse:
-        require_feature(request, "run_groups")
+        await _require_features_async(request, "run_groups")
         state = runtime_state.get()
-        initial = group_snapshot(
-            state.db_path, group_id, experiment_id=experiment_id
+        initial = await asyncio.to_thread(
+            group_snapshot, state.db_path, group_id, experiment_id=experiment_id
         )
         if initial is None:
             raise ResearchApiException(
@@ -653,7 +744,9 @@ def build_router() -> APIRouter:
             if once:
                 return
             while not await request.is_disconnected():
-                events = group_events(state.db_path, group_id, after=cursor)
+                events = await asyncio.to_thread(
+                    group_events, state.db_path, group_id, after=cursor
+                )
                 for event in events:
                     cursor = event["sequence"]
                     yield (
@@ -676,20 +769,23 @@ def build_router() -> APIRouter:
         offset: int = 0,
         limit: int = 100,
     ) -> dict[str, Any]:
-        require_feature(request, "robustness")
+        await _require_features_async(request, "robustness")
         if offset < 0 or not 1 <= limit <= 1000:
             raise ResearchApiException(
                 400, "pagination_invalid", "invalid offset/limit", "robustness"
             )
-        snapshot = group_snapshot(
-            runtime_state.get().db_path, group_id, experiment_id=experiment_id
+        db_path = runtime_state.get().db_path
+        snapshot = await asyncio.to_thread(
+            group_snapshot, db_path, group_id, experiment_id=experiment_id
         )
         if snapshot is None:
             raise ResearchApiException(
                 404, "run_group_not_found", "run group not found", "robustness"
             )
         try:
-            result = build_robustness_snapshot(runtime_state.get().db_path, group_id)
+            result = await asyncio.to_thread(
+                build_robustness_snapshot, db_path, group_id
+            )
             return filter_snapshot(
                 result,
                 metric=metric,
@@ -708,14 +804,15 @@ def build_router() -> APIRouter:
     async def get_cell_drilldown(
         request: Request, experiment_id: str, group_id: str, cell_id: str
     ) -> dict[str, Any]:
-        require_feature(request, "robustness")
-        if group_snapshot(
-            runtime_state.get().db_path, group_id, experiment_id=experiment_id
+        await _require_features_async(request, "robustness")
+        db_path = runtime_state.get().db_path
+        if await asyncio.to_thread(
+            group_snapshot, db_path, group_id, experiment_id=experiment_id
         ) is None:
             raise ResearchApiException(
                 404, "run_group_not_found", "run group not found", "robustness"
             )
-        result = cell_drilldown(runtime_state.get().db_path, group_id, cell_id)
+        result = await asyncio.to_thread(cell_drilldown, db_path, group_id, cell_id)
         if result is None:
             raise ResearchApiException(
                 404, "cell_not_found", "cell not found", "robustness"
@@ -724,10 +821,11 @@ def build_router() -> APIRouter:
 
     @router.post("/experiments/{experiment_id}/rerun-preview")
     async def rerun_preview(request: Request, experiment_id: str) -> dict[str, Any]:
-        require_feature(request, "experiments")
+        await _require_features_async(request, "experiments")
         state = runtime_state.get()
-        bundle = ExperimentRepository(state.db_path, state.data_path).get_bundle(
-            experiment_id
+        bundle = await asyncio.to_thread(
+            ExperimentRepository(state.db_path, state.data_path).get_bundle,
+            experiment_id,
         )
         if bundle is None:
             raise ResearchApiException(
@@ -754,10 +852,13 @@ def build_router() -> APIRouter:
         cursor: int | None = None,
         limit: int = 20,
     ) -> dict[str, Any]:
-        require_feature(request, "insights")
+        await _require_features_async(request, "insights")
         try:
-            items = insight_repository().list(
-                experiment_id, before_version=cursor, limit=limit
+            items = await asyncio.to_thread(
+                insight_repository().list,
+                experiment_id,
+                before_version=cursor,
+                limit=limit,
             )
         except ValueError as exc:
             raise ResearchApiException(
@@ -772,8 +873,10 @@ def build_router() -> APIRouter:
     async def get_insight(
         request: Request, experiment_id: str, version: int
     ) -> dict[str, Any]:
-        require_feature(request, "insights")
-        item = insight_repository().get(experiment_id, version)
+        await _require_features_async(request, "insights")
+        item = await asyncio.to_thread(
+            insight_repository().get, experiment_id, version
+        )
         if item is None:
             raise ResearchApiException(
                 404, "insight_not_found", "insight version not found", "insights"
@@ -797,8 +900,10 @@ def build_router() -> APIRouter:
         version: int,
         idempotency_key: str = Header(min_length=1, alias="Idempotency-Key"),
     ) -> dict[str, Any]:
-        require_feature(request, "insights")
-        if insight_repository().get(experiment_id, version) is None:
+        await _require_features_async(request, "insights")
+        if await asyncio.to_thread(
+            insight_repository().get, experiment_id, version
+        ) is None:
             raise ResearchApiException(
                 404, "insight_not_found", "source insight version not found", "insights"
             )
@@ -808,7 +913,8 @@ def build_router() -> APIRouter:
             idempotency_key,
             source_version=version,
         )
-        append_research_audit(
+        await asyncio.to_thread(
+            append_research_audit,
             runtime_state.get().db_path,
             action="insight.regenerate",
             target_type="experiment",
@@ -827,8 +933,10 @@ def build_router() -> APIRouter:
         idempotency_key: str = Header(min_length=1, alias="Idempotency-Key"),
         actor: str = Header(default="local:anonymous", alias="X-Octagon-Actor"),
     ) -> dict[str, Any]:
-        require_feature(request, "research_feedback")
-        insight = insight_repository().get(experiment_id, version)
+        await _require_features_async(request, "research_feedback")
+        insight = await asyncio.to_thread(
+            insight_repository().get, experiment_id, version
+        )
         if insight is None:
             raise ResearchApiException(
                 404, "insight_not_found", "insight version not found", "feedback"
@@ -840,8 +948,9 @@ def build_router() -> APIRouter:
             actor=actor,
             **body.model_dump(),
         )
-        result = _append_feedback(payload, idempotency_key)
-        append_research_audit(
+        result = await asyncio.to_thread(_append_feedback, payload, idempotency_key)
+        await asyncio.to_thread(
+            append_research_audit,
             runtime_state.get().db_path,
             action="feedback.append",
             target_type="insight",
@@ -860,7 +969,7 @@ def build_router() -> APIRouter:
         include_rationale: bool = False,
         local_admin: str | None = Header(default=None, alias="X-Octagon-Local-Admin"),
     ) -> dict[str, Any]:
-        require_feature(request, "research_feedback")
+        await _require_features_async(request, "research_feedback")
         if include_rationale and local_admin != "true":
             raise ResearchApiException(
                 403,
@@ -868,17 +977,21 @@ def build_router() -> APIRouter:
                 "rationale export requires explicit local-admin policy",
                 "feedback",
             )
+        db_path = runtime_state.get().db_path
+        items = await asyncio.to_thread(
+            FeedbackRepository(db_path).export,
+            target_type=target_type,
+            target_id=target_id,
+            include_rationale=include_rationale,
+        )
         result = {
             "schema_version": "octagon-feedback-export-v1",
-            "items": FeedbackRepository(runtime_state.get().db_path).export(
-                target_type=target_type,
-                target_id=target_id,
-                include_rationale=include_rationale,
-            ),
+            "items": items,
             "rationale_included": include_rationale,
         }
-        append_research_audit(
-            runtime_state.get().db_path,
+        await asyncio.to_thread(
+            append_research_audit,
+            db_path,
             action="feedback.export",
             target_type=target_type or "feedback",
             target_id=target_id or "all",
@@ -894,45 +1007,11 @@ def build_router() -> APIRouter:
     async def get_normalized_output(
         request: Request, attempt_id: str
     ) -> dict[str, Any]:
-        require_feature(request, "normalized_output")
+        await _require_features_async(request, "normalized_output")
         state = runtime_state.get()
-        with _open_sync(state.db_path) as conn:
-            attempt = conn.execute(
-                "SELECT status FROM attempts WHERE id=?", (attempt_id,)
-            ).fetchone()
-        if attempt is None:
-            raise ResearchApiException(
-                404, "attempt_not_found", "attempt not found", "normalized_output"
-            )
-        source = state.data_path / "attempts" / attempt_id / "final_state.json"
-        source_available = source.is_file() and not source.is_symlink()
-        source_finalized = attempt[0] in TERMINAL_ATTEMPT_STATUSES
-        repository = NormalizationRepository(
-            state.db_path, DerivedPayloadStore(state.data_path)
+        return await asyncio.to_thread(
+            _get_normalized_output_sync, state.db_path, state.data_path, attempt_id
         )
-        item = repository.get(
-            attempt_id,
-            pipeline_hash=PIPELINE_HASH,
-            current_source_hash=current_source_hash(state.data_path, attempt_id),
-        )
-        return {
-            "attempt_id": attempt_id,
-            "status": item["status"] if item else "not_generated",
-            "raw_ref": f"attempts/{attempt_id}/final_state.json",
-            "generation_available": source_available and source_finalized,
-            "generation_unavailable_reason": (
-                None
-                if source_available and source_finalized
-                else "source_not_finalized"
-                if not source_finalized
-                else "final_output_unavailable"
-            ),
-            "normalized": item,
-            "search_projection": {
-                "source": "normalized-derived" if item and item["status"] == "current" else None,
-                "raw_source": "final_state",
-            },
-        }
 
     @router.post("/attempts/{attempt_id}/normalized/generate")
     async def generate_normalized_output(
@@ -940,20 +1019,22 @@ def build_router() -> APIRouter:
         attempt_id: str,
         idempotency_key: str = Header(min_length=1, alias="Idempotency-Key"),
     ) -> dict[str, Any]:
-        require_feature(request, "normalized_output")
+        await _require_features_async(request, "normalized_output")
         state = runtime_state.get()
         repository = NormalizationRepository(
             state.db_path, DerivedPayloadStore(state.data_path)
         )
         try:
-            result = generate_normalized_idempotent(
+            result = await asyncio.to_thread(
+                generate_normalized_idempotent,
                 db_path=state.db_path,
                 data_path=state.data_path,
                 attempt_id=attempt_id,
                 repository=repository,
                 idempotency_key=idempotency_key,
             )
-            append_research_audit(
+            await asyncio.to_thread(
+                append_research_audit,
                 state.db_path,
                 action="normalization.generate",
                 target_type="attempt",
@@ -979,11 +1060,13 @@ def build_router() -> APIRouter:
     async def get_attack_coverage(
         request: Request, experiment_id: str
     ) -> dict[str, Any]:
-        require_feature(request, "attack_coverage")
+        await _require_features_async(request, "attack_coverage")
+        state = runtime_state.get()
         try:
-            return build_attack_coverage(
-                db_path=runtime_state.get().db_path,
-                data_path=runtime_state.get().data_path,
+            return await asyncio.to_thread(
+                build_attack_coverage,
+                db_path=state.db_path,
+                data_path=state.data_path,
                 experiment_id=experiment_id,
             )
         except ValueError as exc:
@@ -995,11 +1078,13 @@ def build_router() -> APIRouter:
     async def preview_attack_forensic_rerun(
         request: Request, experiment_id: str
     ) -> dict[str, Any]:
-        require_feature(request, "attack_coverage")
+        await _require_features_async(request, "attack_coverage")
+        state = runtime_state.get()
         try:
-            coverage = build_attack_coverage(
-                db_path=runtime_state.get().db_path,
-                data_path=runtime_state.get().data_path,
+            coverage = await asyncio.to_thread(
+                build_attack_coverage,
+                db_path=state.db_path,
+                data_path=state.data_path,
                 experiment_id=experiment_id,
             )
         except ValueError as exc:
@@ -1014,11 +1099,12 @@ def build_router() -> APIRouter:
     ) -> dict[str, Any]:
         """Resolve an anchor under the metadata-only, fail-closed API policy."""
 
-        require_feature(request, "experiments")
+        await _require_features_async(request, "experiments")
+        state = runtime_state.get()
         try:
             parsed = EvidenceResolver(
-                db_path=runtime_state.get().db_path,
-                data_path=runtime_state.get().data_path,
+                db_path=state.db_path,
+                data_path=state.data_path,
             )
             evidence_anchor = EvidenceAnchor.parse(anchor)
         except ValueError as exc:
@@ -1032,10 +1118,11 @@ def build_router() -> APIRouter:
                 "anchor does not belong to the requested experiment",
                 "evidence",
             )
+        resolution = await asyncio.to_thread(parsed.resolve, evidence_anchor)
         return {
             "schema_version": "octagon-evidence-resolution-v1",
             "anchor": evidence_anchor.uri(),
-            "resolution": parsed.resolve(evidence_anchor),
+            "resolution": resolution,
         }
 
     @router.get("/experiments/{experiment_id}/evidence")
@@ -1051,7 +1138,7 @@ def build_router() -> APIRouter:
     ) -> dict[str, Any]:
         """Return a bounded, metadata-only Evidence index for UI navigation."""
 
-        require_feature(request, "experiments")
+        await _require_features_async(request, "experiments")
         if offset < 0 or not 1 <= limit <= 200:
             raise ResearchApiException(
                 400, "pagination_invalid", "invalid offset/limit", "evidence"

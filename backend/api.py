@@ -34,6 +34,7 @@ import tempfile
 import threading
 import time
 import uuid
+import weakref
 from pathlib import Path
 from typing import Any, Literal
 
@@ -158,6 +159,24 @@ def _list_agents(settings) -> list[dict[str, Any]]:
 
 # ---------- /blade/config -------------------------------------------------
 
+# Event-loop-scoped shared httpx.AsyncClient pool: avoids creating a new client
+# (and connection pool) per request while ensuring multi-loop pytest suites never
+# reuse a client bound to a closed event loop.
+_SHARED_HTTP_CLIENTS: weakref.WeakKeyDictionary[
+    asyncio.AbstractEventLoop, httpx.AsyncClient
+] = weakref.WeakKeyDictionary()
+
+
+def _shared_http_client() -> httpx.AsyncClient:
+    loop = asyncio.get_running_loop()
+    client = _SHARED_HTTP_CLIENTS.get(loop)
+    if client is None or client.is_closed:
+        client = httpx.AsyncClient(
+            limits=httpx.Limits(max_connections=32, max_keepalive_connections=16),
+        )
+        _SHARED_HTTP_CLIENTS[loop] = client
+    return client
+
 
 async def _blade_health(base_url: str) -> dict[str, Any]:
     """ping `{base_url}/healthz`(blade-agent 默认健康检查)。
@@ -167,8 +186,7 @@ async def _blade_health(base_url: str) -> dict[str, Any]:
     """
     url = f"{base_url.rstrip('/')}/healthz"
     try:
-        async with httpx.AsyncClient(timeout=2.0) as cli:
-            resp = await cli.get(url)
+        resp = await _shared_http_client().get(url, timeout=2.0)
         return {
             "reachable": resp.status_code == 200,
             "status_code": resp.status_code,
@@ -182,14 +200,14 @@ async def _blade_models(base_url: str, api_key: str | None) -> dict[str, Any]:
         return {"default": None, "models": [], "error": "blade.api_key not configured"}
     url = f"{base_url.rstrip('/')}/api/config/models"
     try:
-        async with httpx.AsyncClient(
+        resp = await _shared_http_client().get(
+            url,
             timeout=5.0,
             headers={
                 "Accept": "application/json",
                 "Authorization": f"Bearer {api_key}",
             },
-        ) as cli:
-            resp = await cli.get(url)
+        )
         resp.raise_for_status()
         data = resp.json()
         if not isinstance(data, dict):
@@ -239,14 +257,14 @@ async def _openrouter_models() -> dict[str, Any]:
         if cached is not None and _or_models_cache.get("expires_at", 0.0) > now:
             return {"models": cached, "error": None}
         try:
-            async with httpx.AsyncClient(
+            resp = await _shared_http_client().get(
+                _OPENROUTER_MODELS_URL,
                 timeout=10.0,
                 headers={
                     "Accept": "application/json",
                     "Authorization": f"Bearer {api_key}",
                 },
-            ) as cli:
-                resp = await cli.get(_OPENROUTER_MODELS_URL)
+            )
             resp.raise_for_status()
             data = resp.json()
             raw = data.get("data") if isinstance(data, dict) else None
@@ -332,6 +350,149 @@ class CreateRunRequest(BaseModel):
 
 
 # ---------- DB helpers ----------------------------------------------------
+
+
+def _run_exists_sync(db_path: Path, run_id: str) -> bool:
+    with _open_sync(db_path) as conn:
+        return (
+            conn.execute("SELECT 1 FROM runs WHERE id=?", (run_id,)).fetchone()
+            is not None
+        )
+
+
+def _read_attempt_events_sync(attempt_dir: Path) -> list[dict[str, Any]]:
+    events = _read_jsonl(attempt_dir / "events.jsonl")
+    if not events:
+        events = _read_jsonl(attempt_dir / "blade_events.jsonl")
+    return events
+
+
+def _load_attempt_files_sync(
+    attempt_dir: Path, *, include_events: bool
+) -> dict[str, Any]:
+    events = _read_attempt_events_sync(attempt_dir) if include_events else []
+    tool_calls, tool_calls_source = _load_tool_calls(
+        attempt_dir, events if include_events else None
+    )
+    final_state = _read_final_state(attempt_dir / "final_state.json")
+    progress = _read_final_state(attempt_dir / "progress.json")
+    sec_events = _read_jsonl(attempt_dir / "security_events.jsonl")
+    by_cat: dict[str, int] = {}
+    for e in sec_events:
+        if e.get("phase") == "executed":
+            c = e.get("category", "?")
+            by_cat[c] = by_cat.get(c, 0) + 1
+    conversation = _build_conversation_block(attempt_dir)
+    from .iteration.summary import public_iteration_summary
+
+    iteration = public_iteration_summary(attempt_dir)
+    return {
+        "events": events,
+        "tool_calls": tool_calls,
+        "tool_calls_source": tool_calls_source,
+        "final_state": final_state,
+        "progress": progress,
+        "by_cat": by_cat,
+        "conversation": conversation,
+        "iteration": iteration,
+    }
+
+
+def _persist_rejudge_job_sync(state: Any, prepared: dict[str, Any]) -> str:
+    """Create the scoring snapshot and persist the rejudge job off the event loop.
+
+    Matches :func:`backend.scoring_queue.enqueue_scoring_job` except task
+    scheduling, which runs on the event loop via :func:`schedule_scoring_job`.
+    """
+    from .adapters.blade_service import artifact_recovery_failed
+    from .scoring_queue import _execution_status, _scorer_version_for_env
+    from .scoring_snapshot import create_scoring_snapshot
+
+    attempt_id = prepared["attempt_id"]
+    adapter_status = prepared["adapter_status"]
+    adapter_error_code = prepared["adapter_error_code"]
+    adapter_error_message = prepared["adapter_error_message"]
+    stats = prepared["stats"]
+    security_meta = prepared["security_meta"]
+    execution_ended_at = prepared.get("execution_ended_at")
+    rejudge_prev = prepared.get("rejudge_prev")
+
+    snapshot = create_scoring_snapshot(
+        data_path=state.data_path,
+        attempt_id=attempt_id,
+    )
+    now = _now_iso()
+    job_id = f"scj_{uuid.uuid4().hex[:16]}"
+    config: dict[str, Any] = {
+        "adapter_status": adapter_status,
+        "adapter_error_code": adapter_error_code,
+        "adapter_error_message": adapter_error_message,
+        "security_meta": security_meta,
+        "snapshot_ref": snapshot.relative_path,
+    }
+    if rejudge_prev is not None:
+        config["rejudge"] = rejudge_prev
+    refs = dict(stats.get("external_refs") or {})
+    if adapter_status != "completed":
+        refs.update(
+            {
+                "original_status": adapter_status,
+                "original_error_code": adapter_error_code,
+                "original_error_message": adapter_error_message,
+            }
+        )
+    recovery_failed = adapter_status == "completed" and artifact_recovery_failed(refs)
+    with _open_sync(state.db_path) as conn:
+        env_row = conn.execute(
+            "SELECT env_name FROM attempts WHERE id=?", (attempt_id,)
+        ).fetchone()
+        env = state.envs.get(str(env_row[0])) if env_row else None
+        scorer_version = _scorer_version_for_env(env)
+        conn.execute(
+            "UPDATE attempts SET status='scoring',execution_status=?,"
+            "execution_ended_at=?,execution_error_code=?,execution_error_message=?,"
+            "scoring_status='queued',scoring_queued_at=?,score_total=NULL,"
+            "external_refs_json=?,event_count=?,last_event_at=?,thinking_count=?,"
+            "tool_call_count=?,token_usage_json=?,cost_estimate=?,duration_ms=?,"
+            "transport_status=?,ended_at=NULL,error_code=NULL,error_message=NULL,"
+            "failure_kind=? WHERE id=?",
+            (
+                _execution_status(adapter_status),
+                execution_ended_at or now,
+                adapter_error_code,
+                adapter_error_message,
+                now,
+                json.dumps(refs, ensure_ascii=False, sort_keys=True),
+                int(stats.get("event_count", 0)),
+                stats.get("last_event_at"),
+                int(stats.get("thinking_count", 0)),
+                int(stats.get("tool_call_count", 0)),
+                json.dumps(stats.get("token_usage") or {}, ensure_ascii=False, sort_keys=True),
+                stats.get("cost_estimate"),
+                int(stats.get("duration_ms", 0)),
+                stats.get("transport_status", "unknown"),
+                "infrastructure" if recovery_failed else None,
+                attempt_id,
+            ),
+        )
+        conn.execute(
+            "INSERT INTO scoring_jobs(id,attempt_id,status,scorer_version,"
+            "scorer_config_json,input_hash,created_at) VALUES(?,?,'queued',?,?,?,?)",
+            (
+                job_id,
+                attempt_id,
+                scorer_version,
+                json.dumps(config, ensure_ascii=False, sort_keys=True),
+                snapshot.input_hash,
+                now,
+            ),
+        )
+        conn.commit()
+    return job_id
+
+
+_UPLOAD_CHUNK_SIZE = 64 * 1024
+_UPLOAD_MAX_BYTES = 200 * 1024 * 1024
 
 
 def _list_runs_sync(
@@ -1448,58 +1609,61 @@ async def _stream_run_events(
     run_id: str,
     request: Request,
     *,
-    poll_interval: float = 0.75,
+    poll_interval: float = 2.5,
 ):
     state = runtime_state.get()
     last_run_signature = ""
     last_attempt_signatures: dict[str, tuple[Any, ...]] = {}
     last_heartbeat = time.monotonic()
 
-    while not await request.is_disconnected():
-        run = await asyncio.to_thread(_get_run_sync, state.db_path, run_id)
-        if run is None:
-            yield _sse("stream:error", {"message": f"run not found: {run_id}"})
-            return
+    with runtime_state.subscribe_run_updates(run_id) as wake_event:
+        while not await request.is_disconnected():
+            wake_event.clear()
+            run = await asyncio.to_thread(_get_run_sync, state.db_path, run_id)
+            if run is None:
+                yield _sse("stream:error", {"message": f"run not found: {run_id}"})
+                return
 
-        run_signature = json.dumps(run, ensure_ascii=False, sort_keys=True, default=str)
-        if run_signature != last_run_signature:
-            last_run_signature = run_signature
-            yield _sse("run:update", run)
+            run_signature = json.dumps(run, ensure_ascii=False, sort_keys=True, default=str)
+            if run_signature != last_run_signature:
+                last_run_signature = run_signature
+                yield _sse("run:update", run)
 
-        # Terminal runs cannot produce further attempt updates. Exit before
-        # walking artifact directories or reading wire manifests; otherwise
-        # each reconnect from an already-open result tab repeats expensive
-        # filesystem scans for a run that can no longer change.
-        if run.get("status") in {"completed", "failed", "cancelled"}:
-            yield _sse("stream:end", {"run_id": run_id, "status": run.get("status")})
-            return
+            # Terminal runs cannot produce further attempt updates. Exit before
+            # walking artifact directories or reading wire manifests; otherwise
+            # each reconnect from an already-open result tab repeats expensive
+            # filesystem scans for a run that can no longer change.
+            if run.get("status") in {"completed", "failed", "cancelled"}:
+                yield _sse("stream:end", {"run_id": run_id, "status": run.get("status")})
+                return
 
-        current_attempt_ids: set[str] = set()
-        for attempt in run.get("attempts", []):
-            attempt_id = str(attempt["id"])
-            current_attempt_ids.add(attempt_id)
-            file_signature = await asyncio.to_thread(
-                _attempt_change_signature,
-                state.data_path / "attempts" / attempt_id,
-            )
-            # DB 行也进签名：秒失败的 attempt（如 cli_not_found）可能从不写任何
-            # 落盘文件，只有 status/error_code/score 等 DB 字段变化——不发
-            # attempt:update 的话前端要等整个 run 终态才能看到错误信息
-            signature = (
-                json.dumps(attempt, ensure_ascii=False, sort_keys=True, default=str),
-                *file_signature,
-            )
-            if signature != last_attempt_signatures.get(attempt_id):
-                last_attempt_signatures[attempt_id] = signature
-                yield _sse("attempt:update", {"attempt_id": attempt_id})
-        for stale_id in set(last_attempt_signatures) - current_attempt_ids:
-            last_attempt_signatures.pop(stale_id, None)
+            current_attempt_ids: set[str] = set()
+            for attempt in run.get("attempts", []):
+                attempt_id = str(attempt["id"])
+                current_attempt_ids.add(attempt_id)
+                file_signature = await asyncio.to_thread(
+                    _attempt_change_signature,
+                    state.data_path / "attempts" / attempt_id,
+                )
+                # DB 行也进签名：秒失败的 attempt（如 cli_not_found）可能从不写任何
+                # 落盘文件，只有 status/error_code/score 等 DB 字段变化——不发
+                # attempt:update 的话前端要等整个 run 终态才能看到错误信息
+                signature = (
+                    json.dumps(attempt, ensure_ascii=False, sort_keys=True, default=str),
+                    *file_signature,
+                )
+                if signature != last_attempt_signatures.get(attempt_id):
+                    last_attempt_signatures[attempt_id] = signature
+                    yield _sse("attempt:update", {"attempt_id": attempt_id})
+            for stale_id in set(last_attempt_signatures) - current_attempt_ids:
+                last_attempt_signatures.pop(stale_id, None)
 
-        now = time.monotonic()
-        if now - last_heartbeat >= 15:
-            last_heartbeat = now
-            yield ": heartbeat\n\n"
-        await asyncio.sleep(poll_interval)
+            now = time.monotonic()
+            if now - last_heartbeat >= 15:
+                last_heartbeat = now
+                yield ": heartbeat\n\n"
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(wake_event.wait(), timeout=poll_interval)
 
 
 # ---------- routes -------------------------------------------------------
@@ -1510,7 +1674,7 @@ def build_router() -> APIRouter:
 
     @router.get("/agents")
     async def list_agents(request: Request) -> list[dict[str, Any]]:
-        return _list_agents(request.app.state.settings)
+        return await asyncio.to_thread(_list_agents, request.app.state.settings)
 
     @router.get("/blade/config")
     async def blade_config(request: Request) -> dict[str, Any]:
@@ -1656,13 +1820,18 @@ def build_router() -> APIRouter:
     async def list_runs(limit: int = 50, offset: int = 0) -> dict[str, Any]:
         limit = max(1, min(limit, 500))
         offset = max(0, offset)
-        return _list_runs_sync(
-            runtime_state.get().db_path, limit=limit, offset=offset
+        return await asyncio.to_thread(
+            _list_runs_sync,
+            runtime_state.get().db_path,
+            limit=limit,
+            offset=offset,
         )
 
     @router.get("/runs/{run_id}")
     async def get_run(run_id: str) -> dict[str, Any]:
-        run = _get_run_sync(runtime_state.get().db_path, run_id)
+        run = await asyncio.to_thread(
+            _get_run_sync, runtime_state.get().db_path, run_id
+        )
         if run is None:
             raise HTTPException(status_code=404, detail=f"run not found: {run_id}")
         return run
@@ -1676,18 +1845,20 @@ def build_router() -> APIRouter:
         `auditable=false` 时 `upstream` **不得**被当作实扣归因展示。
         """
         db_path = runtime_state.get().db_path
-        if _get_run_sync(db_path, run_id) is None:
+        if not await asyncio.to_thread(_run_exists_sync, db_path, run_id):
             raise HTTPException(status_code=404, detail=f"run not found: {run_id}")
         from .cost.api_view import build_run_cost_view
 
-        view = build_run_cost_view(db_path, run_id)
+        view = await asyncio.to_thread(build_run_cost_view, db_path, run_id)
         if view is None:  # pragma: no cover - build 对缺记录已有兜底
             raise HTTPException(status_code=404, detail="cost audit not found")
         return view
 
     @router.get("/runs/{run_id}/stream")
     async def stream_run(run_id: str, request: Request) -> StreamingResponse:
-        if _get_run_sync(runtime_state.get().db_path, run_id) is None:
+        if not await asyncio.to_thread(
+            _run_exists_sync, runtime_state.get().db_path, run_id
+        ):
             raise HTTPException(status_code=404, detail=f"run not found: {run_id}")
         return StreamingResponse(
             _stream_run_events(run_id, request),
@@ -1707,11 +1878,12 @@ def build_router() -> APIRouter:
         的前提：同一个 attempt 在不同候选集或不同转换算法下的分数不能混排。
         """
         state = runtime_state.get()
-        if _get_run_sync(state.db_path, run_id) is None:
+        if not await asyncio.to_thread(_run_exists_sync, state.db_path, run_id):
             raise HTTPException(status_code=404, detail=f"run not found: {run_id}")
         from .comparison_scorer import list_comparison_jobs
 
-        return {"run_id": run_id, "jobs": list_comparison_jobs(state.db_path, run_id)}
+        jobs = await asyncio.to_thread(list_comparison_jobs, state.db_path, run_id)
+        return {"run_id": run_id, "jobs": jobs}
 
     @router.post("/runs/{run_id}/compare")
     async def compare_run_dimensions(run_id: str) -> dict[str, Any]:
@@ -1722,7 +1894,7 @@ def build_router() -> APIRouter:
         attempt 的成绩随同伴变化，也就无法单独重放。
         """
         state = runtime_state.get()
-        run = _get_run_sync(state.db_path, run_id)
+        run = await asyncio.to_thread(_get_run_sync, state.db_path, run_id)
         if run is None:
             raise HTTPException(status_code=404, detail=f"run not found: {run_id}")
         judge_cfg = getattr(state.settings, "judge", None)
@@ -1779,7 +1951,9 @@ def build_router() -> APIRouter:
         调用失败只影响本次响应。
         """
         state = runtime_state.get()
-        detail = _get_attempt_detail_sync(state.db_path, attempt_id)
+        detail = await asyncio.to_thread(
+            _get_attempt_detail_sync, state.db_path, attempt_id
+        )
         if detail is None or detail.get("run_id") != run_id:
             raise HTTPException(
                 status_code=404,
@@ -1807,7 +1981,8 @@ def build_router() -> APIRouter:
 
         # 与评分共用同一套证据组装：归因用的是 agentic judge（pi + read/bash），
         # 所以走指针形态——绝对路径 + ATIF 轨迹，不内联 trace/events。
-        evidence = build_evidence(
+        evidence = await asyncio.to_thread(
+            build_evidence,
             data_path=state.data_path,
             attempt_id=attempt_id,
             env=env,
@@ -1837,49 +2012,29 @@ def build_router() -> APIRouter:
         include_events: bool = True,
     ) -> dict[str, Any]:
         state = runtime_state.get()
-        detail = _get_attempt_detail_sync(state.db_path, attempt_id)
+        detail = await asyncio.to_thread(
+            _get_attempt_detail_sync, state.db_path, attempt_id
+        )
         if detail is None or detail.get("run_id") != run_id:
             raise HTTPException(
                 status_code=404,
                 detail=f"attempt not found under run={run_id}: {attempt_id}",
             )
         attempt_dir = state.data_path / "attempts" / attempt_id
-        # 兼容新旧文件名
-        events = (
-            _read_jsonl(attempt_dir / "events.jsonl")
-            or _read_jsonl(attempt_dir / "blade_events.jsonl")
-            if include_events
-            else []
+        loaded = await asyncio.to_thread(
+            _load_attempt_files_sync, attempt_dir, include_events=include_events
         )
-        tool_calls, tool_calls_source = _load_tool_calls(
-            attempt_dir, events if include_events else None
-        )
-        final_state = _read_final_state(attempt_dir / "final_state.json")
-        progress = _read_final_state(attempt_dir / "progress.json")
-        # 安全事件明细里的类别分布补进 security（DB 只存汇总，类别从明细文件算）
-        sec_events = _read_jsonl(attempt_dir / "security_events.jsonl")
-        by_cat: dict[str, int] = {}
-        for e in sec_events:
-            if e.get("phase") == "executed":
-                c = e.get("category", "?")
-                by_cat[c] = by_cat.get(c, 0) + 1
         if isinstance(detail.get("security"), dict):
-            detail["security"]["by_category"] = by_cat
-        # conversation 块（summary/turns/evaluation）。多轮 attempt 有
-        # conversation.jsonl；历史单轮 attempt 返回 legacy summary + 空 turns。
-        conversation = await asyncio.to_thread(_build_conversation_block, attempt_dir)
-        from .iteration.summary import public_iteration_summary
-
-        iteration = await asyncio.to_thread(public_iteration_summary, attempt_dir)
+            detail["security"]["by_category"] = loaded["by_cat"]
         return {
             **detail,
-            "tool_calls": tool_calls,
-            "tool_calls_source": tool_calls_source,
-            "events": events,
-            "final_state": final_state,
-            "progress": progress,
-            "conversation": conversation,
-            "iteration": iteration,
+            "tool_calls": loaded["tool_calls"],
+            "tool_calls_source": loaded["tool_calls_source"],
+            "events": loaded["events"],
+            "final_state": loaded["final_state"],
+            "progress": loaded["progress"],
+            "conversation": loaded["conversation"],
+            "iteration": loaded["iteration"],
         }
 
     @router.get("/runs/{run_id}/attempts/{attempt_id}/observations")
@@ -1887,7 +2042,9 @@ def build_router() -> APIRouter:
         run_id: str, attempt_id: str, after: int = 0, limit: int = 200
     ) -> list[dict[str, Any]]:
         state = runtime_state.get()
-        detail = _get_attempt_detail_sync(state.db_path, attempt_id)
+        detail = await asyncio.to_thread(
+            _get_attempt_detail_sync, state.db_path, attempt_id
+        )
         if detail is None or detail.get("run_id") != run_id:
             raise HTTPException(status_code=404, detail="attempt not found")
         return await asyncio.to_thread(
@@ -1905,7 +2062,7 @@ def build_router() -> APIRouter:
             data_path=state.data_path, db_path=state.db_path,
             run_id=run_id, attempt_id=attempt_id,
         )
-        return _read_jsonl(attempt_dir / "thinking.jsonl")
+        return await asyncio.to_thread(_read_jsonl, attempt_dir / "thinking.jsonl")
 
     @router.get("/runs/{run_id}/attempts/{attempt_id}/trace")
     async def get_attempt_trace(run_id: str, attempt_id: str) -> list[dict[str, Any]]:
@@ -1926,10 +2083,7 @@ def build_router() -> APIRouter:
             data_path=state.data_path, db_path=state.db_path,
             run_id=run_id, attempt_id=attempt_id,
         )
-        events = _read_jsonl(attempt_dir / "events.jsonl")
-        if not events:
-            events = _read_jsonl(attempt_dir / "blade_events.jsonl")
-        return events
+        return await asyncio.to_thread(_read_attempt_events_sync, attempt_dir)
 
     @router.get("/runs/{run_id}/attempts/{attempt_id}/security_events")
     async def get_attempt_security_events(
@@ -1943,7 +2097,9 @@ def build_router() -> APIRouter:
             data_path=state.data_path, db_path=state.db_path,
             run_id=run_id, attempt_id=attempt_id,
         )
-        return _read_jsonl(attempt_dir / "security_events.jsonl")
+        return await asyncio.to_thread(
+            _read_jsonl, attempt_dir / "security_events.jsonl"
+        )
 
     @router.post("/runs/{run_id}/stop")
     async def stop_run(run_id: str) -> dict[str, Any]:
@@ -2021,7 +2177,7 @@ def build_router() -> APIRouter:
         历史评分保留在 ``attempt_judge_runs``（append-only），绝不清除。
         """
         from .run_dispatch import _refresh_run_status
-        from .scoring_queue import RejudgeError, _prepare_rejudge, enqueue_scoring_job
+        from .scoring_queue import RejudgeError, _prepare_rejudge, schedule_scoring_job
 
         state = runtime_state.get()
         settings = getattr(state, "settings", None)
@@ -2037,10 +2193,12 @@ def build_router() -> APIRouter:
                 status_code=exc.status_code,
                 detail={"code": exc.code, "message": exc.message},
             ) from exc
-        # enqueue_scoring_job 内部会 schedule_scoring_job → asyncio.create_task，
-        # 必须在事件循环线程调用（与 runner 一致），不能包进 to_thread。
+        # 快照拷贝 + DB 入队放线程池，schedule_scoring_job（asyncio.create_task）
+        # 留在事件循环线程调用，避免阻塞事件循环。
         try:
-            job_id = enqueue_scoring_job(**prepared)
+            job_id = await asyncio.to_thread(
+                _persist_rejudge_job_sync, state, prepared
+            )
         except sqlite3.IntegrityError as exc:
             # 并发 rejudge TOCTOU：两次请求都通过 scoring_in_flight 检查，第二个
             # enqueue 撞 UNIQUE(attempt_id, scorer_version)。route 只 catch
@@ -2052,6 +2210,7 @@ def build_router() -> APIRouter:
                     "message": "concurrent rejudge for the same attempt",
                 },
             ) from exc
+        schedule_scoring_job(job_id, capacity=prepared["capacity"])
         # 把 run 从 completed 拉回 scoring：runs.status='scoring', ended_at=NULL。
         # 否则 SSE 流在 stream:end 后已关闭、新评分永远不会被前端看到。
         await asyncio.to_thread(_refresh_run_status, state.db_path, attempt_id)
@@ -2163,36 +2322,60 @@ def build_router() -> APIRouter:
 
     @router.post("/upload")
     async def upload_file(request: Request):
-        # multipart 手动解析
+        # multipart 手动解析，按块流式落盘 + 上限保护，避免大文件撑爆内存。
         form = await request.form()
         state = runtime_state.get()
         upload_dir = state.data_path / "uploads"
-        upload_dir.mkdir(parents=True, exist_ok=True)
+        await asyncio.to_thread(upload_dir.mkdir, parents=True, exist_ok=True)
         upload_root = upload_dir.resolve()
         saved: list[dict[str, Any]] = []
-        for key in form:
-            item = form[key]
-            if hasattr(item, "read"):
-                content = await item.read()
-                client_name = getattr(item, "filename", None) or key
-                # 落盘文件名由服务端生成唯一 ID，绝不拼接客户端文件名——后者可含
-                # 路径分隔符（../、绝对路径、Windows 反斜杠）造成目录穿越，或与既有
-                # 上传重名造成任意文件覆盖。客户端原名仅作展示（name）回传前端。
-                suffix = _safe_upload_suffix(client_name)
-                dest = upload_dir / f"upload_{uuid.uuid4().hex}{suffix}"
-                # 纵深防御：即便上面生成逻辑将来被改，也保证最终落点在 upload_dir 内。
-                try:
-                    dest.resolve().relative_to(upload_root)
-                except ValueError:
-                    raise HTTPException(status_code=400, detail="invalid upload target")
-                dest.write_bytes(content)
-                saved.append(
-                    {
-                        "name": Path(client_name).name,
-                        "path": str(dest.resolve()),
-                        "size": len(content),
-                    }
-                )
+        try:
+            for key in form:
+                item = form[key]
+                if hasattr(item, "read"):
+                    client_name = getattr(item, "filename", None) or key
+                    # 落盘文件名由服务端生成唯一 ID，绝不拼接客户端文件名——后者可含
+                    # 路径分隔符（../、绝对路径、Windows 反斜杠）造成目录穿越，或与既有
+                    # 上传重名造成任意文件覆盖。客户端原名仅作展示（name）回传前端。
+                    suffix = _safe_upload_suffix(client_name)
+                    dest = upload_dir / f"upload_{uuid.uuid4().hex}{suffix}"
+                    # 纵深防御：即便上面生成逻辑将来被改，也保证最终落点在 upload_dir 内。
+                    try:
+                        dest.resolve().relative_to(upload_root)
+                    except ValueError:
+                        raise HTTPException(status_code=400, detail="invalid upload target")
+                    total_bytes = 0
+                    fp = await asyncio.to_thread(dest.open, "wb")
+                    try:
+                        while True:
+                            chunk = await item.read(_UPLOAD_CHUNK_SIZE)
+                            if not chunk:
+                                break
+                            total_bytes += len(chunk)
+                            if total_bytes > _UPLOAD_MAX_BYTES:
+                                raise HTTPException(
+                                    status_code=413,
+                                    detail=f"uploaded file exceeds size limit ({_UPLOAD_MAX_BYTES} bytes)",
+                                )
+                            await asyncio.to_thread(fp.write, chunk)
+                    except BaseException:
+                        await asyncio.to_thread(fp.close)
+                        with contextlib.suppress(OSError):
+                            dest.unlink(missing_ok=True)
+                        raise
+                    else:
+                        await asyncio.to_thread(fp.close)
+                    saved.append(
+                        {
+                            "name": Path(client_name).name,
+                            "path": str(dest.resolve()),
+                            "size": total_bytes,
+                        }
+                    )
+        finally:
+            if hasattr(form, "close"):
+                with contextlib.suppress(Exception):
+                    await form.close()
         return {"files": saved}
 
     return router
