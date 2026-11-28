@@ -83,6 +83,21 @@ class OctagonSection(BaseModel):
     max_active_attempts: int = Field(default=16, ge=1, le=32)
     # Scoring is deliberately independent from the Agent execution lease.
     max_active_scoring_jobs: int = Field(default=2, ge=1, le=32)
+    # 评分执行模式：
+    # - in_process（默认）：兼容现有单进程部署与测试，带租约与心跳续租；
+    # - subprocess：API 进程按 job 派生独立进程组执行评分，支持 OS 级超时/取消强杀；
+    # - external：API 进程仅持久化 scoring_jobs，由独立常驻
+    #   `python -m backend.workers.scoring_worker` 进程通过租约队列消费。
+    scoring_worker_mode: Literal["in_process", "subprocess", "external"] = "in_process"
+    # scoring_jobs 租约时长（秒）：worker 崩溃超过该时长后可被其它 worker 或重启恢复接管。
+    scoring_lease_seconds: int = Field(default=60, ge=10, le=3600)
+    # Env core/scorer 隔离模式：
+    # - in_process（默认）：保持现有进程内 importlib 加载行为；
+    # - subprocess：不在 API 主进程 exec core.py/scorer.py，工具调用与评分全部
+    #   在剥离管理员凭据的独立子进程中执行，避免外部场景代码触达内存 run_credentials。
+    env_isolation_mode: Literal["in_process", "subprocess"] = "in_process"
+    # 隔离模式下单次 env tool 调用的硬超时（秒），超时按进程组 SIGKILL。
+    env_tool_timeout_seconds: int = Field(default=120, ge=5, le=1800)
     # Experiment protocol hard ceilings. Client/profile limits may only tighten
     # these values; they can never widen the deployment policy.
     research_max_cells: int = Field(default=1000, ge=1, le=1000)
@@ -485,6 +500,14 @@ def _apply_env_overrides(data: dict[str, Any]) -> dict[str, Any]:
         octagon["max_active_attempts"] = v
     if v := os.environ.get("OCTAGON_MAX_ACTIVE_SCORING_JOBS"):
         octagon["max_active_scoring_jobs"] = v
+    if v := os.environ.get("OCTAGON_SCORING_WORKER_MODE"):
+        octagon["scoring_worker_mode"] = v
+    if v := os.environ.get("OCTAGON_SCORING_LEASE_SECONDS"):
+        octagon["scoring_lease_seconds"] = v
+    if v := os.environ.get("OCTAGON_ENV_ISOLATION_MODE"):
+        octagon["env_isolation_mode"] = v
+    if v := os.environ.get("OCTAGON_ENV_TOOL_TIMEOUT_SECONDS"):
+        octagon["env_tool_timeout_seconds"] = v
     if v := os.environ.get("SELECTED_SKILLS_DIR"):
         octagon["selected_skills_path"] = v
     data["octagon"] = octagon
@@ -586,6 +609,10 @@ def _log_settings(settings: Settings) -> None:
             "public_base_url": settings.octagon.public_base_url,
             "max_active_attempts": settings.octagon.max_active_attempts,
             "max_active_scoring_jobs": settings.octagon.max_active_scoring_jobs,
+            "scoring_worker_mode": settings.octagon.scoring_worker_mode,
+            "scoring_lease_seconds": settings.octagon.scoring_lease_seconds,
+            "env_isolation_mode": settings.octagon.env_isolation_mode,
+            "env_tool_timeout_seconds": settings.octagon.env_tool_timeout_seconds,
             "research_max_cells": settings.octagon.research_max_cells,
             "research_max_attempts": settings.octagon.research_max_attempts,
             "research_capture_max_policy": settings.octagon.research_capture_max_policy,

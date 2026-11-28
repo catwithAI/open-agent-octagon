@@ -14,6 +14,7 @@ import mimetypes
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -308,6 +309,37 @@ def cache_key(path: Path) -> str:
     return value
 
 
+def _terminate_process_group_sync(
+    proc: subprocess.Popen[Any], grace_seconds: float = 0.5
+) -> None:
+    """Kill the entire process group of *proc* (SIGTERM -> brief grace -> SIGKILL)."""
+    pid = proc.pid
+    if pid and pid > 0:
+        try:
+            os.killpg(pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+    try:
+        proc.wait(timeout=max(0.0, grace_seconds))
+    except subprocess.TimeoutExpired:
+        if pid and pid > 0:
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+        try:
+            proc.wait(timeout=5.0)
+        except subprocess.TimeoutExpired:
+            pass
+    else:
+        # Ensure any lingering grandchildren in the session (e.g. soffice) are gone.
+        if pid and pid > 0:
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+
+
 def _worker_result(
     path: Path,
     *,
@@ -389,25 +421,31 @@ def _worker_result(
             "HOME": str(temp),
             "TMPDIR": str(temp),
         }
+        proc: subprocess.Popen[bytes] | None = None
         try:
-            completed = subprocess.run(
+            proc = subprocess.Popen(
                 [sys.executable, "-I", str(worker), renderer, str(source_snapshot), str(result_path)],
                 cwd=temp,
                 env=env,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                timeout=timeout_seconds,
-                check=False,
                 start_new_session=True,
             )
+            returncode = proc.wait(timeout=timeout_seconds)
         except subprocess.TimeoutExpired:
+            if proc is not None:
+                _terminate_process_group_sync(proc)
             return {
                 "ok": False,
                 "transient": True,
                 "error": {"code": "renderer_timeout", "message": "Office 预览处理超时"},
             }
-        if completed.returncode not in (0, 2) or not result_path.is_file():
+        except BaseException:
+            if proc is not None:
+                _terminate_process_group_sync(proc)
+            raise
+        if returncode not in (0, 2) or not result_path.is_file():
             return {
                 "ok": False,
                 "transient": True,
