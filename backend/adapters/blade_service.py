@@ -73,8 +73,6 @@ except ImportError as _exc:  # pragma: no cover - 依赖缺失路径
                 "blade-agent 仓库的 agent-kit-python。"
             ) from _BLADE_KIT_IMPORT_ERROR
 
-import re
-
 from .base import (
     AdapterCapabilities,
     AdapterResult,
@@ -83,6 +81,64 @@ from .base import (
     build_security_meta,
     prompt_context,
     time_budget_notice,
+)
+from .blade.artifacts import (
+    _ARTIFACT_MAX_DEPTH,
+    _ARTIFACT_MAX_FILES,
+    _ARTIFACT_SKIP_DIRS,
+    _EDIT_PATH_PATTERNS,
+    _EDIT_TOOL_MARKERS,
+    _REMOTE_PATH_PREFIXES,
+    _agent_edited_paths,
+    _candidate_remote_paths,
+    _digest_bytes,
+    _digest_of,
+    _fail_incomplete_iterative_artifact_sync,
+    _iterative_artifact_sync_error,
+    artifact_recovery_failed,
+    download_priority_paths,
+    recover_workspace_artifacts,
+    sync_blade_skills,
+)
+from .blade.extraction import (
+    _BLADE_SKILL_RUN_RE,
+    _PROJECT_TITLE_MAX,
+    _ROOT_LOOP,
+    _RUNNING_BACKGROUND_TASK_STATUSES,
+    _RUNNING_SESSION_STATUSES,
+    _TERMINAL_SESSION_STATUSES,
+    _TURN_TERMINAL_STATUSES,
+    _append_jsonl,
+    _append_unique_trace_rows,
+    _chat_intent,
+    _classify_outcome,
+    _event_loop_name,
+    _extract_trace_from_history,
+    _is_active_chat_error,
+    _is_not_found_error,
+    _looks_like_error,
+    _now_iso,
+    _outcome_error_code,
+    _parse_blade_skill_run,
+    _persist_cleanup_pending_checkpoint,
+    _project_prompt_title,
+    _projection_identity,
+    _render_prompt,
+    _render_turn_prompt,
+    _session_create_error_detail,
+    _trace_row_identity,
+    _ts_diff_ms,
+    _turn_is_terminal,
+    _write_json,
+    _write_progress,
+)
+from .blade.interactions import (
+    _MAX_UNEXPECTED_AUTO_ANSWERS,
+    UNEXPECTED_INTERACTION_AUTO_ANSWER,
+    _interaction_question_summary,
+    build_askuser_answer,
+    build_generic_askuser_answer,
+    match_interaction_turn,
 )
 from .token_usage import (
     compact_usage,
@@ -106,383 +162,11 @@ _CHAT_END_SETTLE_SECONDS = 0.1
 _ACTIVE_CHAT_RETRY_DELAYS = (0.2, 0.4, 0.8)
 _RECOVERY_READ_MAX_ATTEMPTS = 4
 _CLEANUP_MAX_ATTEMPTS = 3
-_RUNNING_BACKGROUND_TASK_STATUSES = {"running", "starting"}
-_RUNNING_SESSION_STATUSES = {
-    "created",
-    "initializing",
-    "pending",
-    "running",
-    "starting",
-    "queued",
-    "in_progress",
-}
-_TERMINAL_SESSION_STATUSES = {
-    "completed",
-    "ok",
-    "failed",
-    "error",
-    "cancelled",
-    "canceled",
-    "interrupted",
-    "stopped",
-}
-
-#: BA 提出未预声明的提问时自动回的话术。刻意无信息量：不给 agent 任何评测
-#: 线索，只把会话从 WAITING_FOR_INPUT 解出来，防止 attempt 报废/挂死。
-#: blade_cli adapter 复用同一常量，保证两条通道口径一致。
-UNEXPECTED_INTERACTION_AUTO_ANSWER = "你自己看着办不要问我"
-
-
-def _is_not_found_error(exc: BaseException) -> bool:
-    response = getattr(exc, "response", None)
-    return (
-        getattr(response, "status_code", None) == 404
-        or getattr(exc, "status_code", None) == 404
-    )
+_BEST_EFFORT_STOP_TIMEOUT_SECONDS = 5.0
 
 
 async def _wait_for_chat_end_settle(seconds: float = _CHAT_END_SETTLE_SECONDS) -> None:
     await asyncio.sleep(seconds)
-
-
-def _is_active_chat_error(result) -> bool:
-    """迭代续跑失败是否为瞬态 active-chat 竞态（应重试）。"""
-    return "has an active chat" in (result.error_message or "")
-
-# blade 沙盒里 skill 工具经 CLI 执行：`blade skill run "<skill>" <tool> --args '<json>'`。
-# trace 的 tool_name 是 Bash，skill 级语义要从 command 解析（对比视图对齐 / DAG 检查用）。
-_BLADE_SKILL_RUN_RE = re.compile(
-    r"blade\s+skill\s+run\s+\"?([^\"\s]+)\"?\s+(\w+)(?:\s+--args\s+'(.*?)')?",
-    re.DOTALL,
-)
-
-# 产物回收时跳过的目录。与 API 扫描、评分快照共用同一份净产物边界——
-# 这里原本自带一份清单且漏了 dist/build，导致「回收到的产物」与「判分看到的
-# 产物」口径不一致。
-_ARTIFACT_SKIP_DIRS = ARTIFACT_SKIP_DIRS
-_ARTIFACT_MAX_FILES = 500
-
-# 从 events.jsonl 里抠出 agent 用 Edit/Write 类工具写过的 workspace 相对路径。
-# 事件里的工具参数可能是原始 JSON，也可能是被再次 JSON 转义的字符串
-# （recovered messages），所以两种写法都匹配。只认 file_path / path 两个键。
-_EDIT_PATH_PATTERNS = [
-    re.compile(r'\\"(?:file_path|path)\\":\s*\\"([^\\"]+)\\"'),
-    re.compile(r'"(?:file_path|path)":\s*"([^"]+)"'),
-]
-_EDIT_TOOL_MARKERS = ("Edit", "Write", "write_file", "edit_file", "MultiEdit", "create_file")
-
-
-def _agent_edited_paths(attempt_dir: Path) -> list[str]:
-    """agent 在远端 workspace 里写过的文件（相对路径），用于产物回收优先拉取。
-
-    2026-09-14 复盘：django 仓库 6000+ 文件，BFS 回收 500 个就截断，
-    agent 改的 django/utils/numberformat.py 根本轮不到，本地 workspace
-    停在基线 → functional 0 分，而 agent 其实已改完并跑绿测试。
-    """
-    events_path = attempt_dir / "events.jsonl"
-    if not events_path.is_file():
-        return []
-    found: list[str] = []
-    seen: set[str] = set()
-    try:
-        for line in events_path.read_text(encoding="utf-8", errors="replace").splitlines():
-            if not any(marker in line for marker in _EDIT_TOOL_MARKERS):
-                continue
-            for pattern in _EDIT_PATH_PATTERNS:
-                for match in pattern.finditer(line):
-                    raw = match.group(1).strip()
-                    if not raw or raw.startswith("/") or ".." in raw.split("/"):
-                        continue
-                    rel = raw[2:] if raw.startswith("./") else raw
-                    if rel and rel not in seen:
-                        seen.add(rel)
-                        found.append(rel)
-    except OSError:
-        return found
-    return found
-_ARTIFACT_MAX_DEPTH = 5
-
-# 优先回收时试探的远端前缀：日志里的路径未必与远端工作区同根。
-_REMOTE_PATH_PREFIXES = ("", "workspace/", "skill_workspace/", "output/")
-
-
-def _digest_bytes(content: bytes) -> str:
-    return hashlib.sha256(content).hexdigest()
-
-
-def _digest_of(path: Path) -> str | None:
-    """文件当前内容的摘要；不存在返回 None。"""
-    try:
-        return _digest_bytes(path.read_bytes())
-    except OSError:
-        return None
-
-
-def _candidate_remote_paths(rel: str, *, project_workspace: str = "") -> list[str]:
-    """一个相对路径在远端可能的几种写法，按可能性排序。"""
-    # `lstrip("./")` 按字符集剥，会把 `.hidden/report.md` 削成
-    # `hidden/report.md`，每个候选前缀都指向不存在的路径。
-    clean = rel
-    while clean.startswith("./"):
-        clean = clean[2:]
-    seen: dict[str, None] = {}
-    # software_factory 场景：agent 的 cwd 是项目工作区绝对路径，而文件接口的
-    # "." 指向另一份带基线物料的目录——两边都有 repo/…，只有前者带 agent 的
-    # 改动。所以它必须排在最前（2026-09-14 现场结论）。
-    if project_workspace:
-        seen.setdefault(f"{project_workspace.rstrip('/')}/{clean}", None)
-    for prefix in _REMOTE_PATH_PREFIXES:
-        seen.setdefault(f"{prefix}{clean}", None)
-    # 只剩文件名的写法：agent 在工作区根上直接写文件的常见情形。
-    name = Path(clean).name
-    if name != clean:
-        seen.setdefault(name, None)
-    return list(seen)
-
-# blade 主循环的 loop_name；fork 出的子 agent 形如 "agent:<8hex>"。
-_ROOT_LOOP = "root"
-
-
-def _event_loop_name(raw: Any) -> Any:
-    """从事件里取 loop_name。
-
-    新协议 socket 行：``raw.payload.loop_name``；旧协议 turn:end / poll entry /
-    history node：``raw.loop_name``。两处都取不到时归 root——不臆造子 agent 归属。
-    """
-    if not isinstance(raw, dict):
-        return None
-    payload = raw.get("payload")
-    if isinstance(payload, dict) and payload.get("loop_name"):
-        return payload["loop_name"]
-    return raw.get("loop_name")
-
-
-def match_interaction_turn(
-    pending: list[Any], pause_tool_data: dict[str, Any], pause_tool: str | None
-) -> Any | None:
-    """按 wait_for 在待处理 answer_interaction turns 里找匹配项。
-
-    - ``tool_name`` 对 ``pause_tool``（值带 provider 前缀，如
-      ``builtin:AskUserQuestion``），大小写敏感全等；
-    - ``question_key`` 非空时还需命中 ``arguments.questions[].question``
-      （子串匹配，允许场景作者只写关键词）；
-    匹配不到返回 None → 调用方按 unexpected interaction 处理，绝不猜答案。
-    """
-    if not pending:
-        return None
-    questions = []
-    args = pause_tool_data.get("arguments")
-    if isinstance(args, dict) and isinstance(args.get("questions"), list):
-        questions = [
-            str(q.get("question", ""))
-            for q in args["questions"]
-            if isinstance(q, dict)
-        ]
-    for turn in pending:
-        wait_for = turn.wait_for
-        if wait_for is None or wait_for.tool_name != pause_tool:
-            continue
-        key = wait_for.question_key
-        if key and not any(key in q for q in questions):
-            continue
-        return turn
-    return None
-
-
-
-def _interaction_question_summary(
-    pause_tool_data: dict[str, Any], *, limit: int = 3
-) -> list[str]:
-    """unexpected interaction 的问题摘要（供错误消息/排查用，非敏感）。"""
-    args = pause_tool_data.get("arguments")
-    if not isinstance(args, dict) or not isinstance(args.get("questions"), list):
-        return []
-    out: list[str] = []
-    for question in args["questions"][:limit]:
-        if isinstance(question, dict):
-            text = str(question.get("question", "")).strip()
-            if text:
-                out.append(text[:200])
-    return out
-
-
-def build_askuser_answer(
-    turn: Any, pause_tool_data: dict[str, Any]
-) -> tuple[dict[str, Any], str]:
-    """把静态 answer 翻译成 blade 的 askuser_answer + 展示用答案文本。
-
-    支持两种写法（spike 结论第 4 点）：
-    - blade 原生形状 ``{"selections": {...}}`` / ``{"custom": {...}}`` 直接透传；
-    - ``{"option_label": "方案A"}`` 由本函数按 label 在 pause_tool_data 里解析成
-      question/option index。
-    ``tool_call_id`` 永远取自运行时 pause_tool_data，不从静态 answer 读。
-    """
-    answer = dict(turn.answer or {})
-    tool_call_id = str(pause_tool_data.get("tool_call_id") or "")
-
-    selections = answer.get("selections")
-    custom = answer.get("custom")
-    text_parts: list[str] = []
-
-    if selections is None and custom is None:
-        label = answer.get("option_label")
-        args = pause_tool_data.get("arguments")
-        questions = (
-            args.get("questions")
-            if isinstance(args, dict) and isinstance(args.get("questions"), list)
-            else []
-        )
-        resolved: dict[str, list[int]] = {}
-        if isinstance(label, str) and label:
-            for q_index, question in enumerate(questions):
-                if not isinstance(question, dict):
-                    continue
-                for o_index, option in enumerate(question.get("options") or []):
-                    if isinstance(option, dict) and option.get("label") == label:
-                        resolved[str(q_index)] = [o_index]
-                        text_parts.append(label)
-                        break
-                if resolved:
-                    break
-        if not resolved:
-            # 没有可解析的选项：退化为自由文本（answer.text 或 option_label 原文）
-            free_text = str(answer.get("text") or label or "")
-            if not free_text:
-                raise ValueError(
-                    f"answer_interaction turn {turn.turn_id!r} 的 answer 无法翻译成"
-                    " blade 应答：需要 selections/custom/option_label/text 之一"
-                )
-            custom = {"0": free_text}
-            text_parts.append(free_text)
-        else:
-            selections = resolved
-
-    payload: dict[str, Any] = {"tool_call_id": tool_call_id}
-    payload["selections"] = selections if isinstance(selections, dict) else {}
-    payload["custom"] = custom if isinstance(custom, dict) else {}
-
-    if not text_parts:
-        # 从 selections 反查 label 作为展示文本；失败则用 custom 文本
-        args = pause_tool_data.get("arguments")
-        questions = (
-            args.get("questions")
-            if isinstance(args, dict) and isinstance(args.get("questions"), list)
-            else []
-        )
-        for q_key, o_indexes in payload["selections"].items():
-            try:
-                question = questions[int(q_key)]
-                options = question.get("options") or []
-            except (ValueError, IndexError, AttributeError, TypeError):
-                continue
-            for o_index in o_indexes or []:
-                try:
-                    text_parts.append(str(options[int(o_index)].get("label", "")))
-                except (ValueError, IndexError, AttributeError, TypeError):
-                    continue
-        text_parts.extend(str(v) for v in payload["custom"].values() if v)
-
-    answer_text = "；".join(p for p in text_parts if p) or "（已选择）"
-    return payload, answer_text
-
-
-def build_generic_askuser_answer(
-    pause_tool_data: dict[str, Any],
-) -> tuple[dict[str, Any], str]:
-    """未声明的 AskUserQuestion：回一句无信息的拒绝话术，不解任何选项。
-
-    一次提问可能带多个 question，每个都答同一句拒绝文案（custom 按 question
-    index 填）。不替 agent 猜答案、不泄漏任务/评测信息，只把会话从
-    WAITING_FOR_INPUT 解出来。payload 形状与 build_askuser_answer 一致
-    （tool_call_id 恒取运行时 pause_tool_data），server 侧同样按 custom 应答。
-    """
-    tool_call_id = str(pause_tool_data.get("tool_call_id") or "")
-    args = pause_tool_data.get("arguments")
-    questions = (
-        args.get("questions")
-        if isinstance(args, dict) and isinstance(args.get("questions"), list)
-        else []
-    )
-    custom = {
-        str(q_index): UNEXPECTED_INTERACTION_AUTO_ANSWER
-        for q_index in range(len(questions))
-    }
-    if not custom:
-        custom = {"0": UNEXPECTED_INTERACTION_AUTO_ANSWER}
-    payload = {
-        "tool_call_id": tool_call_id,
-        "selections": {},
-        "custom": custom,
-    }
-    return payload, UNEXPECTED_INTERACTION_AUTO_ANSWER
-
-
-def _session_create_error_detail(exc: Exception, entry: dict[str, Any]) -> str:
-    """Preserve Blade's validation body instead of returning a generic 422."""
-    response = getattr(exc, "response", None)
-    status_code = getattr(response, "status_code", None)
-    body = ""
-    if response is not None:
-        try:
-            body = response.text
-        except Exception:  # pragma: no cover - defensive for SDK response wrappers
-            body = ""
-    # 有一类异常 `str()` 是空的（httpx 的超时类尤其常见），只拼 str(exc) 会得到
-    # 一条以 "; " 开头、什么都没说的错误——排查时连"是超时还是被拒"都分不出。
-    # 异常类名永远非空，兜底用它。
-    summary = str(exc) or f"{type(exc).__module__}.{type(exc).__qualname__}"
-    parts = [summary, f"blade_entry={json.dumps(entry, ensure_ascii=False)}"]
-    if status_code is not None:
-        parts.append(f"status_code={status_code}")
-    if body:
-        parts.append(f"response_body={body[:2000]}")
-    return "; ".join(parts)
-
-
-def _iterative_artifact_sync_error(result: AdapterResult) -> str | None:
-    sync = result.external_refs.get("artifact_sync")
-    if not isinstance(sync, dict):
-        return "产物同步结果缺失"
-    if sync.get("error"):
-        return str(sync["error"])
-    errors = sync.get("errors")
-    if isinstance(errors, list) and errors:
-        return "; ".join(str(item) for item in errors[:10])
-    if sync.get("truncated_at") is not None:
-        return f"产物同步在 {sync['truncated_at']} 个文件处截断"
-    return None
-
-
-def artifact_recovery_failed(external_refs: dict[str, Any]) -> bool:
-    """优先路径一个都没落地 —— 产物没回收到，分数不可用。
-
-    这是 2026-09-18 横评里 blade-agent 27 个 attempt 全部低分的形状：attempt
-    正常跑完、拿到一个真实的低分，而那个分数衡量的是空工作区。把它标成
-    infrastructure，统计时才能与「agent 确实没做好」分开（需求 6.3）。
-
-    只有「有依据、且全部落空」才算失败：`priority_source == "none"` 表示压根
-    没提取到路径，那是另一种情况（需求 4.4），不在这里判。
-    """
-    sync = external_refs.get("artifact_sync")
-    if not isinstance(sync, dict):
-        return False
-    missing = sync.get("priority_missing")
-    if not isinstance(missing, list) or not missing:
-        return False
-    got = sync.get("priority_downloaded")
-    return not (isinstance(got, list) and got)
-
-
-def _fail_incomplete_iterative_artifact_sync(result: AdapterResult) -> bool:
-    if result.status != "completed":
-        return False
-    detail = _iterative_artifact_sync_error(result)
-    if detail is None:
-        return False
-    result.status = "chat_failed"
-    result.error_code = "iteration_artifact_sync_failed"
-    result.error_message = detail
-    return True
 
 
 @dataclass
@@ -581,6 +265,35 @@ class BladeServiceAdapter:
                 self.config.reconnect_timeout_seconds
             )
         return client
+
+    def _new_http_client(self) -> httpx.AsyncClient:
+        return httpx.AsyncClient(
+            headers={"Authorization": f"Bearer {self.config.api_key}"},
+            timeout=self.config.request_timeout_seconds,
+        )
+
+    async def _best_effort_stop_session(
+        self,
+        client: BladeAgentClient,
+        session_id: str | None,
+        *,
+        context: str = "error",
+    ) -> None:
+        if not session_id:
+            return
+        timeout = min(
+            max(float(self.config.request_timeout_seconds), 0.1),
+            _BEST_EFFORT_STOP_TIMEOUT_SECONDS,
+        )
+        try:
+            await asyncio.wait_for(client.stop(session_id), timeout=timeout)
+        except Exception as exc:
+            logger.warning(
+                "stop blade session %s after %s failed: %s",
+                session_id,
+                context,
+                exc,
+            )
 
     async def run(
         self,
@@ -691,7 +404,7 @@ class BladeServiceAdapter:
         _write_json(progress_path, progress)
 
         try:
-            async with self._new_client() as client:
+            async with self._new_client() as client, self._new_http_client() as http_client:
                 # 1) 创建 session（路线 A：指定真实注册的 skill / solution）
                 try:
                     is_web_chat = env.surface == "chat"
@@ -1703,7 +1416,7 @@ class BladeServiceAdapter:
         # create_task 后 HTTP 响应可能比 background chat 先到达客户端。等 session
         # 离开 created/initializing，避免恢复器把尚未起跑误判为 interrupted。
         try:
-            async with self._new_client() as client:
+            async with self._new_client() as client, self._new_http_client() as http_client:
                 for _ in range(40):
                     session = await client.get_session(session_id)
                     status = str(session.raw.get("status") or "")
@@ -1726,7 +1439,9 @@ class BladeServiceAdapter:
         result.external_refs.update(external_refs)
         result.external_refs["recovered_after_restart"] = False
         result.external_refs["blade_enable_thinking"] = self.config.enable_thinking
-        result.external_refs["model_used"] = self.config.model
+        result.external_refs["model_used"] = (
+            result.external_refs.get("model_used") or self.config.model
+        )
         result.duration_ms = int((time.monotonic() - started) * 1000)
 
         result = await self._drive_iterative_review(
@@ -1881,7 +1596,7 @@ class BladeServiceAdapter:
         result: AdapterResult,
     ) -> AdapterResult:
         try:
-            async with self._new_client() as client:
+            async with self._new_client() as client, self._new_http_client() as http_client:
                 cleaned = await self._cleanup(client, session_id)
             if not cleaned:
                 result.external_refs["cleanup_pending"] = True
@@ -2206,7 +1921,7 @@ class BladeServiceAdapter:
             )
 
         try:
-            async with self._new_client() as client:
+            async with self._new_client() as client, self._new_http_client() as http_client:
                 session = await self._retry_recovery_read(
                     session_id,
                     "get_session",
@@ -2742,12 +2457,13 @@ class BladeServiceAdapter:
         session_id: str,
         *,
         remaining_seconds: float | None = None,
+        http_client: httpx.AsyncClient | None = None,
     ) -> list[dict[str, Any]]:
         base = self.config.base_url.rstrip("/")
-        headers = {"Authorization": f"Bearer {self.config.api_key}"}
-        async with httpx.AsyncClient(
-            headers=headers, timeout=self.config.request_timeout_seconds
-        ) as http:
+        owns_client = http_client is None
+        http = http_client if http_client is not None else self._new_http_client()
+        data: Any = []
+        try:
             for attempt in range(1, _RECOVERY_READ_MAX_ATTEMPTS + 1):
                 try:
                     resp = await http.get(
@@ -2780,6 +2496,9 @@ class BladeServiceAdapter:
                         classification.summary,
                     )
                     await asyncio.sleep(delay)
+        finally:
+            if owns_client:
+                await http.aclose()
         if isinstance(data, list):
             messages = data
         elif isinstance(data, dict):
@@ -2799,47 +2518,15 @@ class BladeServiceAdapter:
         errors: list[str],
         project_workspace: str = "",
     ) -> tuple[list[str], list[str]]:
-        """定向下载 agent 编辑过的路径，并校验落地内容确实变了。
-
-        「`download_file` 没抛异常」不等于「拿到了产物」：实测下载成功但文件
-        内容仍是基线（mtime 停在物料拷贝时间）。远端路径前缀可能与本地不同，
-        请求到的其实是另一个位置的同名文件。所以下载后比对 hash——与基线一致
-        就视为未命中，换候选前缀再试（需求 5.1/5.2）。
-        """
-        got: list[str] = []
-        missing: list[str] = []
-        for rel in paths:
-            target = download_root / rel
-            # 基线必须取自**活的 workspace**，不能取 download_root：续聊/恢复
-            # 时 download_root 是新建的空 staging 目录，摘要恒为 None，校验就
-            # 完全失效——而那恰恰是这个校验要守的路径。
-            # 文件不存在时为 None：那时任何内容都算命中（本来就没有）。
-            baseline = _digest_of(baseline_root / rel)
-            landed = False
-            for candidate in _candidate_remote_paths(
-                rel, project_workspace=project_workspace
-            ):
-                try:
-                    content = await client.download_file(session_id, candidate)
-                except Exception:
-                    # 候选路径猜错会 404，这是预期内的试探，不记进 errors——
-                    # errors 非空会让迭代评审路径把 attempt 判成 chat_failed。
-                    continue
-                if baseline is not None and _digest_bytes(content) == baseline:
-                    # 内容没变 = 没真正拿到，继续试下一个候选。
-                    continue
-                try:
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    target.write_bytes(content)
-                except OSError as exc:
-                    errors.append(f"write {rel}: {exc}")
-                    break
-                got.append(rel)
-                landed = True
-                break
-            if not landed:
-                missing.append(rel)
-        return got, missing
+        return await download_priority_paths(
+            client,
+            session_id,
+            paths,
+            download_root=download_root,
+            baseline_root=baseline_root,
+            errors=errors,
+            project_workspace=project_workspace,
+        )
 
     async def _recover_workspace_artifacts(
         self,
@@ -2850,194 +2537,31 @@ class BladeServiceAdapter:
         *,
         overwrite_existing_files: bool = False,
     ) -> dict[str, Any]:
-        """递归拉取 blade workspace 到本地 skill_workspace。
-
-        不再依赖硬编码文件名：能拉的全拉（跳过运行时内部目录），scorer 自己判定。
-        首轮已存在且非空的本地文件默认跳过（uploaded 物料本来就在本地）。
-        Session 续聊或恢复时远端工作区是当前版本权威来源，必须覆盖旧轮本地文件。
-        """
-        workspace_dir = attempt_dir / "skill_workspace"
-        workspace_dir.mkdir(parents=True, exist_ok=True)
-        staging_dir = (
-            Path(tempfile.mkdtemp(prefix=".skill_workspace.sync-", dir=attempt_dir))
-            if overwrite_existing_files
-            else None
+        return await recover_workspace_artifacts(
+            client,
+            session_id,
+            attempt_dir,
+            task,
+            overwrite_existing_files=overwrite_existing_files,
+            download_priority_fn=self._download_priority_paths,
         )
-        download_root = staging_dir or workspace_dir
-        overwrite_existing = {
-            str(x)
-            for x in (task.task_context.get("_agent_material_files") or [])
-            if isinstance(x, str)
-        }
-        # Task uploads are copied locally before the Blade session starts. They
-        # are seed inputs, not final artifacts: the agent may edit the same file
-        # in the remote workspace (for example amortization.db). Allow the
-        # remote copy to replace the local seed during recovery.
-        for item in (task.task_context.get("uploaded_files") or []):
-            if isinstance(item, str):
-                name = Path(item).name
-            elif isinstance(item, dict):
-                name = str(item.get("name") or Path(str(item.get("path") or "")).name)
-            else:
-                continue
-            if name and Path(name).name == name:
-                overwrite_existing.add(name)
 
-        listing: list[dict[str, Any]] = []
-        downloaded: list[str] = []
-        skipped_existing: list[str] = []
-        errors: list[str] = []
-        truncated = False
-
-        # 优先回收：先按 agent 实际编辑过的路径定向下载，再进 BFS 兜底。
-        # BFS 的 500 上限本身是合理的防爆保护，但它会把交付物挤掉——
-        # 优先路径不受这个上限约束。
-        # workspace_root 留空是故意的：blade 在沙盒内按 session 选定工作区
-        # （/root/智能助手工作空间/<session>），adapter 事前不知具体子目录。
-        # `normalize_path` 用工作区标记反查前缀，与安全扫描的做法一致。
-        priority_paths, priority_source = agent_edited_paths(attempt_dir)
-        priority_downloaded: list[str] = []
-        priority_missing: list[str] = []
-        if priority_paths:
-            got, missing = await self._download_priority_paths(
-                client,
-                session_id,
-                priority_paths,
-                download_root=download_root,
-                baseline_root=workspace_dir,
-                errors=errors,
-            )
-            priority_downloaded.extend(got)
-            priority_missing.extend(missing)
-            downloaded.extend(got)
-
-        # 优先阶段已落地的路径，BFS 阶段跳过（list 查找是 O(n)，500 个文件
-        # 逐个扫会变成 O(n²)，这里固化成 set）。
-        priority_done = set(priority_downloaded)
-
-        queue: list[tuple[str, int]] = [(".", 0)]
-        seen_files = 0
-        while queue:
-            dir_path, depth = queue.pop(0)
-            try:
-                entries = await client.list_dir(session_id, dir_path)
-            except Exception as exc:
-                errors.append(f"list {dir_path}: {exc}")
-                continue
-            for entry in entries:
-                rel = entry.path or (
-                    entry.name if dir_path == "." else f"{dir_path}/{entry.name}"
-                )
-                if entry.is_dir:
-                    if entry.name in _ARTIFACT_SKIP_DIRS or entry.name.startswith("."):
-                        continue
-                    if depth + 1 <= _ARTIFACT_MAX_DEPTH:
-                        queue.append((rel, depth + 1))
-                    continue
-                if entry.name.startswith("."):
-                    continue
-                seen_files += 1
-                if seen_files > _ARTIFACT_MAX_FILES:
-                    truncated = True
-                    break
-                listing.append({"path": rel})
-                target = download_root / rel
-                # 优先阶段已经拉到的不再重拉：BFS 是兜底，重复下载既浪费
-                # 带宽，又可能用一个「候选前缀猜错」的版本覆盖掉优先阶段
-                # 已经校验过内容的正确版本。
-                if rel in priority_done:
-                    continue
-                if (
-                    staging_dir is None
-                    and
-                    target.exists()
-                    and target.stat().st_size > 0
-                    and rel not in overwrite_existing
-                    and not overwrite_existing_files
-                ):
-                    skipped_existing.append(rel)
-                    continue
-                try:
-                    content = await client.download_file(session_id, rel)
-                except Exception as exc:
-                    errors.append(f"download {rel}: {exc}")
-                    continue
-                try:
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    target.write_bytes(content)
-                except OSError as exc:
-                    errors.append(f"write {rel}: {exc}")
-                    continue
-                downloaded.append(rel)
-            if truncated:
-                break
-
-        result = {
-            "downloaded": downloaded,
-            "priority_downloaded": priority_downloaded,
-            "priority_source": priority_source,
-            "skipped_existing": skipped_existing,
-            "total_listed": len(listing),
-            "errors": errors,
-            # 这四个字段恒存在（需求 6.2）：排查低分时要一眼看出是
-            # 「agent 没做」还是「没回收到」。truncated_at 为 None 表示没截断。
-            "truncated_at": _ARTIFACT_MAX_FILES if truncated else None,
-            "priority_downloaded": priority_downloaded,
-            "priority_missing": priority_missing,
-            "priority_source": "+".join(priority_source) if priority_source else "none",
-        }
-        if truncated:
-            # 静默截断会被误读成"全量回收"，显式标注
-            result["truncated_at"] = _ARTIFACT_MAX_FILES
-            logger.warning(
-                "artifact recovery truncated at %d files (session %s)",
-                _ARTIFACT_MAX_FILES, session_id,
-            )
-        if staging_dir is not None:
-            if errors or truncated:
-                # staging 被整个丢弃 —— 包括优先阶段已经拉到的那些文件。
-                # 若仍把它们记在 priority_downloaded 里，`artifact_recovery_failed`
-                # 会判定回收成功，于是 attempt 拿着一个「对空工作区打出的分数」
-                # 进矩阵，且不带 infrastructure 标记。产物确实没落地，记账就得
-                # 照实说：全部转入 priority_missing。
-                shutil.rmtree(staging_dir, ignore_errors=True)
-                if priority_downloaded:
-                    logger.warning(
-                        "staging 丢弃使 %d 个优先产物未落地 (session %s)",
-                        len(priority_downloaded), session_id,
-                    )
-                    for rel in priority_downloaded:
-                        if rel in downloaded:
-                            downloaded.remove(rel)
-                    priority_missing.extend(priority_downloaded)
-                    priority_downloaded.clear()
-                    result["priority_downloaded"] = priority_downloaded
-                    result["priority_missing"] = priority_missing
-                    result["downloaded"] = downloaded
-                    result["staging_discarded"] = True
-            else:
-                backup_dir = attempt_dir / f".skill_workspace.previous-{time.time_ns()}"
-                try:
-                    workspace_dir.rename(backup_dir)
-                    staging_dir.rename(workspace_dir)
-                except Exception:
-                    if not workspace_dir.exists() and backup_dir.exists():
-                        backup_dir.rename(workspace_dir)
-                    shutil.rmtree(staging_dir, ignore_errors=True)
-                    raise
-                else:
-                    shutil.rmtree(backup_dir, ignore_errors=True)
-                    result["workspace_replaced"] = True
-        return result
-
-    async def _cleanup(self, client: BladeAgentClient, session_id: str | None) -> bool:
+    async def _cleanup(
+        self,
+        client: BladeAgentClient,
+        session_id: str | None,
+        *,
+        http_client: httpx.AsyncClient | None = None,
+    ) -> bool:
         if not session_id:
             return True
 
         for attempt in range(1, _CLEANUP_MAX_ATTEMPTS + 1):
             background_tasks_ok = True
             try:
-                await self._stop_running_background_tasks(session_id)
+                await self._stop_running_background_tasks(
+                    session_id, http_client=http_client
+                )
             except Exception as exc:
                 background_tasks_ok = False
                 logger.warning(
@@ -3081,14 +2605,17 @@ class BladeServiceAdapter:
             return True
         return False
 
-    async def _stop_running_background_tasks(self, session_id: str) -> list[str]:
+    async def _stop_running_background_tasks(
+        self,
+        session_id: str,
+        *,
+        http_client: httpx.AsyncClient | None = None,
+    ) -> list[str]:
         base = self.config.base_url.rstrip("/")
-        headers = {"Authorization": f"Bearer {self.config.api_key}"}
         encoded_session_id = quote(session_id, safe="")
-        async with httpx.AsyncClient(
-            headers=headers,
-            timeout=self.config.request_timeout_seconds,
-        ) as http:
+        owns_client = http_client is None
+        http = http_client if http_client is not None else self._new_http_client()
+        try:
             response = await http.get(
                 f"{base}/api/sessions/{encoded_session_id}/background-tasks"
             )
@@ -3140,416 +2667,6 @@ class BladeServiceAdapter:
                     + ", ".join(failed)
                 )
             return stopped
-
-
-def _extract_trace_from_history(
-    nodes: list[dict[str, Any]],
-    *,
-    attempt_id: str,
-    env_session_id: str,
-) -> list[dict[str, Any]]:
-    """把 get_history 的 nodes 归一成 Octagon trace.jsonl 行。
-
-    结构依据 blade-agent host/sessions/history.py list_history()（Phase 0 已实测验证，
-    见 docs/specs/batch_benchmark/phase0_history_sample.json）：
-    - assistant 节点的 tool_calls（OpenAI 格式）与后续 role=tool 节点的 content 配对；
-      tool 节点不带 tool_call_id → 同一 loop_name 内按序 FIFO 配对
-    - duration_ms 用 assistant 节点 → tool 结果节点的 timestamp 差近似
-    - is_error 从结果内容启发式判断（exit_code 非 0 / Error 前缀）
-    - 过滤 is_deprecated 节点
-    """
-    rows: list[dict[str, Any]] = []
-    # loop_name -> 待配对的 (tool_call, assistant_ts) FIFO 队列
-    pending: dict[str, list[tuple[dict[str, Any], str | None]]] = {}
-
-    for node in nodes:
-        if node.get("is_deprecated"):
-            continue
-        if node.get("kind") != "message":
-            continue
-        role = node.get("role")
-        loop = str(node.get("loop_name") or "root")
-        ts = node.get("timestamp")
-
-        if role == "assistant" and node.get("tool_calls"):
-            for tc in node["tool_calls"]:
-                pending.setdefault(loop, []).append((tc, ts))
-            continue
-
-        if role == "tool":
-            queue = pending.get(loop) or []
-            tc, call_ts = queue.pop(0) if queue else ({}, None)
-            fn = tc.get("function", {}) if isinstance(tc, dict) else {}
-            raw_args = fn.get("arguments", "")
-            try:
-                arguments = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
-                if not isinstance(arguments, dict):
-                    arguments = {"_raw": arguments}
-            except ValueError:
-                arguments = {"_raw": raw_args}
-            result = node.get("content", "")
-            row = {
-                "timestamp": ts,
-                "attempt_id": attempt_id,
-                "env_session_id": env_session_id,
-                "tool_name": fn.get("name") or "unknown",
-                "arguments": arguments,
-                "result": result,
-                "is_error": _looks_like_error(result),
-                "duration_ms": _ts_diff_ms(call_ts, ts),
-                "loop_name": loop,
-                "tool_call_id": tc.get("id") if isinstance(tc, dict) else None,
-            }
-            skill_call = _parse_blade_skill_run(arguments)
-            if skill_call:
-                row["skill_id"], row["skill_tool"], row["skill_args"] = skill_call
-            rows.append(row)
-    return rows
-
-
-def _trace_row_identity(row: dict[str, Any]) -> str:
-    tool_call_id = row.get("tool_call_id")
-    if isinstance(tool_call_id, str) and tool_call_id:
-        return "tool_call:" + "|".join(
-            (
-                str(row.get("env_session_id") or ""),
-                str(row.get("loop_name") or "root"),
-                tool_call_id,
-            )
-        )
-    stable = {
-        key: row.get(key)
-        for key in (
-            "env_session_id",
-            "loop_name",
-            "timestamp",
-            "tool_name",
-            "arguments",
-            "result",
-        )
-    }
-    payload = json.dumps(
-        stable, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str
-    )
-    return "fallback:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
-
-
-def _append_unique_trace_rows(path: Path, rows: list[dict[str, Any]]) -> int:
-    identities: set[str] = set()
-    if path.is_file():
-        for line in path.read_text(encoding="utf-8").splitlines():
-            if not line.strip():
-                continue
-            with contextlib.suppress(json.JSONDecodeError):
-                existing = json.loads(line)
-                if isinstance(existing, dict):
-                    identities.add(_trace_row_identity(existing))
-    added = 0
-    with path.open("a", encoding="utf-8") as handle:
-        for row in rows:
-            identity = _trace_row_identity(row)
-            if identity in identities:
-                continue
-            handle.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
-            identities.add(identity)
-            added += 1
-    return added
-
-
-def _parse_blade_skill_run(arguments: Any) -> tuple[str, str, dict[str, Any]] | None:
-    """从 Bash command 里解析 `blade skill run` 的 skill 级语义。"""
-    if not isinstance(arguments, dict):
-        return None
-    command = arguments.get("command")
-    if not isinstance(command, str) or "blade skill run" not in command:
-        return None
-    m = _BLADE_SKILL_RUN_RE.search(command)
-    if not m:
-        return None
-    skill_id, tool_name, raw_args = m.group(1), m.group(2), m.group(3)
-    try:
-        skill_args = json.loads(raw_args) if raw_args else {}
-        if not isinstance(skill_args, dict):
-            skill_args = {"_raw": skill_args}
-    except ValueError:
-        skill_args = {"_raw": raw_args}
-    return skill_id, tool_name, skill_args
-
-
-def _looks_like_error(result: Any) -> bool:
-    if not isinstance(result, str):
-        return False
-    stripped = result.lstrip()
-    if stripped.startswith("Error") or stripped.startswith("error:"):
-        return True
-    if stripped.startswith("{"):
-        try:
-            data = json.loads(stripped)
-        except ValueError:
-            return False
-        if isinstance(data, dict):
-            exit_code = data.get("exit_code")
-            if isinstance(exit_code, int) and exit_code != 0:
-                return True
-            if data.get("is_error") is True or data.get("error"):
-                return True
-    return False
-
-
-def _ts_diff_ms(start: str | None, end: str | None) -> int:
-    if not start or not end:
-        return 0
-    try:
-        s = datetime.fromisoformat(str(start))
-        e = datetime.fromisoformat(str(end))
-    except ValueError:
-        return 0
-    diff = (e - s).total_seconds() * 1000
-    return max(int(diff), 0)
-
-
-def _classify_outcome(
-    chat_end_status: str | None,
-    error_message: str | None,
-    finish_reason: str | None = None,
-    *,
-    unexpected_interaction: bool = False,
-) -> str:
-    # 未声明的交互请求：agent 停在等应答，任务不可能完成。语义是
-    # "agent 要人介入而场景没准备"，不是超时——归 chat_failed 并配专用 error_code。
-    if unexpected_interaction:
-        return "chat_failed"
-    if error_message and "timeout" in error_message.lower():
-        return "timeout"
-    if error_message and "socket disconnected" in error_message.lower():
-        return "chat_failed"
-    if error_message:
-        return "chat_failed"
-    if finish_reason == "terminal_tool":
-        return "completed"
-    if chat_end_status in ("ok", "completed"):
-        return "completed"
-    if chat_end_status == "failed":
-        return "chat_failed"
-    if chat_end_status == "paused":
-        # 非 headless 下 paused 是"等交互应答"。走到这里说明应答循环没能收尾
-        # （已声明的 turn 用尽仍在暂停），同样不是超时。
-        return "chat_failed"
-    if chat_end_status == "interrupted":
-        return "chat_failed"
-    if chat_end_status is None:
-        return "timeout"
-    return "chat_failed"
-
-
-def _outcome_error_code(
-    status: str,
-    error_message: str | None,
-    finish_reason: str | None,
-    *,
-    unexpected_interaction: bool = False,
-) -> str | None:
-    if status == "completed":
-        return None
-    if unexpected_interaction:
-        return "unexpected_interaction"
-    lowered = (error_message or "").lower()
-    if "socket disconnected" in lowered:
-        return "transport_reconnect_exhausted"
-    if "inactivity timeout" in lowered:
-        return "agent_inactivity_timeout"
-    if "total timeout" in lowered:
-        return "agent_total_timeout"
-    if "timeout" in lowered:
-        return "agent_timeout"
-    if "finish_reason" in lowered or "流式响应未正常结束" in lowered:
-        return "llm_stream_incomplete"
-    return finish_reason or "chat_error"
-
-
-def sync_blade_skills(envs_path: Path, skills_path: Path) -> list[str]:
-    """把所有 env 的 blade_skill/ 同步到 <skills_path>/octagon/<env-name>/。
-
-    路线 A 下这是旧 env 薄壳的注册通道：blade server 启动时把 <skills_path>
-    加进 BLADE_SKILL_PATHS，薄壳即成为注册 skill（id = "octagon/<env-name>"），
-    运行期不再向 session 上传。
-    """
-    envs_path = Path(envs_path)
-    skills_path = Path(skills_path)
-    target = skills_path / "octagon"
-    tmp = skills_path / ".octagon.tmp"
-    skills_path.mkdir(parents=True, exist_ok=True)
-    if tmp.exists():
-        shutil.rmtree(tmp)
-    tmp.mkdir(parents=True)
-
-    synced: list[str] = []
-    if envs_path.is_dir():
-        for env_dir in sorted(p for p in envs_path.iterdir() if p.is_dir()):
-            blade_skill = env_dir / "blade_skill"
-            if not blade_skill.is_dir():
-                continue
-            shutil.copytree(blade_skill, tmp / env_dir.name)
-            synced.append(env_dir.name)
-
-    if target.exists():
-        shutil.rmtree(target)
-    tmp.rename(target)
-    logger.info("sync_blade_skills: %s envs -> %s", len(synced), target)
-    return synced
-
-
-# 软件工厂只在这里复用前端的项目标题规则；app-dev bootstrap 消息、工作区
-# 准备与 skills 全部由当前 BA 的 /api/agent-board/projects 生成，Octagon 不留副本。
-_PROJECT_TITLE_MAX = 36
-
-
-def _project_prompt_title(prompt: str) -> str:
-    """与软件工厂前端 ``projectPromptTitle`` 保持一致。"""
-    text = " ".join(prompt.strip().split())
-    return text[:_PROJECT_TITLE_MAX] if text else "新对话"
-
-
-def _chat_intent(prompt: str) -> str:
-    """普通聊天首页用用户输入前 20 个 Unicode 字符作为会话标题。"""
-    text = prompt.strip() or "新会话"
-    return text[:20]
-
-
-def _render_prompt(
-    task: AdapterRunInput,
-    env: "AdapterEnv | None" = None,
-    data_path: Path | None = None,
-) -> str:
-    """只传任务消息。工具引导交给 blade 真实 AGENTS.md / SKILL.md（路线 A）。"""
-    parts: list[str] = []
-    # 时间预算放最前（blade ChatSendPayload 无独立 system 通道，回落 message 顶部；
-    # 语义是"框架级约束"，置顶更醒目）。None（不限时）不注入。
-    notice = (
-        time_budget_notice(task.timeout_seconds)
-        if task.notify_model_of_timeout
-        else None
-    )
-    if notice:
-        parts += [notice, ""]
-
-    parts.append(task.task_prompt)
-
-    if task.task_context:
-        context = prompt_context(task.task_context)
-        if context:
-            parts += ["", "上下文:", json.dumps(context, ensure_ascii=False, indent=2)]
-    return "\n".join(parts)
-
-
-def _render_turn_prompt(
-    task: AdapterRunInput,
-    turn: Any,
-    env: "AdapterEnv | None" = None,
-    data_path: Path | None = None,
-) -> str:
-    """渲染某一轮的消息。
-
-    首轮（turn_index==0）走 `_render_prompt` 的完整渲染：time budget notice 与
-    task context 只在首轮注入——后续轮重复宣称"本任务限时 X"会误导 agent，
-    context 也已在同一 session 里。legacy 单轮因此与改造前逐字节一致。
-    后续轮只发该轮 prompt 原文。
-    """
-    if turn.turn_index == 0:
-        # legacy 轮的 prompt 就是 task_prompt，等价于旧路径；多轮首轮用该轮
-        # prompt 替换任务消息，notice/context 渲染方式不变。
-        if turn.prompt == task.task_prompt:
-            return _render_prompt(task, env, data_path)
-        parts: list[str] = []
-        notice = (
-            time_budget_notice(task.timeout_seconds)
-            if task.notify_model_of_timeout
-            else None
-        )
-        if notice:
-            parts += [notice, ""]
-        parts.append(turn.prompt or "")
-        if task.task_context:
-            context = prompt_context(task.task_context)
-            if context:
-                parts += [
-                    "", "上下文:",
-                    json.dumps(context, ensure_ascii=False, indent=2),
-                ]
-        return "\n".join(parts)
-    return turn.prompt or ""
-
-
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
-
-
-def _append_jsonl(path: Path, data: dict) -> None:
-    with path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(data, ensure_ascii=False, default=str) + "\n")
-
-
-_TURN_TERMINAL_STATUSES = frozenset(
-    {"completed", "ok", "failed", "error", "interrupted", "cancelled"}
-)
-
-
-def _turn_is_terminal(turn: dict[str, Any]) -> bool:
-    """/messages 返回的 turn 是否已到终态。
-
-    status 缺失视为终态（旧版 blade /messages 只返回已完成的 turn，部分行
-    可能不带 status 字段）；只有显式的进行中状态才判非终态。
-    """
-    status = turn.get("status")
-    if status is None:
-        return True
-    return str(status) in _TURN_TERMINAL_STATUSES
-
-
-def _projection_identity(payload: dict[str, Any]) -> str:
-    turn_id = payload.get("turn_id") or payload.get("id")
-    if turn_id:
-        return f"{payload.get('role', '')}:{turn_id}"
-    return json.dumps(
-        {
-            "role": payload.get("role"),
-            "status": payload.get("status"),
-            "blocks": payload.get("blocks") or [],
-        },
-        ensure_ascii=False,
-        sort_keys=True,
-        default=str,
-    )
-
-
-def _write_progress(path: Path, progress: dict[str, Any]) -> None:
-    progress["updated_at"] = _now_iso()
-    _write_json(path, progress)
-
-
-def _persist_cleanup_pending_checkpoint(
-    attempt_dir: Path,
-    session_id: str | None,
-    external_refs: dict[str, Any] | None = None,
-) -> None:
-    if not session_id:
-        return
-    checkpoint_path = attempt_dir / "recovery.json"
-    checkpoint: dict[str, Any] = {}
-    if checkpoint_path.is_file():
-        with contextlib.suppress(OSError, json.JSONDecodeError):
-            loaded = json.loads(checkpoint_path.read_text(encoding="utf-8"))
-            if isinstance(loaded, dict):
-                checkpoint = loaded
-    if external_refs:
-        checkpoint.update(external_refs)
-    checkpoint["blade_session_id"] = session_id
-    checkpoint["cleanup_pending"] = True
-    _write_json(checkpoint_path, checkpoint)
-
-
-def _write_json(path: Path, data: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(f"{path.suffix}.tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, default=str), encoding="utf-8")
-    tmp.replace(path)
+        finally:
+            if owns_client:
+                await http.aclose()
