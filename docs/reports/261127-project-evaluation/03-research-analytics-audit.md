@@ -1,8 +1,8 @@
 # 03 — Research/Experiments、Insights、Rubric Evolution、Iteration 与 Scorers 审计
 
-> 审计日期：2026-11-27 · 审计基线：`9c4cfaf` · **状态更新**：2026-11-28（PR #36、PR #37 已合入 `main`；Phase 3 待合入）
+> 审计日期：2026-11-27 · 审计基线：`9c4cfaf` · **状态更新**：2026-11-28（PR #36、PR #37、PR #38 已合入 `main`；Phase 4 待合入）
 >
-> 状态图例：`✅ 已合入 (PR #36/#37)` · `🟡 本 PR 待合入 (Phase 3)` · `⏸️ 已冻结/废弃 (D1)` · `⬜ 未开始`
+> 状态图例：`✅ 已合入 (PR #36/#37/#38)` · `🟡 本 PR 待合入 (Phase 4)` · `⏸️ 已冻结/废弃 (D1)` · `⬜ 未开始`
 >
 > 审计范围：`backend/research_api.py`、`experiments/`、`insights/`、`rubric_evolution/`、`iteration/`、`mutations/`、`analysis/`、`feedback/`、`profiles/`、`comparison_scorer.py`、`evals_scorer.py`、`attribution_client.py`。
 
@@ -14,11 +14,11 @@
 - **位置**：`backend/analysis/`、`backend/rubric_evolution/`
 - **处理**：按确认决策 D1 明确标记 `analysis` 废弃待删、`rubric_evolution` 冻结不再投入。
 
-### 2. [P1 竞态] Experiments 取消后仍继续创建 Run 并拉起 Agent 子进程 — `✅/🟡 已完成`
+### 2. [P1 竞态] Experiments 取消后仍继续创建 Run 并拉起 Agent 子进程 — `✅ 已合入 (PR #36/#38)`
 - **位置**：`backend/experiments/coordinator.py`、`backend/experiments/recovery.py`
 - **状态拆解**：
   1. `coordinator.py` 校验 `transition_cell` 返回值与 `stop_group` 取消 `group:{id}` 任务：`✅ 已合入 (PR #36: T1.5)`。
-  2. `experiments/recovery.py` 查询活跃状态补 `'scoring'`：`🟡 待合入 (Phase 3: T3.2)`。
+  2. `experiments/recovery.py` 查询活跃状态补 `'scoring'`：`✅ 已合入 (PR #38: T3.2)`。
 
 ### 3. [P1 全局卡死] Leader Outbox 消费者遇到异常行永久堵死 — `✅ 已合入 (PR #36: T1.5)`
 - **位置**：`backend/experiments/leader.py:21, 76, 101-129`
