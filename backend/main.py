@@ -91,6 +91,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.db = await open_db(cfg.octagon.data_path)
         app.state.envs = EnvLoader(cfg.octagon.envs_path).load_all(
             allow_unavailable_core=True,
+            isolate=(cfg.octagon.env_isolation_mode == "subprocess"),
         )
         logger.info("loaded envs: %s", list(app.state.envs))
         # 纯展示边界：HTTP 中间件拦不住进程内的启动写入、恢复与常驻任务——

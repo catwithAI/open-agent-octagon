@@ -329,14 +329,13 @@ def _insert_run_attempt(db: Path, run_id: str, attempt_id: str) -> None:
         conn.commit()
 
 
-def _atif_client(db: Path, data: Path) -> TestClient:
+def _atif_client(db: Path, data: Path, monkeypatch: pytest.MonkeyPatch) -> TestClient:
     import backend.api as api
 
     class _State:
         db_path = db
         data_path = data
 
-    monkeypatch = pytest.MonkeyPatch()
     monkeypatch.setattr(api.runtime_state, "get", lambda: _State())
     full = api.build_router()
     router = APIRouter()
@@ -345,18 +344,16 @@ def _atif_client(db: Path, data: Path) -> TestClient:
             router.routes.append(route)
     app = FastAPI()
     app.include_router(router)
-    client = TestClient(app)
-    client._mp = monkeypatch  # type: ignore[attr-defined]
-    return client
+    return TestClient(app)
 
 
-def test_api_atif_ready() -> None:
+def test_api_atif_ready(monkeypatch: pytest.MonkeyPatch) -> None:
     tmp = Path(tempfile.mkdtemp())
     db = tmp / "octagon.db"
     _init_db_sync(db)
     _insert_run_attempt(db, "run_1", "att_api1")
     _write_cc_sandbox(tmp, "att_api1")
-    client = _atif_client(db, tmp)
+    client = _atif_client(db, tmp, monkeypatch)
     resp = client.get("/runs/run_1/attempts/att_api1/atif")
     assert resp.status_code == 200
     body = resp.json()
@@ -364,24 +361,24 @@ def test_api_atif_ready() -> None:
     assert body["trajectory"]["agent"]["name"] == "claude-code"
 
 
-def test_api_atif_not_available() -> None:
+def test_api_atif_not_available(monkeypatch: pytest.MonkeyPatch) -> None:
     tmp = Path(tempfile.mkdtemp())
     db = tmp / "octagon.db"
     _init_db_sync(db)
     _insert_run_attempt(db, "run_1", "att_api2")
     attempt_dir = _attempt_dir(tmp, "att_api2")
     (attempt_dir / ".codex-iso-home").mkdir()
-    client = _atif_client(db, tmp)
+    client = _atif_client(db, tmp, monkeypatch)
     resp = client.get("/runs/run_1/attempts/att_api2/atif")
     assert resp.status_code == 200
     assert resp.json()["status"] == "not_available"
 
 
-def test_api_atif_attempt_not_found() -> None:
+def test_api_atif_attempt_not_found(monkeypatch: pytest.MonkeyPatch) -> None:
     tmp = Path(tempfile.mkdtemp())
     db = tmp / "octagon.db"
     _init_db_sync(db)
-    client = _atif_client(db, tmp)
+    client = _atif_client(db, tmp, monkeypatch)
     resp = client.get("/runs/run_1/attempts/att_missing/atif")
     assert resp.status_code == 404
 

@@ -23,6 +23,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hmac
 import json
 import logging
@@ -200,7 +201,34 @@ def _open_env_db(data_path: Path, attempt_id: str, env_dir: Path) -> sqlite3.Con
         return conn
 
 
-def _resolve_tool(env: LoadedEnv, tool_name: str) -> RegisteredTool:
+def _ensure_env_db_initialized(
+    data_path: Path, attempt_id: str, env_dir: Path
+) -> None:
+    """原子初始化 env.db schema 后立即关闭连接，供隔离 worker 子进程安全打开。"""
+    conn = _open_env_db(data_path, attempt_id, env_dir)
+    conn.close()
+
+
+def _is_isolated_mode(request: Request, env: LoadedEnv) -> bool:
+    if getattr(env, "isolated", False):
+        return True
+    settings = getattr(request.app.state, "settings", None)
+    octagon = getattr(settings, "octagon", None)
+    return getattr(octagon, "env_isolation_mode", "in_process") == "subprocess"
+
+
+def _tool_timeout_seconds(request: Request) -> float:
+    settings = getattr(request.app.state, "settings", None)
+    octagon = getattr(settings, "octagon", None)
+    raw = getattr(octagon, "env_tool_timeout_seconds", 120)
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        return 120.0
+    return val if val > 0 else 120.0
+
+
+def _resolve_tool(env: LoadedEnv, tool_name: str) -> Any:
     tool = env.tools.get(tool_name)
     if tool is None:
         raise HTTPException(
@@ -353,6 +381,80 @@ def build_router() -> APIRouter:
         status_code = 200
         serialized: Any = None
         try:
+            if _is_isolated_mode(request, env):
+                from .workers.env_worker import (
+                    EnvToolExecutionError,
+                    EnvWorkerError,
+                    EnvWorkerTimeoutError,
+                    call_tool_in_subprocess,
+                )
+
+                await asyncio.to_thread(
+                    _ensure_env_db_initialized, data_path, attempt_id, env.env_dir
+                )
+                timeout_seconds = _tool_timeout_seconds(request)
+                try:
+                    result = await asyncio.to_thread(
+                        call_tool_in_subprocess,
+                        env_name=env.name,
+                        env_dir=env.env_dir,
+                        tool_name=tool_name,
+                        data_path=data_path,
+                        attempt_id=attempt_id,
+                        env_session_id=auth.env_session_id,
+                        arguments=body or {},
+                        timeout_seconds=timeout_seconds,
+                    )
+                except EnvWorkerTimeoutError as exc:
+                    logger.warning(
+                        "env tool 调用超时 attempt=%s tool=%s timeout=%ss",
+                        attempt_id,
+                        tool_name,
+                        timeout_seconds,
+                    )
+                    status_code = 504
+                    raise HTTPException(
+                        status_code=504,
+                        detail={
+                            "error": "tool_execution_timeout",
+                            "tool": tool_name,
+                            "type": "TimeoutError",
+                            "message": str(exc),
+                        },
+                    ) from exc
+                except EnvToolExecutionError as exc:
+                    logger.exception(
+                        "env tool 调用失败 attempt=%s tool=%s", attempt_id, tool_name
+                    )
+                    status_code = 500
+                    raise HTTPException(
+                        status_code=500,
+                        detail={
+                            "error": "tool_execution_error",
+                            "tool": tool_name,
+                            "type": exc.error_type,
+                            "message": exc.message,
+                        },
+                    ) from exc
+                except EnvWorkerError as exc:
+                    logger.exception(
+                        "env tool worker 失败 attempt=%s tool=%s",
+                        attempt_id,
+                        tool_name,
+                    )
+                    status_code = 500
+                    raise HTTPException(
+                        status_code=500,
+                        detail={
+                            "error": "tool_execution_error",
+                            "tool": tool_name,
+                            "type": exc.__class__.__name__,
+                            "message": str(exc),
+                        },
+                    ) from exc
+                serialized = _serialize_result(result)
+                return serialized
+
             env_db = _open_env_db(data_path, attempt_id, env.env_dir)
             try:
                 ctx = EnvContext(
