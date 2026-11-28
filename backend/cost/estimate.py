@@ -20,12 +20,70 @@ import json
 import logging
 import sqlite3
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 logger = logging.getLogger(__name__)
 
 #: 四个成本列，写入顺序固定，供三处调用方共用。
 COST_COLUMNS = ("cost_usd", "cost_breakdown_json", "cost_priced", "cost_model")
+
+_VALID_INPUT_SEMANTICS = frozenset({"auto", "inclusive", "disjoint"})
+_DISJOINT_AGENTS = frozenset({
+    "claude-code",
+    "ssh-claude-code",
+    "kimi-code",
+    "opencode",
+    "mimo-code",
+    # dsh 的 TokenUsage 注释明写 "Counts are DISJOINT: inputTokens
+    # is uncached input only"（llm/src/types.ts:128-134）。
+    "dsh",
+})
+_INCLUSIVE_AGENTS = frozenset({"codex", "blade-agent"})
+_PROXY_USAGE_SOURCE_PREFIXES = ("wire", "http_exchange", "http_proxy", "proxy")
+
+
+def resolve_input_semantics(
+    agent_name: str | None = None,
+    *,
+    token_usage: dict[str, Any] | None = None,
+    usage_source: str | None = None,
+    input_semantics: str | None = None,
+) -> Literal["auto", "inclusive", "disjoint"]:
+    """Resolve input_tokens cache-inclusion semantics with source awareness.
+
+    Priority:
+    1. Explicit ``input_semantics`` kwarg or ``token_usage["input_semantics"]``;
+    2. OpenAI/OpenRouter proxy ``prompt_tokens`` shape inside ``token_usage``;
+    3. Source-aware override: ``kimi-code`` backfilled from ``wire`` /
+       ``http_exchange`` (OpenAI-compatible proxy ``prompt_tokens``) is
+       ``"inclusive"`` so cached input tokens are not double-charged;
+    4. Authoritative producer default (fallback ``"auto"``).
+    """
+    if isinstance(input_semantics, str) and input_semantics in _VALID_INPUT_SEMANTICS:
+        return input_semantics  # type: ignore[return-value]
+
+    if isinstance(token_usage, dict):
+        explicit = token_usage.get("input_semantics")
+        if isinstance(explicit, str) and explicit in _VALID_INPUT_SEMANTICS:
+            return explicit  # type: ignore[return-value]
+        if "prompt_tokens" in token_usage or "prompt_tokens_details" in token_usage:
+            return "inclusive"
+        if usage_source is None:
+            raw_src = token_usage.get("usage_source") or token_usage.get(
+                "token_usage_source"
+            )
+            if isinstance(raw_src, str) and raw_src.strip():
+                usage_source = raw_src
+
+    src = usage_source.strip().lower() if isinstance(usage_source, str) else ""
+    if agent_name == "kimi-code" and src.startswith(_PROXY_USAGE_SOURCE_PREFIXES):
+        return "inclusive"
+
+    if agent_name in _DISJOINT_AGENTS:
+        return "disjoint"
+    if agent_name in _INCLUSIVE_AGENTS:
+        return "inclusive"
+    return "auto"
 
 
 def compute_breakdown(
@@ -34,6 +92,8 @@ def compute_breakdown(
     pricing_path: Path | None = None,
     *,
     agent_name: str | None = None,
+    usage_source: str | None = None,
+    input_semantics: Literal["auto", "inclusive", "disjoint"] | None = None,
 ) -> Any:
     """五维用量 + 定价表 → CostBreakdown。任何一环缺失都返回 None。
 
@@ -48,24 +108,11 @@ def compute_breakdown(
         from ..experiments.scoring import _load_pricing
         from ..pricing import compute_cost
 
-        # Producer APIs disagree on whether input_tokens already includes
-        # cache tiers.  Agent identity is authoritative; magnitude heuristics
-        # are only a fallback for legacy/direct callers.
-        semantics = (
-            "disjoint"
-            if agent_name in {
-                "claude-code",
-                "ssh-claude-code",
-                "kimi-code",
-                "opencode",
-                "mimo-code",
-                # dsh 的 TokenUsage 注释明写 "Counts are DISJOINT: inputTokens
-                # is uncached input only"（llm/src/types.ts:128-134）。
-                "dsh",
-            }
-            else "inclusive"
-            if agent_name in {"codex", "blade-agent"}
-            else "auto"
+        semantics = resolve_input_semantics(
+            agent_name,
+            token_usage=token_usage,
+            usage_source=usage_source,
+            input_semantics=input_semantics,
         )
         return compute_cost(
             token_usage,
@@ -113,6 +160,30 @@ def _resolve_attempt_context(
     )
 
 
+def _resolve_attempt_usage_source(
+    conn: sqlite3.Connection,
+    attempt_id: str,
+) -> str | None:
+    """Read ``external_refs.token_usage_source`` if persisted on the attempt row."""
+    try:
+        row = conn.execute(
+            "SELECT external_refs_json FROM attempts WHERE id=?",
+            (attempt_id,),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return None
+    if not row or not row[0]:
+        return None
+    try:
+        refs = json.loads(row[0])
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(refs, dict):
+        return None
+    source = refs.get("token_usage_source")
+    return source if isinstance(source, str) and source.strip() else None
+
+
 def apply_cost_columns(
     conn: sqlite3.Connection,
     attempt_id: str,
@@ -120,6 +191,8 @@ def apply_cost_columns(
     token_usage: dict[str, Any] | None,
     model: str | None = None,
     pricing_path: Path | None = None,
+    usage_source: str | None = None,
+    input_semantics: Literal["auto", "inclusive", "disjoint"] | None = None,
 ) -> Any:
     """在**调用方已开启的连接/事务内**写入四个成本列。
 
@@ -134,11 +207,18 @@ def apply_cost_columns(
         attempt_id,
         model,
     )
+    effective_source = (
+        usage_source
+        if usage_source is not None
+        else _resolve_attempt_usage_source(conn, attempt_id)
+    )
     breakdown = compute_breakdown(
         token_usage,
         effective_model,
         pricing_path,
         agent_name=agent_name,
+        usage_source=effective_source,
+        input_semantics=input_semantics,
     )
     values = cost_columns(breakdown)
     conn.execute(
@@ -156,6 +236,8 @@ def recompute_attempt_cost(
     token_usage: dict[str, Any] | None,
     model: str | None = None,
     pricing_path: Path | None = None,
+    usage_source: str | None = None,
+    input_semantics: Literal["auto", "inclusive", "disjoint"] | None = None,
 ) -> Any:
     """独立事务内重算成本（wire backfill 修正 token 后调用）。
 
@@ -171,6 +253,8 @@ def recompute_attempt_cost(
             token_usage=token_usage,
             model=model,
             pricing_path=pricing_path,
+            usage_source=usage_source,
+            input_semantics=input_semantics,
         )
         conn.commit()
     return breakdown

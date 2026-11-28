@@ -112,7 +112,7 @@ def _group_status(statuses: list[str], previous: str) -> str:
 def _project_experiment(conn: sqlite3.Connection, experiment_id: str) -> None:
     row = conn.execute(
         "SELECT status FROM run_groups WHERE experiment_id=? "
-        "ORDER BY CASE WHEN status IN ('queued','running') THEN 0 ELSE 1 END,"
+        "ORDER BY CASE WHEN status IN ('queued','running','scoring') THEN 0 ELSE 1 END,"
         "created_at DESC,id DESC LIMIT 1",
         (experiment_id,),
     ).fetchone()
@@ -195,7 +195,7 @@ def recover_groups_sync(db_path: Path) -> tuple[str, ...]:
             row[0]
             for row in conn.execute(
                 "SELECT run_id FROM run_group_cells WHERE run_id IS NOT NULL "
-                "AND status IN ('provisioning','running')"
+                "AND status IN ('provisioning','running','scoring')"
             ).fetchall()
         ]
         group_ids = [
@@ -210,7 +210,7 @@ def recover_groups_sync(db_path: Path) -> tuple[str, ...]:
     resumable: list[str] = []
     for group_id in group_ids:
         status = rebuild_group_projection(db_path, group_id)
-        if status in {"queued", "running"}:
+        if status in {"queued", "running", "scoring"}:
             with _open_sync(db_path) as conn:
                 queued = conn.execute(
                     "SELECT 1 FROM run_group_cells WHERE run_group_id=? "

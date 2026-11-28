@@ -39,6 +39,7 @@ from backend.wire.normalizers.blade import BladeNormalizer
 from backend.wire.normalizers.claude_code import ClaudeCodeNormalizer
 from backend.wire.normalizers.codex import CodexNormalizer
 from backend.wire.normalizers.dsh import DshNormalizer
+from backend.wire.normalizers.kimi_code import KimiCodeNormalizer
 from backend.wire.normalizers.opencode_family import OpencodeFamilyNormalizer
 from backend.wire.trajectory_schema import TRAJECTORY_SCHEMA_VERSION
 
@@ -47,6 +48,7 @@ _NORMALIZERS = {
     "codex": CodexNormalizer,
     "blade-agent": BladeNormalizer,
     "dsh": DshNormalizer,
+    "kimi-code": KimiCodeNormalizer,
 }
 
 # opencode 与其 fork mimo 事件流逐字段同构，共用一个 normalizer 实现，

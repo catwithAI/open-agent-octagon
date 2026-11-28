@@ -14,6 +14,7 @@ import json
 import logging
 import sqlite3
 import uuid
+import weakref
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -349,7 +350,39 @@ def _load_created_run(db_path: Path, run_id: str) -> CreatedRun | None:
     )
 
 
-_create_locks: dict[str, asyncio.Lock] = {}
+_create_locks: weakref.WeakKeyDictionary[
+    asyncio.AbstractEventLoop, dict[str, tuple[asyncio.Lock, int]]
+] = weakref.WeakKeyDictionary()
+
+
+@asynccontextmanager
+async def _acquire_create_lock(run_id: str):
+    """Acquire a loop-scoped creation lock and evict it when no waiters remain."""
+    loop = asyncio.get_running_loop()
+    loop_locks = _create_locks.get(loop)
+    if loop_locks is None:
+        loop_locks = {}
+        _create_locks[loop] = loop_locks
+    entry = loop_locks.get(run_id)
+    if entry is None:
+        lock = asyncio.Lock()
+        loop_locks[run_id] = (lock, 1)
+    else:
+        lock, waiters = entry
+        loop_locks[run_id] = (lock, waiters + 1)
+    try:
+        async with lock:
+            yield
+    finally:
+        current = loop_locks.get(run_id)
+        if current is not None:
+            cur_lock, waiters = current
+            if waiters <= 1:
+                loop_locks.pop(run_id, None)
+                if not loop_locks:
+                    _create_locks.pop(loop, None)
+            else:
+                loop_locks[run_id] = (cur_lock, waiters - 1)
 
 
 def _resolve_timeout_seconds(
@@ -508,8 +541,7 @@ async def create_run_plan(
     raw_plan, execution = _validate_and_build_job_plan(request, settings)
     job_plan = await _normalize_job_plan(settings, raw_plan, blade_models_loader)
     run_id = _idempotent_run_id(create_key) if create_key else f"run_{uuid.uuid4().hex[:12]}"
-    lock = _create_locks.setdefault(run_id, asyncio.Lock())
-    async with lock:
+    async with _acquire_create_lock(run_id):
         if create_key:
             request_hash = canonical_hash(request)
             try:
