@@ -1,24 +1,22 @@
 # OpenAgentOctagon 全项目综合评估报告
 
-> 审计日期：2026-11-27 · 审计基线：`9c4cfaf` (`main`) · **最近状态更新**：2026-11-28（`main` 已合入 PR #36、`PR #37` 至 `3641d97`；Phase 3 已完成并准备 PR）
+> 审计日期：2026-11-27 · 审计基线：`9c4cfaf` (`main`) · **最近状态更新**：2026-11-28（`main` 已合入 PR #36、PR #37、PR #38 至 `2963dbe`；Phase 4 已完成并准备 PR）
 >
 > 范围：全仓库后端（Python / FastAPI / SQLite，约 72,896 LOC）与前端（React / Vite / TypeScript，非测试代码约 13,842 LOC；测试文件 103 个）。
 
 ## 当前修复进度总览（2026-11-28）
 
-> 状态图例：`✅ 已合入 (PR #36/#37)` · `🟡 本 PR 待合入 (Phase 3)` · `⏸️ 已冻结/废弃 (D1)` · `⬜ 未开始`
+> 状态图例：`✅ 已合入 (PR #36/#37/#38)` · `🟡 本 PR 待合入 (Phase 4)` · `⏸️ 已冻结/废弃 (D1)` · `⬜ 未开始`
 
 | 阶段 | 任务 | 当前状态 | 关联 PR / 说明 |
 |---|---|---|---|
 | **Phase 0** | `T0.1`–`T0.2` 前端全量 CI 门禁与后端可选依赖隔离 | ✅ 已合入 | [PR #36](https://github.com/catwithAI/open-agent-octagon/pull/36)（`6d5a108`） |
 | **Phase 1** | `T1.1`–`T1.5` 安全止血、数据保护、Token/成本、Skill Eval、Research & 前端 | ✅ 已合入 | [PR #36](https://github.com/catwithAI/open-agent-octagon/pull/36)（`6d5a108`） |
 | **Phase 2** | `T2.1`–`T2.4` SQLite 工厂、状态机/Sweeper、非阻塞事件循环、Scorer 加固与 D1 冻结 | ✅ 已合入 | [PR #37](https://github.com/catwithAI/open-agent-octagon/pull/37)（`3641d97`） |
-| **Phase 3** | `T3.1A` 抽 `cli_common.py`，并发抽干 4 个 CLI Adapter `stderr` 与句柄安全 | 🟡 待合入 | Phase 3 PR（已过全量 392 后端测试） |
-| **Phase 3** | `T3.1B` 拆分 `blade_service.py`（3,555 → 2,672 行）并修恢复风暴/泄漏/自动应答上限 | 🟡 待合入 | Phase 3 PR（抽出 `backend/adapters/blade/` 3 个子模块） |
-| **Phase 3** | `T3.2` 补齐 Blade SDK ATIF、`kimi-code` Wire Normalizer、来源感知成本语义与 `experiments/recovery` | 🟡 待合入 | Phase 3 PR（7 家 Agent ATIF/Wire 全面对等） |
-| **Phase 3** | `T3.3` 拆分 `RunDetail.tsx`（3,751 → 1,552 行）、解除 `skillEval` 反转依赖、`React.lazy` 代码分割与前端润色 | 🟡 待合入 | Phase 3 PR（前端 187/187 全绿，主包 640KB → 405KB） |
-| **Phase 4** | `T4.1`–`T4.2` 独立 `scoring-worker` 进程 / Env 代码子进程隔离 | ⬜ 未开始 | 等 Phase 3 合入后启动 |
-| **Phase 5** | `T5.1`–`T5.4` Skill Eval ↔ Core 矩阵融合、分叉对比、Preflight、富编辑器 | ⬜ 未开始 | 排在底座与架构解耦之后 |
+| **Phase 3** | `T3.1`–`T3.3` CLI 底座与 `blade_service` 拆分、7 家 ATIF/Wire 对等、`RunDetail` 拆巨石与路由懒加载 | ✅ 已合入 | [PR #38](https://github.com/catwithAI/open-agent-octagon/pull/38)（`2963dbe`） |
+| **Phase 4** | `T4.1` 独立 `scoring-worker` 租约进程（`in_process`/`subprocess`/`external` 三模）+ 重型预览进程组超时强杀 | 🟡 待合入 | Phase 4 PR（新增 10 项隔离专测，支持 OS 级 `SIGKILL` 进程组终止） |
+| **Phase 4** | `T4.2` Env Scorer / Core 子进程隔离（`env_worker.py` 剥离管理员密钥与内存 `run_credentials`） | 🟡 待合入 | Phase 4 PR（新增 8 项隔离专测，后端全量 410 passed） |
+| **Phase 5** | `T5.1`–`T5.4` Skill Eval ↔ Core 矩阵融合、分叉对比、Preflight、富编辑器 | ⬜ 未开始 | 等 Phase 4 合入后启动 |
 
 ## 报告索引
 

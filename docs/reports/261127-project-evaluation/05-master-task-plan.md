@@ -1,6 +1,6 @@
 # 05 — 冲突消解与有序改造总任务清单（Master Task Plan）
 
-> 制定日期：2026-11-27 · 初始基线：`9c4cfaf` · **最近状态更新**：2026-11-28（Phase 0/1/2 已随 PR #36、`PR #37` 合入 `main` `3641d97`；Phase 3 已完成并准备 PR）
+> 制定日期：2026-11-27 · 初始基线：`9c4cfaf` · **最近状态更新**：2026-11-28（Phase 0–3 已随 PR #36/#37/#38 合入 `main` `2963dbe`；Phase 4 已完成并准备 PR）
 >
 > 状态约定：`[x] 已合入 main 且回归通过` · `[~] 已提 PR 待合入（已过全量既有回归）` · `[ ] 未开始` · `[-] 已冻结/跳过`
 
@@ -134,17 +134,17 @@
 
 ---
 
-### Phase 3：核心架构解耦（Adapter 抽象 + ATIF/Wire 7 家对等 + 前端拆巨石 — 本次 PR 待合入）
+### Phase 3：核心架构解耦（Adapter 抽象 + ATIF/Wire 7 家对等 + 前端拆巨石 — 已随 [PR #38](https://github.com/catwithAI/open-agent-octagon/pull/38) 合入 `main`）
 
-> 目标：根治长期维护成本最高的巨石模块、管道死锁、7 家观测不对等与前端反转依赖。已通过后端 392 passed + 前端 187 passed + `vite build` 路由分包。
+> 目标：根治长期维护成本最高的巨石模块、管道死锁、7 家观测不对等与前端反转依赖。PR #38（`2963dbe`）已合入 `main`。
 
-- [~] **T3.1 抽取 CLI Adapter 公共底座 `cli_common.py` 与拆分/加固 `blade_service.py`（解冲突组 F）**
+- [x] **T3.1 抽取 CLI Adapter 公共底座 `cli_common.py` 与拆分/加固 `blade_service.py`（解冲突组 F）**（PR #38 已合入）
   - **涉及文件**：`backend/adapters/{cli_common,claude_code,codex,kimi_code,opencode_family,blade_service}.py`、新增 `backend/adapters/blade/{__init__,artifacts,extraction,interactions}.py`
   - **改动内容**：
     1. `cli_common.py` 统一并发抽干 4 个 CLI Adapter 的 `stderr`（根治 64KB 管道死锁并按轮次追加 `stderr.txt`）与 `finally` 安全关闭 `ConversationTraceWriter`；
     2. 将 `blade_service.py` 从 3,555 行精简至 2,672 行（拆出 `artifacts`/`extraction`/`interactions` 3 个子模块并保持全部导出兼容）；修复恢复期每事件 3 次 REST 风暴（按 `progress_poll_interval_seconds` 节流并保留完整 token/model/tool 统计）、非 `BladeChatError` 异常路径清理远端会话与取消监控任务、自动应答循环上限（`_MAX_UNEXPECTED_AUTO_ANSWERS=20`）以及会话级 `httpx.AsyncClient` 复用。
 
-- [~] **T3.2 补齐 7 家 Agent ATIF / Wire 观测对等、来源感知成本语义与遗留修复（解冲突组 B）**
+- [x] **T3.2 补齐 7 家 Agent ATIF / Wire 观测对等、来源感知成本语义与遗留修复（解冲突组 B）**（PR #38 已合入）
   - **涉及文件**：`backend/atif/converters/blade_agent.py`、新增 `backend/wire/normalizers/kimi_code.py`、`backend/wire/normalizers/runner.py`、`backend/cost/estimate.py`、`backend/experiments/recovery.py`、`backend/run_service.py`
   - **改动内容**：
     1. `atif/converters/blade_agent.py` 兼容 `blade_service.py` SDK `{kind, raw}` 事件格式，实现 7 家 Agent ATIF-v1.7 全覆盖；
@@ -152,7 +152,7 @@
     3. `cost/estimate.py` 支持来源感知的 `input_semantics`（避免 Kimi 等经 HTTP 代理回填 inclusive `prompt_tokens` 重复计费）；
     4. `experiments/recovery.py` 活跃状态补 `'scoring'`；`run_service._create_locks` 按 event loop 清理避免内存泄漏。
 
-- [~] **T3.3 拆分前端巨石 `RunDetail.tsx`、解除 `skillEval` 反转依赖与代码分割（解冲突组 D）**
+- [x] **T3.3 拆分前端巨石 `RunDetail.tsx`、解除 `skillEval` 反转依赖与代码分割（解冲突组 D）**（PR #38 已合入）
   - **涉及文件**：新增 `web/src/components/viewers/ArtifactViewers.tsx`、`web/src/components/ArtifactsPanel.tsx`、`web/src/cost/RunCostCard.tsx`、`web/src/wire/WirePanel.tsx`；改造 `web/src/pages/RunDetail.tsx`、`web/src/skillEval/{ArtifactPreview,ProcessView,RunDetail}.tsx`、`web/src/main.tsx`、`web/src/pages/{ExperimentBuilder,RunGroupLive,RunList}.tsx`
   - **改动内容**：
     1. 将 `RunDetail.tsx` 从 3,751 行缩减至 1,552 行（-58.6%），抽离共享预览器、产物树（修复 SSE 刷新折叠已展开目录）、成本卡片与 Wire 面板并保持向后 re-export；
@@ -162,16 +162,24 @@
 
 ---
 
-### Phase 4：独立进程隔离（水平扩展与安全边界）
+### Phase 4：独立进程隔离（水平扩展与安全边界 — 本次 PR 待合入）
 
-- [ ] **T4.1 抽取独立的 `scoring-worker`（评分与重型预览）进程**
-  - **涉及文件**：`backend/scoring_queue.py`、`backend/artifact_worker.py`、新增 `backend/workers/scoring_worker.py`
-  - **改动内容**：利用 `scoring_jobs` 已有的 `lease_owner`/`lease_expires_at`/`snapshot_ref`，将 LLM Judge 评分与 LibreOffice 渲染迁出 API 主进程，支持独立重启与 OS 级超时强杀。
+> 目标：利用 `scoring_jobs` 租约列将评分/重型预览迁出 API 主进程，并将外部 `envs/*/core.py` 与 `scorer.py` 从持有明文凭据的 API 进程中隔离。已通过后端 410 passed（含 18 项新增隔离专测）+ 前端 187 passed。
+
+- [~] **T4.1 抽取独立的 `scoring-worker`（评分与重型预览）进程**
+  - **涉及文件**：`backend/config.py`、`backend/scoring_queue.py`、`backend/artifact_preview.py`、`backend/artifact_worker.py`、新增 `backend/workers/{__init__,scoring_worker}.py`、`tests/test_scoring_worker_isolation.py`
+  - **改动内容**：
+    1. `scoring_queue.py` 启用 `scoring_jobs.lease_owner` / `lease_expires_at` / `heartbeat_at` 租约与心跳续租（`BEGIN IMMEDIATE` 原子抢单 + 过期租约自动接管），新增 `scoring_worker_mode`（`in_process` / `subprocess` / `external`）三模调度；
+    2. 新增独立常驻进程与单任务隔离入口 `python -m backend.workers.scoring_worker`（支持 `--once` / `--concurrency` / `--run-job` / `--render-preview`），每个评分任务运行在独立进程组，超时/取消触发 OS 级 `SIGTERM → SIGKILL` 整组强杀并剥离管理员密钥；
+    3. `artifact_preview.py` 将预览超时升级为 `Popen(start_new_session=True)` + `os.killpg` 整组强杀，防止子渲染进程泄漏；`artifact_worker.py` 支持有界资源限额覆写。
   - **前置依赖**：T2.1、T2.2。
 
-- [ ] **T4.2 Env Scorer / Core 子进程隔离**
-  - **涉及文件**：`backend/env_loader.py`、`backend/env_attempt_server.py`
-  - **改动内容**：将外部场景代码加载与执行与主 API 进程中的明文 `run_credentials` 隔离。
+- [~] **T4.2 Env Scorer / Core 子进程隔离**
+  - **涉及文件**：`backend/config.py`、`backend/main.py`、`backend/env_loader.py`、`backend/env_attempt_server.py`、新增 `backend/workers/env_worker.py`、`tests/test_env_subprocess_isolation.py`（并顺手修复 `tests/test_atif.py` 跨用例 `MonkeyPatch` 泄漏）
+  - **改动内容**：
+    1. 新增 `backend/workers/env_worker.py`（支持 `inspect-env` / `call-tool` / `run-scorer` 三个子进程动作），对 `core.py` 采用最小白名单环境变量、对 `scorer.py` 强制剥离 `OPENROUTER_MANAGEMENT_KEY` 等管理员密钥并仅透传当前任务自己的 `judge_env_overlay()`，完全隔离 API 主进程内存中的 `runtime_state.run_credentials`；
+    2. `EnvLoader.load_all(..., isolate=True)` 不在 API 进程 `exec_module`，通过 `IsolatedRegisteredTool` / `IsolatedScorerModule` 代理透明兼容全部现有调用方；
+    3. `env_attempt_server.py` 在 `env_isolation_mode="subprocess"` 下通过隔离子进程执行工具调用，保留 wire inbound 采集、原子 `env.db` 初始化，并按 `env_tool_timeout_seconds` 对超时工具执行进程组强杀（返回 HTTP 504）。
   - **前置依赖**：T4.1。
 
 ---

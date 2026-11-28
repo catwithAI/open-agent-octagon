@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import sqlite3
 import time
 import uuid
@@ -353,42 +354,221 @@ def _scoring_semaphore(capacity: int) -> asyncio.Semaphore:
     return semaphore
 
 
+def _default_lease_seconds() -> int:
+    try:
+        state = runtime_state.get()
+    except RuntimeError:
+        return 60
+    settings = getattr(state, "settings", None)
+    raw = getattr(getattr(settings, "octagon", None), "scoring_lease_seconds", None)
+    try:
+        seconds = int(raw) if raw is not None else 60
+    except (TypeError, ValueError):
+        seconds = 60
+    return max(1, seconds)
+
+
+def _default_lease_owner() -> str:
+    return f"in-process:{os.getpid()}"
+
+
+def _scoring_worker_mode(state: Any) -> str:
+    settings = getattr(state, "settings", None)
+    mode = getattr(getattr(settings, "octagon", None), "scoring_worker_mode", "in_process")
+    return str(mode or "in_process")
+
+
 def _claim_job(
-    db_path: Path, job_id: str, *, deadline_seconds: int = 0
+    db_path: Path,
+    job_id: str,
+    *,
+    deadline_seconds: int = 0,
+    lease_owner: str | None = None,
+    lease_seconds: int | None = None,
 ) -> sqlite3.Row | None:
     now = _now_iso()
+    owner = lease_owner or _default_lease_owner()
+    ttl = max(1, int(lease_seconds) if lease_seconds is not None else _default_lease_seconds())
+    lease_expires_at = _iso_after(now, ttl)
     # 评分有自己的 deadline，不消耗 Agent 的耐心预算。绝对时钟
     # 持久化，重启后与常驻 sweeper 都能据此判定。
     deadline = _iso_after(now, deadline_seconds) if deadline_seconds > 0 else None
-    with _open_sync(db_path) as conn:
+    run_id: str | None = None
+    row: sqlite3.Row | None = None
+    with _open_sync(db_path, immediate=True) as conn:
         conn.row_factory = sqlite3.Row
         changed = conn.execute(
-            "UPDATE scoring_jobs SET status='running',started_at=?,heartbeat_at=?,"
-            "deadline_at=?,attempt_count=attempt_count+1 WHERE id=? AND status='queued' "
-            "AND cancel_requested_at IS NULL",
-            (now, now, deadline, job_id),
+            "UPDATE scoring_jobs SET status='running',"
+            "started_at=COALESCE(started_at, ?),heartbeat_at=?,"
+            "deadline_at=COALESCE(deadline_at, ?),lease_owner=?,lease_expires_at=?,"
+            "attempt_count=attempt_count+1 "
+            "WHERE id=? AND cancel_requested_at IS NULL "
+            "AND (status='queued' OR (status='running' AND lease_expires_at IS NOT NULL "
+            "AND lease_expires_at < ?))",
+            (now, now, deadline, owner, lease_expires_at, job_id, now),
         ).rowcount
         if not changed:
+            conn.commit()
+            return None
+        row = conn.execute("SELECT * FROM scoring_jobs WHERE id=?", (job_id,)).fetchone()
+        if row is None:
             conn.commit()
             return None
         conn.execute(
             "UPDATE attempts SET scoring_status='running',scoring_started_at=?,"
             "scoring_deadline_at=?,"
-            "status='scoring' WHERE id=(SELECT attempt_id FROM scoring_jobs WHERE id=?)",
-            (now, deadline, job_id),
+            "status='scoring' WHERE id=?",
+            (row["started_at"], row["deadline_at"], row["attempt_id"]),
         )
-        row = conn.execute("SELECT * FROM scoring_jobs WHERE id=?", (job_id,)).fetchone()
-        run_row = (
-            conn.execute(
-                "SELECT run_id FROM attempts WHERE id=?", (row["attempt_id"],)
-            ).fetchone()
-            if row is not None
-            else None
-        )
-        conn.commit()
+        run_row = conn.execute(
+            "SELECT run_id FROM attempts WHERE id=?", (row["attempt_id"],)
+        ).fetchone()
         if run_row and run_row[0]:
-            runtime_state.notify_run_update(str(run_row[0]))
-        return row
+            run_id = str(run_row[0])
+        conn.commit()
+    if run_id:
+        runtime_state.notify_run_update(run_id)
+    return row
+
+
+def renew_scoring_lease(
+    db_path: Path, job_id: str, *, lease_owner: str, lease_seconds: int
+) -> bool:
+    """Extend a running scoring job lease if still owned by *lease_owner* and not cancelled."""
+    now = _now_iso()
+    expires = _iso_after(now, max(1, int(lease_seconds)))
+    with _open_sync(db_path, immediate=True) as conn:
+        changed = conn.execute(
+            "UPDATE scoring_jobs SET heartbeat_at=?,lease_expires_at=? "
+            "WHERE id=? AND lease_owner=? AND status='running' "
+            "AND cancel_requested_at IS NULL",
+            (now, expires, job_id, lease_owner),
+        ).rowcount
+        conn.commit()
+    return changed > 0
+
+
+def release_scoring_lease(
+    db_path: Path, job_id: str, *, lease_owner: str | None = None
+) -> bool:
+    """Return a non-cancelled running job back to queued and clear its lease."""
+    with _open_sync(db_path, immediate=True) as conn:
+        if lease_owner is not None:
+            changed = conn.execute(
+                "UPDATE scoring_jobs SET status='queued',started_at=NULL,"
+                "lease_owner=NULL,lease_expires_at=NULL "
+                "WHERE id=? AND lease_owner=? AND status='running' "
+                "AND cancel_requested_at IS NULL",
+                (job_id, lease_owner),
+            ).rowcount
+        else:
+            changed = conn.execute(
+                "UPDATE scoring_jobs SET status='queued',started_at=NULL,"
+                "lease_owner=NULL,lease_expires_at=NULL "
+                "WHERE id=? AND status='running' AND cancel_requested_at IS NULL",
+                (job_id,),
+            ).rowcount
+        if changed:
+            conn.execute(
+                "UPDATE attempts SET scoring_status='queued' "
+                "WHERE id=(SELECT attempt_id FROM scoring_jobs WHERE id=?) "
+                "AND scoring_status='running'",
+                (job_id,),
+            )
+        conn.commit()
+    return changed > 0
+
+
+def reclaim_expired_scoring_leases(db_path: Path) -> int:
+    """Reset expired running leases back to queued so another worker can take over."""
+    now = _now_iso()
+    with _open_sync(db_path, immediate=True) as conn:
+        rows = conn.execute(
+            "SELECT id, attempt_id FROM scoring_jobs "
+            "WHERE status='running' AND cancel_requested_at IS NULL "
+            "AND lease_expires_at IS NOT NULL AND lease_expires_at < ?",
+            (now,),
+        ).fetchall()
+        if not rows:
+            conn.commit()
+            return 0
+        job_ids = [str(r[0]) for r in rows]
+        attempt_ids = [str(r[1]) for r in rows if r[1]]
+        job_marks = ",".join("?" for _ in job_ids)
+        conn.execute(
+            f"UPDATE scoring_jobs SET status='queued',started_at=NULL,"
+            f"lease_owner=NULL,lease_expires_at=NULL WHERE id IN ({job_marks})",
+            tuple(job_ids),
+        )
+        if attempt_ids:
+            att_marks = ",".join("?" for _ in attempt_ids)
+            conn.execute(
+                f"UPDATE attempts SET scoring_status='queued',status='scoring' "
+                f"WHERE id IN ({att_marks}) AND scoring_status='running'",
+                tuple(attempt_ids),
+            )
+        conn.commit()
+    return len(job_ids)
+
+
+def claim_next_scoring_job(
+    db_path: Path,
+    *,
+    lease_owner: str,
+    lease_seconds: int,
+    deadline_seconds: int = 0,
+) -> sqlite3.Row | None:
+    """Atomically claim the oldest queued or expired-lease scoring job."""
+    now = _now_iso()
+    ttl = max(1, int(lease_seconds))
+    lease_expires_at = _iso_after(now, ttl)
+    deadline = _iso_after(now, deadline_seconds) if deadline_seconds > 0 else None
+    run_id: str | None = None
+    row: sqlite3.Row | None = None
+    with _open_sync(db_path, immediate=True) as conn:
+        conn.row_factory = sqlite3.Row
+        candidate = conn.execute(
+            "SELECT id FROM scoring_jobs "
+            "WHERE cancel_requested_at IS NULL "
+            "AND (status='queued' OR (status='running' AND lease_expires_at IS NOT NULL "
+            "AND lease_expires_at < ?)) "
+            "ORDER BY created_at ASC, id ASC LIMIT 1",
+            (now,),
+        ).fetchone()
+        if candidate is None:
+            conn.commit()
+            return None
+        job_id = str(candidate["id"])
+        changed = conn.execute(
+            "UPDATE scoring_jobs SET status='running',lease_owner=?,lease_expires_at=?,"
+            "heartbeat_at=?,started_at=COALESCE(started_at, ?),"
+            "deadline_at=COALESCE(deadline_at, ?),attempt_count=attempt_count+1 "
+            "WHERE id=? AND cancel_requested_at IS NULL "
+            "AND (status='queued' OR (status='running' AND lease_expires_at IS NOT NULL "
+            "AND lease_expires_at < ?))",
+            (lease_owner, lease_expires_at, now, now, deadline, job_id, now),
+        ).rowcount
+        if not changed:
+            conn.commit()
+            return None
+        row = conn.execute("SELECT * FROM scoring_jobs WHERE id=?", (job_id,)).fetchone()
+        if row is None:
+            conn.commit()
+            return None
+        conn.execute(
+            "UPDATE attempts SET scoring_status='running',scoring_started_at=?,"
+            "scoring_deadline_at=?,status='scoring' WHERE id=?",
+            (row["started_at"], row["deadline_at"], row["attempt_id"]),
+        )
+        run_row = conn.execute(
+            "SELECT run_id FROM attempts WHERE id=?", (row["attempt_id"],)
+        ).fetchone()
+        if run_row and run_row[0]:
+            run_id = str(run_row[0])
+        conn.commit()
+    if run_id:
+        runtime_state.notify_run_update(run_id)
+    return row
 
 
 def _invoke_scorer_cancel_hook(state: Any, attempt_id: str) -> None:
@@ -517,8 +697,8 @@ def _finish_failure(
         except (TypeError, ValueError):
             prev_score_total = None
         conn.execute(
-            "UPDATE scoring_jobs SET status=?,ended_at=?,error_code=?,error_message=? "
-            "WHERE id=?",
+            "UPDATE scoring_jobs SET status=?,ended_at=?,error_code=?,error_message=?,"
+            "lease_expires_at=NULL WHERE id=?",
             (status, now, code, message, job_id),
         )
         conn.execute(
@@ -535,6 +715,457 @@ def _finish_failure(
         runtime_state.notify_run_update(run_id)
 
 
+class _NeverEvalsJudgeError(Exception):
+    """Sentinel when evals scorer is not active for this job."""
+
+
+async def execute_claimed_job(
+    job: sqlite3.Row,
+    *,
+    deadline_seconds: int | None = None,
+    lease_owner: str | None = None,
+    lease_seconds: int | None = None,
+) -> None:
+    """Execute an already-claimed scoring job with lease heartbeat renewal."""
+    state = runtime_state.get()
+    job_id = str(job["id"])
+    attempt_id = str(job["attempt_id"])
+    if deadline_seconds is None:
+        settings = getattr(state, "settings", None)
+        deadline_seconds = int(
+            getattr(getattr(settings, "octagon", None), "scoring_deadline_seconds", 0)
+            or 0
+        )
+    row_owner = (
+        str(job["lease_owner"])
+        if "lease_owner" in job.keys() and job["lease_owner"]
+        else None
+    )
+    effective_lease_owner = lease_owner or row_owner
+    effective_lease_seconds = (
+        max(1, int(lease_seconds))
+        if lease_seconds is not None
+        else _default_lease_seconds()
+    )
+    current_task = asyncio.current_task()
+    if current_task is not None:
+        if state.loop is None:
+            state.loop = asyncio.get_running_loop()
+        state.scoring_tasks[attempt_id] = current_task
+
+    heartbeat_stop = asyncio.Event()
+    heartbeat_interval = max(1.0, float(effective_lease_seconds) / 3.0)
+
+    async def _heartbeat_loop() -> None:
+        assert effective_lease_owner is not None
+        while not heartbeat_stop.is_set():
+            try:
+                await asyncio.wait_for(
+                    heartbeat_stop.wait(), timeout=heartbeat_interval
+                )
+                break
+            except (asyncio.TimeoutError, TimeoutError):
+                pass
+            try:
+                renewed = await asyncio.to_thread(
+                    renew_scoring_lease,
+                    state.db_path,
+                    job_id,
+                    lease_owner=effective_lease_owner,
+                    lease_seconds=effective_lease_seconds,
+                )
+                if not renewed:
+                    break
+            except Exception:
+                logger.debug(
+                    "scoring lease heartbeat failed job=%s", job_id, exc_info=True
+                )
+
+    heartbeat_task: asyncio.Task[None] | None = None
+    if effective_lease_owner:
+        heartbeat_task = asyncio.create_task(
+            _heartbeat_loop(), name=f"scoring-heartbeat:{job_id}"
+        )
+
+    # 硬上限从**获得评分槽**起算：排队不消耗评分预算，与
+    # 「排队不消耗耐心」同理。
+    scoring_started = time.monotonic()
+
+    def _remaining() -> float | None:
+        if not deadline_seconds or deadline_seconds <= 0:
+            return None
+        return max(0.0, deadline_seconds - (time.monotonic() - scoring_started))
+
+    evals_judge_error_cls: type[Exception] = _NeverEvalsJudgeError
+    try:
+        if _job_cancelled(state.db_path, job_id):
+            _finish_failure(
+                state.db_path,
+                job_id,
+                status="cancelled",
+                code="scoring_cancelled",
+                message="用户手动停止评分",
+            )
+            return
+        # crash 重跑幂等：commit 已写过 outbox（进程在标记 completed 前崩溃）
+        # → 直接标记完成，不重复跑 judge（审查 #3）。
+        if _job_already_committed(state.db_path, job_id):
+            logger.info(
+                "scoring job already committed, skipping re-run job=%s", job_id
+            )
+            now = _now_iso()
+            with _open_sync(state.db_path) as conn:
+                conn.execute(
+                    "UPDATE scoring_jobs SET status='completed',ended_at=?,"
+                    "heartbeat_at=?,lease_expires_at=NULL WHERE id=?",
+                    (now, now, job_id),
+                )
+                conn.commit()
+            from .run_dispatch import _refresh_run_status
+
+            _refresh_run_status(state.db_path, attempt_id)
+            return
+        with _open_sync(state.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            attempt = conn.execute(
+                "SELECT * FROM attempts WHERE id=?", (attempt_id,)
+            ).fetchone()
+            task = conn.execute(
+                "SELECT * FROM tasks WHERE id=(SELECT task_id FROM attempts WHERE id=?)",
+                (attempt_id,),
+            ).fetchone()
+        if attempt is None or task is None:
+            raise RuntimeError("attempt or task missing")
+        env = state.envs.get(attempt["env_name"])
+        if env is None:
+            raise RuntimeError(f"env not loaded: {attempt['env_name']}")
+        from .input_snapshots import resolve_attempt_input
+        from .run_dispatch import _resolve_scorer, _refresh_run_status
+        from .runner import _row_to_task_dict, _write_security_columns_sync
+        from .evaluator import (
+            ScorerUnavailableError,
+            evaluate,
+            judge_infrastructure_error,
+        )
+        scorer = _resolve_scorer(env)
+        # settings.judge.backend="evals"：judge 环节换成 octagon-evals 的
+        # /evaluate。dimensions 从 env meta.yaml 打包（维度 ID=维度名，
+        # 与内置 scorer 的输出形状一致），commit/outbox/leader 全链路复用。
+        judge_cfg = getattr(getattr(state, "settings", None), "judge", None)
+        eval_plan = (getattr(env, "meta", None) or {}).get("eval", {})
+        local_scorer = isinstance(eval_plan, dict) and eval_plan.get("backend") == "local"
+        use_evals = judge_cfg is not None and judge_cfg.backend == "evals" and not local_scorer
+        if use_evals:
+            from .evals_scorer import EvalsJudgeError
+
+            evals_judge_error_cls = EvalsJudgeError
+        if scorer is None and not use_evals:
+            raise ScorerUnavailableError(f"env {attempt['env_name']} missing scorer")
+        frozen_input = resolve_attempt_input(
+            data_path=state.data_path,
+            db_path=state.db_path,
+            attempt_id=attempt_id,
+        )
+        config = json.loads(job["scorer_config_json"] or "{}")
+        snapshot_ref = str(config.get("snapshot_ref") or "")
+        input_hash = str(job["input_hash"] or "")
+        if not snapshot_ref or not input_hash:
+            raise ScoringInputMismatchError("scoring job has no frozen input")
+        scoring_data_path = await asyncio.to_thread(
+            materialize_scoring_input,
+            data_path=state.data_path,
+            snapshot_ref=snapshot_ref,
+            attempt_id=attempt_id,
+            expected_hash=input_hash,
+            job_id=job_id,
+        )
+        if use_evals:
+            # **必须在物化之后构造**：被评的交付物在冻结快照里，不在实时
+            # attempt 目录。内置 scorer 由 evaluate(data_path=
+            # scoring_data_path) 天然拿到快照；evals 适配器是把路径交给
+            # 跨进程 judge 自取，所以要显式把 input_path 传进去。指向实时
+            # 目录的后果不是报错——judge 找不到交付物会开始满盘搜索，最后
+            # 判「无法核验」给 0 分（2026-09-24 实测）。
+            from .evals_scorer import make_evals_scorer
+
+            scorer = make_evals_scorer(
+                env=env,
+                base_url=judge_cfg.evals_base_url,
+                timeout=judge_cfg.evals_timeout,
+                data_path=state.data_path,
+                input_path=scoring_data_path,
+                job_id=job_id,
+                method_override=judge_cfg.evals_method_override or None,
+            )
+        # judge 成本：本 run 的评分共用一把 judge key，与 agent
+        # 执行隔离——ppt-visual-repair 那类多模态 judge 可能与执行同量级，
+        # 混进 agent 的账会污染性价比横向比较。
+        #
+        # **这里是真实评分入口**：scoring queue 直接调 evaluate()，
+        # 不经过 runner.py，所以凭据必须在这条路径上注入。
+        judge_run_id = _run_id_of_attempt(state.db_path, attempt_id)
+        await _open_judge_key(state, judge_run_id)
+        with judge_credentials_active(judge_run_id) as _judge_used_run_key:
+            if not _judge_used_run_key:
+                # judge 走了自己的配置（Blade judge、非 OpenRouter provider
+                # 或凭据缺失）——那笔花费不在 run key 上，账不可审计。
+                _mark_judge_unaudited(state.db_path, judge_run_id)
+            # 硬上限：到点即放弃等待并记 timed_out。evaluate 跑在
+            # 工作线程里、无法被真正打断，但**不能因此让评分无限期占着
+            # 槽位并把 attempt 永远挂在 scoring 上**——那正是周末现场的
+            # 现象。这里先释放调度侧，再调 scorer 的取消钩子请求它收手。
+            _evaluate = asyncio.to_thread(
+                evaluate,
+                attempt_id=attempt_id,
+                task=_row_to_task_dict(dict(task), frozen_input=frozen_input),
+                env=env,
+                data_path=scoring_data_path,
+                scorer=scorer,
+                security_meta=config.get("security_meta") or {},
+            )
+            budget = _remaining()
+            if budget is None:
+                outcome = await _evaluate
+            else:
+                try:
+                    outcome = await asyncio.wait_for(_evaluate, timeout=budget)
+                except (asyncio.TimeoutError, TimeoutError) as exc:
+                    raise ScoringDeadlineExceeded(
+                        f"评分超过 {deadline_seconds}s 硬上限"
+                    ) from exc
+        if _job_cancelled(state.db_path, job_id):
+            _finish_failure(
+                state.db_path,
+                job_id,
+                status="cancelled",
+                code="scoring_cancelled",
+                message="用户手动停止评分",
+            )
+            return
+        # Revalidate the immutable source immediately before the score commit.
+        # A mismatch invalidates the result even if the scorer itself succeeded.
+        await asyncio.to_thread(
+            verify_scoring_snapshot,
+            data_path=state.data_path,
+            snapshot_ref=snapshot_ref,
+            attempt_id=attempt_id,
+            expected_hash=input_hash,
+        )
+        await asyncio.to_thread(
+            _write_security_columns_sync,
+            state.db_path,
+            attempt_id,
+            config.get("security_meta") or {},
+            outcome.security,
+        )
+        # judge 自身没跑起来时，env scorer 仍会返回一行 value=0 的维度。
+        # 照单收下就等于把一次判分设施故障写成「agent 得了 0 分」——
+        # 2026-09-18 横评里 109 个 attempt 正是这样被记成
+        # score=0 / failure_kind=NULL，跨全部 7 个 agent。
+        # 走既有的 scoring 失败路径：score_total 保持 NULL（绝不写业务
+        # 0 分），failure_kind='scoring'，顶层 status 保留执行结论。
+        judge_error = judge_infrastructure_error(outcome.scores)
+        if judge_error is not None:
+            logger.error(
+                "attempt %s 判分设施未就绪，不记 0 分：%s", attempt_id, judge_error
+            )
+            await asyncio.to_thread(
+                _finish_failure,
+                state.db_path,
+                job_id,
+                status="scoring_failed",
+                code="judge_unavailable",
+                message=judge_error[:500],
+            )
+            return
+
+        from .experiments.scoring import commit_scoring_result
+
+        final_status = "completed" if outcome.passed else "gave_up"
+        await asyncio.to_thread(
+            commit_scoring_result,
+            db_path=state.db_path,
+            data_path=state.data_path,
+            attempt_id=attempt_id,
+            scores=outcome.scores,
+            manifest=outcome.evaluation_manifest,
+            status=final_status,
+            score_total=outcome.score_total,
+            ended_at=_now_iso(),
+            external_refs={
+                "scoring_input_hash": input_hash,
+                "scoring_snapshot_ref": snapshot_ref,
+            },
+            event_count=int(attempt["event_count"]),
+            last_event_at=attempt["last_event_at"],
+            thinking_count=int(attempt["thinking_count"]),
+            tool_call_count=int(attempt["tool_call_count"]),
+            token_usage=json.loads(attempt["token_usage_json"] or "{}"),
+            cost_estimate=attempt["cost_estimate"],
+            duration_ms=int(attempt["duration_ms"]),
+            transport_status=attempt["transport_status"],
+            model=attempt["model"],
+            scoring_job_id=job_id,
+        )
+        # 数据治理锚(评分阶段补全):judge 锚 + manifest_ref + cli 版本,
+        # 置 provenance_complete=1。best-effort,失败不影响评分落库。
+        try:
+            from .provenance import finalize_attempt_provenance
+
+            await asyncio.to_thread(
+                finalize_attempt_provenance,
+                state.db_path,
+                attempt_id=attempt_id,
+                data_path=state.data_path,
+                job_id=job_id,
+            )
+        except Exception as exc:  # noqa: BLE001 —— 治理锚缺失不阻塞评分
+            logger.warning(
+                "attempt_provenance 评分阶段更新失败(不影响评分) attempt=%s: %s",
+                attempt_id,
+                exc,
+            )
+        # Collect derived Product Judge evidence only after the immutable
+        # snapshot was revalidated and the official score transaction committed.
+        try:
+            from .rubric_evolution.collector import record_evaluation_outcome_sync
+
+            await asyncio.to_thread(
+                record_evaluation_outcome_sync,
+                db_path=state.db_path,
+                attempt_id=attempt_id,
+                scores=outcome.scores,
+                evaluation_manifest=outcome.evaluation_manifest,
+                metadata={"source": "scoring_queue", "scoring_job_id": job_id},
+            )
+        except Exception:
+            logger.exception(
+                "rubric judge record collection failed after score commit attempt=%s",
+                attempt_id,
+            )
+        now = _now_iso()
+        with _open_sync(state.db_path) as conn:
+            conn.execute(
+                "UPDATE scoring_jobs SET status='completed',ended_at=?,heartbeat_at=?,"
+                "lease_expires_at=NULL WHERE id=?",
+                (now, now, job_id),
+            )
+            conn.execute(
+                "UPDATE attempts SET scoring_status='completed',scoring_ended_at=?,"
+                "scoring_error_code=NULL,scoring_error_message=NULL WHERE id=?",
+                (now, attempt_id),
+            )
+            conn.commit()
+        try:
+            from .experiments.leader import consume_score_outbox
+
+            await asyncio.to_thread(consume_score_outbox, state.db_path)
+        except Exception:
+            logger.exception("leader outbox notification failed attempt=%s", attempt_id)
+        _refresh_run_status(state.db_path, attempt_id)
+        if judge_run_id:
+            runtime_state.notify_run_update(judge_run_id)
+    except asyncio.CancelledError:
+        _invoke_scorer_cancel_hook(state, attempt_id)
+        if _job_cancelled(state.db_path, job_id):
+            _finish_failure(
+                state.db_path,
+                job_id,
+                status="cancelled",
+                code="scoring_cancelled",
+                message="用户手动停止评分",
+            )
+        else:
+            # Shutdown recovery will requeue this durable job on next startup.
+            release_scoring_lease(
+                state.db_path, job_id, lease_owner=effective_lease_owner
+            )
+        raise
+    except ScoringInputMismatchError as exc:
+        logger.error(
+            "scoring input mismatch job=%s attempt=%s: %s",
+            job_id,
+            attempt_id,
+            exc,
+        )
+        _finish_failure(
+            state.db_path,
+            job_id,
+            status="failed",
+            code="scoring_input_mismatch",
+            message=str(exc),
+        )
+        from .run_dispatch import _refresh_run_status
+
+        _refresh_run_status(state.db_path, attempt_id)
+    except ScoringDeadlineExceeded as exc:
+        # 评分太慢 ≠ 评分设施坏了：记 timed_out，不是
+        # failed+scorer_unavailable。执行状态与已回收产物完全不受影响，
+        # score_total 保持 NULL——不得填业务 0 分。
+        logger.error(
+            "scoring deadline exceeded job=%s attempt=%s: %s",
+            job_id, attempt_id, exc,
+        )
+        _finish_failure(
+            state.db_path,
+            job_id,
+            status="timed_out",
+            code="scoring_deadline_exceeded",
+            message=str(exc),
+        )
+        # 请求 scorer 收手，避免 judge 子进程在后台继续跑。
+        _invoke_scorer_cancel_hook(state, attempt_id)
+        from .run_dispatch import _refresh_run_status
+
+        _refresh_run_status(state.db_path, attempt_id)
+    except evals_judge_error_cls as exc:
+        # 外部 evals judge 环节失败（服务不可达/响应非法）：记
+        # scoring_failed + judge_unavailable，score_total 保持 NULL——
+        # 与 judge_infrastructure_error 同一语义，不落业务 0 分。
+        logger.error(
+            "evals judge failed job=%s attempt=%s: %s", job_id, attempt_id, exc
+        )
+        _finish_failure(
+            state.db_path,
+            job_id,
+            status="scoring_failed",
+            code="judge_unavailable",
+            message=str(exc)[:500],
+        )
+        from .run_dispatch import _refresh_run_status
+
+        _refresh_run_status(state.db_path, attempt_id)
+    except Exception as exc:
+        logger.exception("scoring job failed job=%s attempt=%s", job_id, attempt_id)
+        _finish_failure(
+            state.db_path,
+            job_id,
+            status="failed",
+            code=(
+                "scorer_unavailable"
+                if exc.__class__.__name__ == "ScorerUnavailableError"
+                else "scorer_exception"
+            ),
+            message=str(exc),
+        )
+        from .run_dispatch import _refresh_run_status
+
+        _refresh_run_status(state.db_path, attempt_id)
+    finally:
+        heartbeat_stop.set()
+        if heartbeat_task is not None:
+            heartbeat_task.cancel()
+            try:
+                await heartbeat_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        if (
+            current_task is not None
+            and state.scoring_tasks.get(attempt_id) is current_task
+        ):
+            state.scoring_tasks.pop(attempt_id, None)
+
+
 async def _execute_job(
     job_id: str, *, capacity: int, deadline_seconds: int | None = None
 ) -> None:
@@ -545,392 +1176,53 @@ async def _execute_job(
             getattr(getattr(settings, "octagon", None), "scoring_deadline_seconds", 0)
             or 0
         )
+    lease_owner = _default_lease_owner()
+    lease_seconds = _default_lease_seconds()
     async with _scoring_semaphore(capacity):
         job = await asyncio.to_thread(
-            _claim_job, state.db_path, job_id, deadline_seconds=deadline_seconds
+            _claim_job,
+            state.db_path,
+            job_id,
+            deadline_seconds=deadline_seconds,
+            lease_owner=lease_owner,
+            lease_seconds=lease_seconds,
         )
         if job is None:
             return
-        attempt_id = str(job["attempt_id"])
-        current_task = asyncio.current_task()
-        if current_task is not None:
-            if state.loop is None:
-                state.loop = asyncio.get_running_loop()
-            state.scoring_tasks[attempt_id] = current_task
-        # 硬上限从**获得评分槽**起算：排队不消耗评分预算，与
-        # 「排队不消耗耐心」同理。
-        scoring_started = time.monotonic()
+        await execute_claimed_job(
+            job,
+            deadline_seconds=deadline_seconds,
+            lease_owner=lease_owner,
+            lease_seconds=lease_seconds,
+        )
 
-        def _remaining() -> float | None:
-            if not deadline_seconds or deadline_seconds <= 0:
-                return None
-            return max(0.0, deadline_seconds - (time.monotonic() - scoring_started))
-        try:
-            if _job_cancelled(state.db_path, job_id):
-                _finish_failure(
-                    state.db_path,
-                    job_id,
-                    status="cancelled",
-                    code="scoring_cancelled",
-                    message="用户手动停止评分",
-                )
-                return
-            # crash 重跑幂等：commit 已写过 outbox（进程在标记 completed 前崩溃）
-            # → 直接标记完成，不重复跑 judge（审查 #3）。
-            if _job_already_committed(state.db_path, job_id):
-                logger.info(
-                    "scoring job already committed, skipping re-run job=%s", job_id
-                )
-                with _open_sync(state.db_path) as conn:
-                    conn.execute(
-                        "UPDATE scoring_jobs SET status='completed',ended_at=?,"
-                        "heartbeat_at=? WHERE id=?",
-                        (_now_iso(), _now_iso(), job_id),
-                    )
-                    conn.commit()
-                from .run_dispatch import _refresh_run_status
 
-                _refresh_run_status(state.db_path, attempt_id)
-                return
-            with _open_sync(state.db_path) as conn:
-                conn.row_factory = sqlite3.Row
-                attempt = conn.execute(
-                    "SELECT * FROM attempts WHERE id=?", (attempt_id,)
-                ).fetchone()
-                task = conn.execute(
-                    "SELECT * FROM tasks WHERE id=(SELECT task_id FROM attempts WHERE id=?)",
-                    (attempt_id,),
-                ).fetchone()
-            if attempt is None or task is None:
-                raise RuntimeError("attempt or task missing")
-            env = state.envs.get(attempt["env_name"])
-            if env is None:
-                raise RuntimeError(f"env not loaded: {attempt['env_name']}")
-            from .input_snapshots import resolve_attempt_input
-            from .run_dispatch import _resolve_scorer, _refresh_run_status
-            from .runner import _row_to_task_dict, _write_security_columns_sync
-            from .evaluator import (
-                ScorerUnavailableError,
-                evaluate,
-                judge_infrastructure_error,
-            )
-            scorer = _resolve_scorer(env)
-            # settings.judge.backend="evals"：judge 环节换成 octagon-evals 的
-            # /evaluate。dimensions 从 env meta.yaml 打包（维度 ID=维度名，
-            # 与内置 scorer 的输出形状一致），commit/outbox/leader 全链路复用。
-            judge_cfg = getattr(getattr(state, "settings", None), "judge", None)
-            eval_plan = (getattr(env, "meta", None) or {}).get("eval", {})
-            local_scorer = isinstance(eval_plan, dict) and eval_plan.get("backend") == "local"
-            use_evals = judge_cfg is not None and judge_cfg.backend == "evals" and not local_scorer
-            if use_evals:
-                from .evals_scorer import EvalsJudgeError
-            if scorer is None and not use_evals:
-                raise ScorerUnavailableError(f"env {attempt['env_name']} missing scorer")
-            frozen_input = resolve_attempt_input(
-                data_path=state.data_path,
-                db_path=state.db_path,
-                attempt_id=attempt_id,
-            )
-            config = json.loads(job["scorer_config_json"] or "{}")
-            snapshot_ref = str(config.get("snapshot_ref") or "")
-            input_hash = str(job["input_hash"] or "")
-            if not snapshot_ref or not input_hash:
-                raise ScoringInputMismatchError("scoring job has no frozen input")
-            scoring_data_path = await asyncio.to_thread(
-                materialize_scoring_input,
-                data_path=state.data_path,
-                snapshot_ref=snapshot_ref,
-                attempt_id=attempt_id,
-                expected_hash=input_hash,
-                job_id=job_id,
-            )
-            if use_evals:
-                # **必须在物化之后构造**：被评的交付物在冻结快照里，不在实时
-                # attempt 目录。内置 scorer 由 evaluate(data_path=
-                # scoring_data_path) 天然拿到快照；evals 适配器是把路径交给
-                # 跨进程 judge 自取，所以要显式把 input_path 传进去。指向实时
-                # 目录的后果不是报错——judge 找不到交付物会开始满盘搜索，最后
-                # 判「无法核验」给 0 分（2026-09-24 实测）。
-                from .evals_scorer import make_evals_scorer
+async def _execute_job_subprocess(
+    job_id: str, *, capacity: int, deadline_seconds: int | None = None
+) -> None:
+    state = runtime_state.get()
+    if deadline_seconds is None:
+        settings = getattr(state, "settings", None)
+        deadline_seconds = int(
+            getattr(getattr(settings, "octagon", None), "scoring_deadline_seconds", 0)
+            or 0
+        )
+    lease_owner = f"subprocess-parent:{os.getpid()}:{uuid.uuid4().hex[:8]}"
+    lease_seconds = _default_lease_seconds()
+    envs_path = getattr(getattr(state.settings, "octagon", None), "envs_path", None)
+    async with _scoring_semaphore(capacity):
+        from .workers.scoring_worker import run_job_in_subprocess
 
-                scorer = make_evals_scorer(
-                    env=env,
-                    base_url=judge_cfg.evals_base_url,
-                    timeout=judge_cfg.evals_timeout,
-                    data_path=state.data_path,
-                    input_path=scoring_data_path,
-                    job_id=job_id,
-                    method_override=judge_cfg.evals_method_override or None,
-                )
-            # judge 成本：本 run 的评分共用一把 judge key，与 agent
-            # 执行隔离——ppt-visual-repair 那类多模态 judge 可能与执行同量级，
-            # 混进 agent 的账会污染性价比横向比较。
-            #
-            # **这里是真实评分入口**：scoring queue 直接调 evaluate()，
-            # 不经过 runner.py，所以凭据必须在这条路径上注入。
-            judge_run_id = _run_id_of_attempt(state.db_path, attempt_id)
-            await _open_judge_key(state, judge_run_id)
-            with judge_credentials_active(judge_run_id) as _judge_used_run_key:
-                if not _judge_used_run_key:
-                    # judge 走了自己的配置（Blade judge、非 OpenRouter provider
-                    # 或凭据缺失）——那笔花费不在 run key 上，账不可审计。
-                    _mark_judge_unaudited(state.db_path, judge_run_id)
-                # 硬上限：到点即放弃等待并记 timed_out。evaluate 跑在
-                # 工作线程里、无法被真正打断，但**不能因此让评分无限期占着
-                # 槽位并把 attempt 永远挂在 scoring 上**——那正是周末现场的
-                # 现象。这里先释放调度侧，再调 scorer 的取消钩子请求它收手。
-                _evaluate = asyncio.to_thread(
-                    evaluate,
-                    attempt_id=attempt_id,
-                    task=_row_to_task_dict(dict(task), frozen_input=frozen_input),
-                    env=env,
-                    data_path=scoring_data_path,
-                    scorer=scorer,
-                    security_meta=config.get("security_meta") or {},
-                )
-                budget = _remaining()
-                if budget is None:
-                    outcome = await _evaluate
-                else:
-                    try:
-                        outcome = await asyncio.wait_for(_evaluate, timeout=budget)
-                    except (asyncio.TimeoutError, TimeoutError) as exc:
-                        raise ScoringDeadlineExceeded(
-                            f"评分超过 {deadline_seconds}s 硬上限"
-                        ) from exc
-            if _job_cancelled(state.db_path, job_id):
-                _finish_failure(
-                    state.db_path,
-                    job_id,
-                    status="cancelled",
-                    code="scoring_cancelled",
-                    message="用户手动停止评分",
-                )
-                return
-            # Revalidate the immutable source immediately before the score commit.
-            # A mismatch invalidates the result even if the scorer itself succeeded.
-            await asyncio.to_thread(
-                verify_scoring_snapshot,
-                data_path=state.data_path,
-                snapshot_ref=snapshot_ref,
-                attempt_id=attempt_id,
-                expected_hash=input_hash,
-            )
-            await asyncio.to_thread(
-                _write_security_columns_sync,
-                state.db_path,
-                attempt_id,
-                config.get("security_meta") or {},
-                outcome.security,
-            )
-            # judge 自身没跑起来时，env scorer 仍会返回一行 value=0 的维度。
-            # 照单收下就等于把一次判分设施故障写成「agent 得了 0 分」——
-            # 2026-09-18 横评里 109 个 attempt 正是这样被记成
-            # score=0 / failure_kind=NULL，跨全部 7 个 agent。
-            # 走既有的 scoring 失败路径：score_total 保持 NULL（绝不写业务
-            # 0 分），failure_kind='scoring'，顶层 status 保留执行结论。
-            judge_error = judge_infrastructure_error(outcome.scores)
-            if judge_error is not None:
-                logger.error(
-                    "attempt %s 判分设施未就绪，不记 0 分：%s", attempt_id, judge_error
-                )
-                await asyncio.to_thread(
-                    _finish_failure,
-                    state.db_path,
-                    job_id,
-                    status="scoring_failed",
-                    code="judge_unavailable",
-                    message=judge_error[:500],
-                )
-                return
-
-            from .experiments.scoring import commit_scoring_result
-
-            final_status = "completed" if outcome.passed else "gave_up"
-            await asyncio.to_thread(
-                commit_scoring_result,
-                db_path=state.db_path,
-                data_path=state.data_path,
-                attempt_id=attempt_id,
-                scores=outcome.scores,
-                manifest=outcome.evaluation_manifest,
-                status=final_status,
-                score_total=outcome.score_total,
-                ended_at=_now_iso(),
-                external_refs={
-                    "scoring_input_hash": input_hash,
-                    "scoring_snapshot_ref": snapshot_ref,
-                },
-                event_count=int(attempt["event_count"]),
-                last_event_at=attempt["last_event_at"],
-                thinking_count=int(attempt["thinking_count"]),
-                tool_call_count=int(attempt["tool_call_count"]),
-                token_usage=json.loads(attempt["token_usage_json"] or "{}"),
-                cost_estimate=attempt["cost_estimate"],
-                duration_ms=int(attempt["duration_ms"]),
-                transport_status=attempt["transport_status"],
-                model=attempt["model"],
-                scoring_job_id=job_id,
-            )
-            # 数据治理锚(评分阶段补全):judge 锚 + manifest_ref + cli 版本,
-            # 置 provenance_complete=1。best-effort,失败不影响评分落库。
-            try:
-                from .provenance import finalize_attempt_provenance
-
-                await asyncio.to_thread(
-                    finalize_attempt_provenance,
-                    state.db_path,
-                    attempt_id=attempt_id,
-                    data_path=state.data_path,
-                    job_id=job_id,
-                )
-            except Exception as exc:  # noqa: BLE001 —— 治理锚缺失不阻塞评分
-                logger.warning(
-                    "attempt_provenance 评分阶段更新失败(不影响评分) attempt=%s: %s",
-                    attempt_id,
-                    exc,
-                )
-            # Collect derived Product Judge evidence only after the immutable
-            # snapshot was revalidated and the official score transaction committed.
-            try:
-                from .rubric_evolution.collector import record_evaluation_outcome_sync
-
-                await asyncio.to_thread(
-                    record_evaluation_outcome_sync,
-                    db_path=state.db_path,
-                    attempt_id=attempt_id,
-                    scores=outcome.scores,
-                    evaluation_manifest=outcome.evaluation_manifest,
-                    metadata={"source": "scoring_queue", "scoring_job_id": job_id},
-                )
-            except Exception:
-                logger.exception(
-                    "rubric judge record collection failed after score commit attempt=%s",
-                    attempt_id,
-                )
-            now = _now_iso()
-            with _open_sync(state.db_path) as conn:
-                conn.execute(
-                    "UPDATE scoring_jobs SET status='completed',ended_at=?,heartbeat_at=? "
-                    "WHERE id=?",
-                    (now, now, job_id),
-                )
-                conn.execute(
-                    "UPDATE attempts SET scoring_status='completed',scoring_ended_at=?,"
-                    "scoring_error_code=NULL,scoring_error_message=NULL WHERE id=?",
-                    (now, attempt_id),
-                )
-                conn.commit()
-            try:
-                from .experiments.leader import consume_score_outbox
-
-                await asyncio.to_thread(consume_score_outbox, state.db_path)
-            except Exception:
-                logger.exception("leader outbox notification failed attempt=%s", attempt_id)
-            _refresh_run_status(state.db_path, attempt_id)
-            if judge_run_id:
-                runtime_state.notify_run_update(judge_run_id)
-        except asyncio.CancelledError:
-            _invoke_scorer_cancel_hook(state, attempt_id)
-            if _job_cancelled(state.db_path, job_id):
-                _finish_failure(
-                    state.db_path,
-                    job_id,
-                    status="cancelled",
-                    code="scoring_cancelled",
-                    message="用户手动停止评分",
-                )
-            else:
-                # Shutdown recovery will requeue this durable job on next startup.
-                with _open_sync(state.db_path) as conn:
-                    conn.execute(
-                        "UPDATE scoring_jobs SET status='queued',started_at=NULL "
-                        "WHERE id=? AND status='running'",
-                        (job_id,),
-                    )
-                    conn.execute(
-                        "UPDATE attempts SET scoring_status='queued' WHERE id=? "
-                        "AND scoring_status='running'",
-                        (attempt_id,),
-                    )
-                    conn.commit()
-            raise
-        except ScoringInputMismatchError as exc:
-            logger.error(
-                "scoring input mismatch job=%s attempt=%s: %s",
-                job_id,
-                attempt_id,
-                exc,
-            )
-            _finish_failure(
-                state.db_path,
-                job_id,
-                status="failed",
-                code="scoring_input_mismatch",
-                message=str(exc),
-            )
-            from .run_dispatch import _refresh_run_status
-
-            _refresh_run_status(state.db_path, attempt_id)
-        except ScoringDeadlineExceeded as exc:
-            # 评分太慢 ≠ 评分设施坏了：记 timed_out，不是
-            # failed+scorer_unavailable。执行状态与已回收产物完全不受影响，
-            # score_total 保持 NULL——不得填业务 0 分。
-            logger.error(
-                "scoring deadline exceeded job=%s attempt=%s: %s",
-                job_id, attempt_id, exc,
-            )
-            _finish_failure(
-                state.db_path,
-                job_id,
-                status="timed_out",
-                code="scoring_deadline_exceeded",
-                message=str(exc),
-            )
-            # 请求 scorer 收手，避免 judge 子进程在后台继续跑。
-            _invoke_scorer_cancel_hook(state, attempt_id)
-            from .run_dispatch import _refresh_run_status
-
-            _refresh_run_status(state.db_path, attempt_id)
-        except EvalsJudgeError as exc:
-            # 外部 evals judge 环节失败（服务不可达/响应非法）：记
-            # scoring_failed + judge_unavailable，score_total 保持 NULL——
-            # 与 judge_infrastructure_error 同一语义，不落业务 0 分。
-            logger.error(
-                "evals judge failed job=%s attempt=%s: %s", job_id, attempt_id, exc
-            )
-            _finish_failure(
-                state.db_path,
-                job_id,
-                status="scoring_failed",
-                code="judge_unavailable",
-                message=str(exc)[:500],
-            )
-            from .run_dispatch import _refresh_run_status
-
-            _refresh_run_status(state.db_path, attempt_id)
-        except Exception as exc:
-            logger.exception("scoring job failed job=%s attempt=%s", job_id, attempt_id)
-            _finish_failure(
-                state.db_path,
-                job_id,
-                status="failed",
-                code=(
-                    "scorer_unavailable"
-                    if exc.__class__.__name__ == "ScorerUnavailableError"
-                    else "scorer_exception"
-                ),
-                message=str(exc),
-            )
-            from .run_dispatch import _refresh_run_status
-
-            _refresh_run_status(state.db_path, attempt_id)
-        finally:
-            if (
-                current_task is not None
-                and state.scoring_tasks.get(attempt_id) is current_task
-            ):
-                state.scoring_tasks.pop(attempt_id, None)
+        await run_job_in_subprocess(
+            job_id,
+            db_path=state.db_path,
+            data_path=state.data_path,
+            envs_path=envs_path,
+            lease_owner=lease_owner,
+            lease_seconds=lease_seconds,
+            deadline_seconds=deadline_seconds,
+            already_claimed=False,
+        )
 
 
 def _attempt_id_of_job(db_path: Path, job_id: str) -> str | None:
@@ -948,6 +1240,10 @@ def schedule_scoring_job(
     job_id: str, *, capacity: int, attempt_id: str | None = None
 ) -> bool:
     state = runtime_state.get()
+    mode = _scoring_worker_mode(state)
+    if mode == "external":
+        # External scoring_worker daemon claims persisted jobs directly via SQLite leases.
+        return False
     resolved_attempt_id = attempt_id or _attempt_id_of_job(state.db_path, job_id)
     group = (
         f"scoring:{resolved_attempt_id}"
@@ -963,7 +1259,10 @@ def schedule_scoring_job(
 
     async def run() -> None:
         try:
-            await _execute_job(job_id, capacity=capacity)
+            if mode == "subprocess":
+                await _execute_job_subprocess(job_id, capacity=capacity)
+            else:
+                await _execute_job(job_id, capacity=capacity)
         finally:
             if (
                 resolved_attempt_id
@@ -985,15 +1284,36 @@ def schedule_scoring_job(
 
 def schedule_startup_scoring_recovery(*, capacity: int) -> int:
     state = runtime_state.get()
-    with _open_sync(state.db_path) as conn:
-        conn.execute(
-            "UPDATE scoring_jobs SET status='queued',started_at=NULL "
-            "WHERE status='running' AND cancel_requested_at IS NULL"
-        )
-        conn.execute(
-            "UPDATE attempts SET scoring_status='queued',status='scoring' "
-            "WHERE scoring_status='running'"
-        )
+    mode = _scoring_worker_mode(state)
+    if mode == "external":
+        reclaim_expired_scoring_leases(state.db_path)
+        return 0
+    now = _now_iso()
+    with _open_sync(state.db_path, immediate=True) as conn:
+        reclaim_rows = conn.execute(
+            "SELECT id, attempt_id FROM scoring_jobs "
+            "WHERE status='running' AND cancel_requested_at IS NULL "
+            "AND (lease_expires_at IS NULL OR lease_expires_at < ? "
+            "OR lease_owner IS NULL OR lease_owner LIKE 'in-process:%' "
+            "OR lease_owner LIKE 'subprocess-parent:%')",
+            (now,),
+        ).fetchall()
+        if reclaim_rows:
+            job_ids = [str(r[0]) for r in reclaim_rows]
+            attempt_ids = [str(r[1]) for r in reclaim_rows if r[1]]
+            job_marks = ",".join("?" for _ in job_ids)
+            conn.execute(
+                f"UPDATE scoring_jobs SET status='queued',started_at=NULL,"
+                f"lease_owner=NULL,lease_expires_at=NULL WHERE id IN ({job_marks})",
+                tuple(job_ids),
+            )
+            if attempt_ids:
+                att_marks = ",".join("?" for _ in attempt_ids)
+                conn.execute(
+                    f"UPDATE attempts SET scoring_status='queued',status='scoring' "
+                    f"WHERE id IN ({att_marks}) AND scoring_status='running'",
+                    tuple(attempt_ids),
+                )
         rows = conn.execute(
             "SELECT id, attempt_id FROM scoring_jobs WHERE status='queued' "
             "AND cancel_requested_at IS NULL ORDER BY created_at,id"

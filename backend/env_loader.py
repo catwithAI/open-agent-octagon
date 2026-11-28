@@ -18,12 +18,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import json
 import logging
 import re
 import shutil
 import sys
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -90,18 +92,260 @@ class Task:
 
 
 @dataclass
+class IsolatedRegisteredTool:
+    """Proxy for an ``@env_tool`` when ``env_isolation_mode == 'subprocess'``."""
+
+    name: str
+    description: str
+    parameters: dict[str, Any]
+    env_name: str
+    env_dir: Path
+    is_async: bool = False
+
+    @property
+    def parameters_schema(self) -> dict[str, Any]:
+        return self.parameters
+
+    @staticmethod
+    def _extract_data_path(ctx: Any) -> Path:
+        trace = getattr(ctx, "trace", None)
+        data_path = getattr(trace, "_data_path", None)
+        if data_path is not None:
+            return Path(data_path)
+        trace_path = getattr(trace, "path", None)
+        if trace_path is not None:
+            return Path(trace_path).parent.parent.parent
+        raise ValueError("EnvContext.trace missing data_path for isolated tool call")
+
+    def call(self, ctx: Any, **kwargs: Any) -> Any:
+        from .workers.env_worker import call_tool_in_subprocess
+
+        return call_tool_in_subprocess(
+            env_name=self.env_name,
+            env_dir=self.env_dir,
+            tool_name=self.name,
+            data_path=self._extract_data_path(ctx),
+            attempt_id=ctx.attempt_id,
+            env_session_id=ctx.env_session_id,
+            arguments=kwargs,
+        )
+
+    async def acall(self, ctx: Any, **kwargs: Any) -> Any:
+        from .workers.env_worker import call_tool_in_subprocess
+
+        return await asyncio.to_thread(
+            call_tool_in_subprocess,
+            env_name=self.env_name,
+            env_dir=self.env_dir,
+            tool_name=self.name,
+            data_path=self._extract_data_path(ctx),
+            attempt_id=ctx.attempt_id,
+            env_session_id=ctx.env_session_id,
+            arguments=kwargs,
+        )
+
+
+def _resolve_isolated_scorer_runtime() -> tuple[dict[str, str], tuple[str, ...], float]:
+    extra_env: dict[str, str] = {}
+    try:
+        from .cost.credential import judge_env_overlay
+
+        extra_env = judge_env_overlay()
+    except Exception:
+        extra_env = {}
+
+    extra_deny_list: list[str] = []
+    timeout_seconds = 300.0
+    try:
+        from . import runtime_state
+
+        settings = getattr(runtime_state.get(), "settings", None)
+    except RuntimeError:
+        settings = None
+
+    if settings is not None:
+        cost_cfg = getattr(settings, "cost", None)
+        mgmt_key_env = getattr(cost_cfg, "management_key_env", None)
+        if isinstance(mgmt_key_env, str) and mgmt_key_env:
+            extra_deny_list.append(mgmt_key_env)
+        insights_cfg = getattr(settings, "insights", None)
+        insights_key_env = getattr(insights_cfg, "api_key_env", None)
+        if isinstance(insights_key_env, str) and insights_key_env:
+            extra_deny_list.append(insights_key_env)
+        octagon_cfg = getattr(settings, "octagon", None)
+        deadline = getattr(octagon_cfg, "scoring_deadline_seconds", None)
+        if isinstance(deadline, (int, float)) and deadline > 0:
+            timeout_seconds = float(deadline)
+
+    return extra_env, tuple(extra_deny_list), timeout_seconds
+
+
+class IsolatedScorerModule:
+    """Subprocess-backed proxy for ``envs/<name>/scorer.py``.
+
+    Never imports ``scorer.py`` into the API process; every ``score()`` /
+    ``evaluate_submission()`` call runs in a credential-scrubbed subprocess.
+    """
+
+    def __init__(
+        self,
+        *,
+        env_name: str,
+        env_dir: Path,
+        has_score: bool,
+        has_evaluate_submission: bool,
+        has_cancel_scoring: bool,
+        scorer_version: str | None = None,
+        score_fn_version: str | None = None,
+        source_hash: str | None = None,
+        rubric_constants: dict[str, str] | None = None,
+    ) -> None:
+        self.__name__ = EnvLoader._module_name_for(env_name, "scorer")
+        self.__file__ = str(env_dir / "scorer.py")
+        self._env_name = env_name
+        self._env_dir = env_dir
+        self._source_hash = source_hash
+        if scorer_version:
+            self.__octagon_scorer_version__ = scorer_version
+        if rubric_constants:
+            for key, value in rubric_constants.items():
+                if isinstance(key, str) and isinstance(value, str):
+                    setattr(self, key, value)
+
+        if has_score:
+            self.score = self._build_score_proxy(
+                env_name=env_name,
+                env_dir=env_dir,
+                module_name=self.__name__,
+                score_fn_version=score_fn_version,
+                source_hash=source_hash,
+            )
+        if has_evaluate_submission:
+            self.evaluate_submission = self._build_evaluate_submission_proxy(
+                env_name=env_name,
+                env_dir=env_dir,
+                module_name=self.__name__,
+                source_hash=source_hash,
+            )
+        if has_cancel_scoring:
+            def cancel_scoring(attempt_id: str) -> None:
+                from .workers.env_worker import cancel_active_scorer_processes
+
+                cancel_active_scorer_processes(attempt_id)
+
+            cancel_scoring.__module__ = self.__name__
+            cancel_scoring.__qualname__ = "cancel_scoring"
+            self.cancel_scoring = cancel_scoring
+
+    @staticmethod
+    def _build_score_proxy(
+        *,
+        env_name: str,
+        env_dir: Path,
+        module_name: str,
+        score_fn_version: str | None,
+        source_hash: str | None,
+    ) -> Any:
+        tls = threading.local()
+
+        def score(
+            *,
+            attempt_id: str,
+            task: dict[str, Any],
+            env_db: Path | None,
+            trace: list[dict[str, Any]],
+            final_state: dict[str, Any],
+            events: list[dict[str, Any]] | None = None,
+            **kwargs: Any,
+        ) -> list[dict[str, Any]]:
+            from .workers.env_worker import _run_scorer_in_subprocess_raw
+
+            extra_env, extra_deny, timeout_seconds = _resolve_isolated_scorer_runtime()
+            call_kwargs: dict[str, Any] = {
+                "attempt_id": attempt_id,
+                "task": task,
+                "env_db": env_db,
+                "trace": trace,
+                "final_state": final_state,
+                "events": events,
+                **kwargs,
+            }
+            result, declared = _run_scorer_in_subprocess_raw(
+                env_name=env_name,
+                env_dir=env_dir,
+                fn_name="score",
+                kwargs=call_kwargs,
+                timeout_seconds=timeout_seconds,
+                extra_env=extra_env,
+                extra_deny=extra_deny,
+            )
+            tls.declared_manifest = declared
+            return result
+
+        def _evaluation_manifest() -> dict[str, Any]:
+            declared = dict(getattr(tls, "declared_manifest", None) or {})
+            if source_hash:
+                declared.setdefault("isolated_scorer_source_hash", source_hash)
+            return declared
+
+        score.__module__ = module_name
+        score.__qualname__ = "score"
+        score.__version__ = score_fn_version  # type: ignore[attr-defined]
+        score.__octagon_evaluation_manifest__ = _evaluation_manifest  # type: ignore[attr-defined]
+        return score
+
+    @staticmethod
+    def _build_evaluate_submission_proxy(
+        *,
+        env_name: str,
+        env_dir: Path,
+        module_name: str,
+        source_hash: str | None,
+    ) -> Any:
+        tls = threading.local()
+
+        def evaluate_submission(**kwargs: Any) -> Any:
+            from .workers.env_worker import _run_scorer_in_subprocess_raw
+
+            extra_env, extra_deny, timeout_seconds = _resolve_isolated_scorer_runtime()
+            result, declared = _run_scorer_in_subprocess_raw(
+                env_name=env_name,
+                env_dir=env_dir,
+                fn_name="evaluate_submission",
+                kwargs=kwargs,
+                timeout_seconds=timeout_seconds,
+                extra_env=extra_env,
+                extra_deny=extra_deny,
+            )
+            tls.declared_manifest = declared
+            return result
+
+        def _evaluation_manifest() -> dict[str, Any]:
+            declared = dict(getattr(tls, "declared_manifest", None) or {})
+            if source_hash:
+                declared.setdefault("isolated_scorer_source_hash", source_hash)
+            return declared
+
+        evaluate_submission.__module__ = module_name
+        evaluate_submission.__qualname__ = "evaluate_submission"
+        evaluate_submission.__octagon_evaluation_manifest__ = _evaluation_manifest  # type: ignore[attr-defined]
+        return evaluate_submission
+
+
+@dataclass
 class LoadedEnv:
     name: str
     skill_id: str  # "octagon/<name>",自动拼出
     meta: dict[str, Any]
-    tools: dict[str, RegisteredTool]
+    tools: dict[str, RegisteredTool | IsolatedRegisteredTool]
     tasks: list[Task] = field(default_factory=list)
     tasks_by_id: dict[str, Task] = field(default_factory=dict)
-    scorer_module: Any = None  # 由 scorer.py exec 产物;允许为 None
+    scorer_module: Any = None  # 由 scorer.py exec 产物或 IsolatedScorerModule;允许为 None
     env_dir: Path = field(default_factory=Path)
     load_error: EnvLoadError | None = None
     # prerequisites 真校验：只警告不阻断，供 env 列表标记展示
     prerequisite_warnings: list[str] = field(default_factory=list)
+    isolated: bool = False
 
 
 _VALID_ENV_NAME = re.compile(r"^[a-z][a-z0-9_-]*$")
@@ -273,7 +517,12 @@ class EnvLoader:
     def __init__(self, envs_path: Path | str) -> None:
         self._envs_path = Path(envs_path)
 
-    def load_all(self, *, allow_unavailable_core: bool = False) -> dict[str, LoadedEnv]:
+    def load_all(
+        self,
+        *,
+        allow_unavailable_core: bool = False,
+        isolate: bool = False,
+    ) -> dict[str, LoadedEnv]:
         if not self._envs_path.is_dir():
             return {}
 
@@ -289,6 +538,7 @@ class EnvLoader:
                 env = self._load_one(
                     env_dir,
                     allow_unavailable_core=allow_unavailable_core,
+                    isolate=isolate,
                 )
                 result[env.name] = env
         finally:
@@ -304,6 +554,7 @@ class EnvLoader:
         env_dir: Path,
         *,
         allow_unavailable_core: bool = False,
+        isolate: bool = False,
     ) -> LoadedEnv:
         env_name = env_dir.name
         if not _VALID_ENV_NAME.match(env_name):
@@ -333,15 +584,22 @@ class EnvLoader:
             raise EnvLoadError(env_name, "meta", str(exc)) from exc
 
         load_error: EnvLoadError | None = None
-        try:
-            tools = self._load_core_tools(env_name, env_dir / "core.py")
-        except EnvLoadError as exc:
-            if not allow_unavailable_core:
-                raise
-            logger.warning("env core unavailable, deferring error until use: %s", exc)
-            tools = {}
-            load_error = exc
-        scorer_module = self._load_scorer(env_name, env_dir / "scorer.py")
+        if isolate:
+            tools, scorer_module, load_error = self._load_isolated_code(
+                env_name,
+                env_dir,
+                allow_unavailable_core=allow_unavailable_core,
+            )
+        else:
+            try:
+                tools = self._load_core_tools(env_name, env_dir / "core.py")
+            except EnvLoadError as exc:
+                if not allow_unavailable_core:
+                    raise
+                logger.warning("env core unavailable, deferring error until use: %s", exc)
+                tools = {}
+                load_error = exc
+            scorer_module = self._load_scorer(env_name, env_dir / "scorer.py")
         tasks = self._load_tasks(env_name, env_dir / "tasks")
 
         return LoadedEnv(
@@ -355,7 +613,98 @@ class EnvLoader:
             env_dir=env_dir,
             load_error=load_error,
             prerequisite_warnings=prereq_warnings,
+            isolated=isolate,
         )
+
+    def _load_isolated_code(
+        self,
+        env_name: str,
+        env_dir: Path,
+        *,
+        allow_unavailable_core: bool,
+    ) -> tuple[
+        dict[str, RegisteredTool | IsolatedRegisteredTool],
+        IsolatedScorerModule | None,
+        EnvLoadError | None,
+    ]:
+        from .workers.env_worker import EnvWorkerError, inspect_env_in_subprocess
+
+        try:
+            info = inspect_env_in_subprocess(env_name, env_dir)
+        except EnvWorkerError as exc:
+            err = EnvLoadError(env_name, "core", str(exc))
+            if not allow_unavailable_core:
+                raise err from exc
+            logger.warning("env isolated inspect failed, deferring error until use: %s", err)
+            return {}, None, err
+
+        load_error: EnvLoadError | None = None
+        tools: dict[str, RegisteredTool | IsolatedRegisteredTool] = {}
+        core_error = info.get("core_error")
+        if isinstance(core_error, dict):
+            err = EnvLoadError(
+                env_name,
+                str(core_error.get("stage") or "core"),
+                str(core_error.get("detail") or "unknown error"),
+            )
+            if not allow_unavailable_core:
+                raise err
+            logger.warning("env core unavailable, deferring error until use: %s", err)
+            load_error = err
+        else:
+            for item in info.get("tools") or []:
+                if not isinstance(item, dict) or not item.get("name"):
+                    continue
+                name = str(item["name"])
+                tools[name] = IsolatedRegisteredTool(
+                    name=name,
+                    description=str(item.get("description") or ""),
+                    parameters=dict(item.get("parameters_schema") or {}),
+                    env_name=env_name,
+                    env_dir=env_dir,
+                    is_async=bool(item.get("is_async", False)),
+                )
+
+        scorer_error = info.get("scorer_error")
+        if isinstance(scorer_error, dict):
+            raise EnvLoadError(
+                env_name,
+                str(scorer_error.get("stage") or "scorer"),
+                str(scorer_error.get("detail") or "unknown error"),
+            )
+
+        scorer_module: IsolatedScorerModule | None = None
+        scorer_info = info.get("scorer")
+        if isinstance(scorer_info, dict) and scorer_info.get("present"):
+            scorer_module = IsolatedScorerModule(
+                env_name=env_name,
+                env_dir=env_dir,
+                has_score=bool(scorer_info.get("has_score")),
+                has_evaluate_submission=bool(scorer_info.get("has_evaluate_submission")),
+                has_cancel_scoring=bool(scorer_info.get("has_cancel_scoring")),
+                scorer_version=(
+                    scorer_info.get("scorer_version")
+                    if isinstance(scorer_info.get("scorer_version"), str)
+                    else None
+                ),
+                score_fn_version=(
+                    scorer_info.get("score_fn_version")
+                    if isinstance(scorer_info.get("score_fn_version"), str)
+                    else None
+                ),
+                source_hash=(
+                    scorer_info.get("source_hash")
+                    if isinstance(scorer_info.get("source_hash"), str)
+                    else None
+                ),
+                rubric_constants=(
+                    scorer_info.get("rubric_constants")
+                    if isinstance(scorer_info.get("rubric_constants"), dict)
+                    else None
+                ),
+            )
+
+        return tools, scorer_module, load_error
 
     # ----- 各 stage -------------------------------------------------------
 

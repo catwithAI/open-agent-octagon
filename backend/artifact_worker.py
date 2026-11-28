@@ -15,6 +15,28 @@ from pathlib import Path
 from typing import Any
 
 
+_DEFAULT_CPU_LIMIT = 12
+_MIN_CPU_LIMIT = 1
+_MAX_CPU_LIMIT = 300
+
+_DEFAULT_AS_LIMIT = 1024 * 1024 * 1024
+_MIN_AS_LIMIT = 64 * 1024 * 1024
+_MAX_AS_LIMIT = 4 * 1024 * 1024 * 1024
+
+
+def _parse_clamped_int_env(
+    name: str, default: int, *, minimum: int, maximum: int
+) -> int:
+    raw = os.environ.get(name)
+    if not raw:
+        return default
+    try:
+        parsed = int(raw.strip())
+    except ValueError:
+        return default
+    return max(minimum, min(maximum, parsed))
+
+
 def _install_limits() -> None:
     """Apply best-effort POSIX limits before opening the artifact."""
     try:
@@ -22,9 +44,21 @@ def _install_limits() -> None:
     except ImportError:  # pragma: no cover - Windows fallback
         return
 
+    cpu_limit = _parse_clamped_int_env(
+        "OCTAGON_PREVIEW_CPU_LIMIT",
+        _DEFAULT_CPU_LIMIT,
+        minimum=_MIN_CPU_LIMIT,
+        maximum=_MAX_CPU_LIMIT,
+    )
+    as_limit = _parse_clamped_int_env(
+        "OCTAGON_PREVIEW_AS_LIMIT",
+        _DEFAULT_AS_LIMIT,
+        minimum=_MIN_AS_LIMIT,
+        maximum=_MAX_AS_LIMIT,
+    )
     limits = (
-        ("RLIMIT_CPU", 12),
-        ("RLIMIT_AS", 1024 * 1024 * 1024),
+        ("RLIMIT_CPU", cpu_limit),
+        ("RLIMIT_AS", as_limit),
         ("RLIMIT_FSIZE", 64 * 1024 * 1024),
         ("RLIMIT_NOFILE", 64),
     )
