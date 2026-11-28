@@ -1,28 +1,23 @@
 # OpenAgentOctagon 全项目综合评估报告
 
-> 审计日期：2026-11-27 · 审计基线：`9c4cfaf` (`main`) · **最近状态更新**：2026-11-27（`main` 已合入 PR #36 至 `6d5a108`，Phase 2 已提交 PR #37）
+> 审计日期：2026-11-27 · 审计基线：`9c4cfaf` (`main`) · **最近状态更新**：2026-11-28（`main` 已合入 PR #36、`PR #37` 至 `3641d97`；Phase 3 已完成并准备 PR）
 >
 > 范围：全仓库后端（Python / FastAPI / SQLite，约 72,896 LOC）与前端（React / Vite / TypeScript，非测试代码约 13,842 LOC；测试文件 103 个）。
 
-## 当前修复进度总览（2026-11-27）
+## 当前修复进度总览（2026-11-28）
 
-> 状态图例：`✅ 已合入 (PR #36)` · `🟡 已提 PR 待合入 (PR #37)` · `⏸️ 已冻结/废弃 (D1)` · `⬜ 未开始`
+> 状态图例：`✅ 已合入 (PR #36/#37)` · `🟡 本 PR 待合入 (Phase 3)` · `⏸️ 已冻结/废弃 (D1)` · `⬜ 未开始`
 
 | 阶段 | 任务 | 当前状态 | 关联 PR / 说明 |
 |---|---|---|---|
-| **Phase 0** | `T0.1` 修复 14 个前端单测并恢复全量 CI | ✅ 已合入 | [PR #36](https://github.com/catwithAI/open-agent-octagon/pull/36)（40/40 文件、186/186 用例全绿） |
-| **Phase 0** | `T0.2` 隔离后端可选依赖 `blade` 单测 | ✅ 已合入 | [PR #36](https://github.com/catwithAI/open-agent-octagon/pull/36)（无 blade extra 下不再 collection 中断） |
-| **Phase 1** | `T1.1` 安全止血（上传白名单、`--env-file`、zip-slip、凭据清理） | ✅ 已合入 | [PR #36](https://github.com/catwithAI/open-agent-octagon/pull/36)（同步更新 3 处旧行为单测） |
-| **Phase 1** | `T1.2` 数据保护（Rejudge 先检后删、幂等释放、`display_only` 启动守卫） | ✅ 已合入 | [PR #36](https://github.com/catwithAI/open-agent-octagon/pull/36) |
-| **Phase 1** | `T1.3` Wire/Token/成本准确度与沙盒路径修复 | ✅ 已合入 | [PR #36](https://github.com/catwithAI/open-agent-octagon/pull/36) |
-| **Phase 1** | `T1.4` Skill Eval 多轮 SQL、Worker 防崩、D3 预览只读 | ✅ 已合入 | [PR #36](https://github.com/catwithAI/open-agent-octagon/pull/36) |
-| **Phase 1** | `T1.5` Research 防堵死/取消竞态、主站 SSE 与前端死循环/泄漏 | ✅ 已合入 | [PR #36](https://github.com/catwithAI/open-agent-octagon/pull/36) |
-| **Phase 2** | `T2.1` 统一 SQLite 连接工厂、once-WAL/init 与 `BEGIN IMMEDIATE` | 🟡 待合入 | [PR #37](https://github.com/catwithAI/open-agent-octagon/pull/37)（`61f2562`，后端 392 passed） |
-| **Phase 2** | `T2.2` 状态机终态守卫、任务纳管、Sweeper 取消评分与推送总线 | 🟡 待合入 | [PR #37](https://github.com/catwithAI/open-agent-octagon/pull/37)（`75b6c3c`，后端 392 passed） |
-| **Phase 2** | `T2.3` 消除事件循环阻塞、事件驱动 SSE、预览与缓存有界化 | 🟡 待合入 | [PR #37](https://github.com/catwithAI/open-agent-octagon/pull/37)（`bd9126f`，后端 392 passed） |
-| **Phase 2** | `T2.4` 外置 Scorer 强校验、JSON 统一、`iteration`/`mutations`/`profiles` 加固与 D1 冻结 | 🟡 待合入 | [PR #37](https://github.com/catwithAI/open-agent-octagon/pull/37)（`c44b406`，后端 392 passed） |
-| **Phase 3** | `T3.1`–`T3.3` 抽 `BaseCliAdapter` + 拆 `blade_service.py` / Canonical Trajectory / 拆 `RunDetail.tsx` | ⬜ 未开始 | 等 PR #37 合入后启动 |
-| **Phase 4** | `T4.1`–`T4.2` 独立 `scoring-worker` 进程 / Env 代码子进程隔离 | ⬜ 未开始 | 排在 Phase 3 之后 |
+| **Phase 0** | `T0.1`–`T0.2` 前端全量 CI 门禁与后端可选依赖隔离 | ✅ 已合入 | [PR #36](https://github.com/catwithAI/open-agent-octagon/pull/36)（`6d5a108`） |
+| **Phase 1** | `T1.1`–`T1.5` 安全止血、数据保护、Token/成本、Skill Eval、Research & 前端 | ✅ 已合入 | [PR #36](https://github.com/catwithAI/open-agent-octagon/pull/36)（`6d5a108`） |
+| **Phase 2** | `T2.1`–`T2.4` SQLite 工厂、状态机/Sweeper、非阻塞事件循环、Scorer 加固与 D1 冻结 | ✅ 已合入 | [PR #37](https://github.com/catwithAI/open-agent-octagon/pull/37)（`3641d97`） |
+| **Phase 3** | `T3.1A` 抽 `cli_common.py`，并发抽干 4 个 CLI Adapter `stderr` 与句柄安全 | 🟡 待合入 | Phase 3 PR（已过全量 392 后端测试） |
+| **Phase 3** | `T3.1B` 拆分 `blade_service.py`（3,555 → 2,672 行）并修恢复风暴/泄漏/自动应答上限 | 🟡 待合入 | Phase 3 PR（抽出 `backend/adapters/blade/` 3 个子模块） |
+| **Phase 3** | `T3.2` 补齐 Blade SDK ATIF、`kimi-code` Wire Normalizer、来源感知成本语义与 `experiments/recovery` | 🟡 待合入 | Phase 3 PR（7 家 Agent ATIF/Wire 全面对等） |
+| **Phase 3** | `T3.3` 拆分 `RunDetail.tsx`（3,751 → 1,552 行）、解除 `skillEval` 反转依赖、`React.lazy` 代码分割与前端润色 | 🟡 待合入 | Phase 3 PR（前端 187/187 全绿，主包 640KB → 405KB） |
+| **Phase 4** | `T4.1`–`T4.2` 独立 `scoring-worker` 进程 / Env 代码子进程隔离 | ⬜ 未开始 | 等 Phase 3 合入后启动 |
 | **Phase 5** | `T5.1`–`T5.4` Skill Eval ↔ Core 矩阵融合、分叉对比、Preflight、富编辑器 | ⬜ 未开始 | 排在底座与架构解耦之后 |
 
 ## 报告索引

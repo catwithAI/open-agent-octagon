@@ -1,8 +1,8 @@
 # 01 — 核心后端引擎深度审计
 
-> 审计日期：2026-11-27 · 审计基线：`9c4cfaf` · **状态更新**：2026-11-27（PR #36 已合入，PR #37 待合入）
+> 审计日期：2026-11-27 · 审计基线：`9c4cfaf` · **状态更新**：2026-11-28（PR #36、PR #37 已合入 `main`；Phase 3 待合入）
 >
-> 状态图例：`✅ 已合入 (PR #36)` · `🟡 待合入 (PR #37)` · `🟡 部分完成` · `⬜ 未开始`
+> 状态图例：`✅ 已合入 (PR #36/#37)` · `🟡 本 PR 待合入 (Phase 3)` · `🟡 部分完成` · `⬜ 未开始`
 >
 > 审计范围：`backend/main.py`、`api.py`、`db.py`、`runner.py`、`run_dispatch.py`、`run_service.py`、`scoring_queue.py`、`evaluator.py`、`recovery.py`、`sweeper.py`、`disk_guard.py`、`env_loader.py`、`env_attempt_server.py`、`process/docker_launcher.py`、`artifact_preview.py`、`artifact_worker.py`、`display_only.py`、`runtime_state.py`。
 

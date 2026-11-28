@@ -1,6 +1,6 @@
 # 05 — 冲突消解与有序改造总任务清单（Master Task Plan）
 
-> 制定日期：2026-11-27 · 初始基线：`9c4cfaf` · **最近状态更新**：2026-11-27（Phase 0/1 已随 PR #36 合入 `main` `6d5a108`；Phase 2 已提 PR #37 待合入）
+> 制定日期：2026-11-27 · 初始基线：`9c4cfaf` · **最近状态更新**：2026-11-28（Phase 0/1/2 已随 PR #36、`PR #37` 合入 `main` `3641d97`；Phase 3 已完成并准备 PR）
 >
 > 状态约定：`[x] 已合入 main 且回归通过` · `[~] 已提 PR 待合入（已过全量既有回归）` · `[ ] 未开始` · `[-] 已冻结/跳过`
 
@@ -97,11 +97,11 @@
 
 ---
 
-### Phase 2：底层底座统一（DB 契约 + 状态机 + 消除事件循环阻塞 — 已提交 [PR #37](https://github.com/catwithAI/open-agent-octagon/pull/37) 待合入）
+### Phase 2：底层底座统一（DB 契约 + 状态机 + 消除事件循环阻塞 — 已随 [PR #37](https://github.com/catwithAI/open-agent-octagon/pull/37) 合入 `main`）
 
-> 目标：先建好统一的 DB、状态机、事件总线和共享 HTTP/LLM 客户端底座，彻底消除冲突组 A、C、E 的重复返工。PR #37（`61f2562` / `75b6c3c` / `bd9126f` / `c44b406`）已通过后端 `compileall` + `pytest` 392 passed / 12 skipped。
+> 目标：先建好统一的 DB、状态机、事件总线和共享 HTTP/LLM 客户端底座，彻底消除冲突组 A、C、E 的重复返工。PR #37（`3641d97`）已合入 `main`。
 
-- [~] **T2.1 统一 SQLite 连接工厂与初始化策略（解冲突组 A）**（已完成并跑过全量既有回归，待补新增专测）
+- [x] **T2.1 统一 SQLite 连接工厂与初始化策略（解冲突组 A）**（PR #37 已合入）
   - **涉及文件**：`backend/db.py`、`backend/evaluator.py`、`backend/wire/finalize.py`、`backend/wire/aggregate.py`、`backend/skill_eval/repository.py`、`backend/env_attempt_server.py`
   - **改动内容**：
     1. `_open_sync` 改为自动 `conn.close()` 的 `@contextmanager`（支持 `immediate=True`）；WAL 按 `(path, dev, ino)` 仅初始化一次，`synchronous=NORMAL` / `busy_timeout=30000` 统一生效（含 `open_db`）；
@@ -109,14 +109,14 @@
     3. `attempt_events` 写入与 `claim_idempotency` 改用 `BEGIN IMMEDIATE`；`env.db` 建表加按路径引用计数锁 + WAL + `hmac.compare_digest`；
     4. `evaluator` / `wire/finalize` / `wire/aggregate` 改用 `_open_sync`；有界化 `_event_data_paths`、`_inbound_seq` 与 `_FINALIZE_LOCKS`。
 
-- [~] **T2.2 收口 `AttemptStateMachine` + `TaskRegistry` + 事件驱动 SSE（解冲突组 C）**（已完成并跑过全量既有回归，待补新增专测）
+- [x] **T2.2 收口 `AttemptStateMachine` + `TaskRegistry` + 事件驱动 SSE（解冲突组 C）**（PR #37 已合入）
   - **涉及文件**：`backend/runtime_state.py`、`backend/convergence.py`、`backend/sweeper.py`、`backend/scoring_queue.py`、`backend/runner.py`、`backend/run_dispatch.py`、`backend/recovery.py`
   - **改动内容**：
     1. `runtime_state.py` 新增 `scoring_tasks`、`track_background_task`（强引用 + 完成清理 + 异常日志）以及跨线程安全的 `notify_run_update` / `subscribe_run_updates` 推送总线；
     2. `convergence.py` + `sweeper.py` + `scoring_queue.py`：超时评分同步取消卡死 scorer 协程并触发 cancel hook，同时收敛 `scoring_jobs` 终态防重启复活；新增 `enqueue_scoring_job_async` 将快照与写库移出事件循环；
     3. `runner.py` + `run_dispatch.py`：`_finalize_no_score` 加非终态乐观守卫防竞态覆盖；非 blade agent 异常不再误标 `blade_service_unavailable`（改 `cli_error`）；物料准备与状态更新移出事件循环；`recovery.py` 兼容 `judge.backend == "evals"`。
 
-- [~] **T2.3 全面消除异步事件循环上的同步阻塞与无界内存缓存**（已完成并跑过全量既有回归，待补新增专测）
+- [x] **T2.3 全面消除异步事件循环上的同步阻塞与无界内存缓存**（PR #37 已合入）
   - **涉及文件**：`backend/api.py`、`backend/research_api.py`、`backend/artifact_preview.py`、`backend/wire/lifecycle.py`、`backend/wire/sources/http_proxy.py`、`backend/model_integrity.py`、`backend/skill_eval/{events,run_api,storage}.py`
   - **改动内容**：
     1. `api.py`：主站 SSE 接入 `subscribe_run_updates` 事件唤醒；读接口与 JSONL 读取全量 `asyncio.to_thread`；存在性检查改轻量 `SELECT 1`；`POST /upload` 改 64KB 流式分块限 200MB；按 event loop 复用共享 `httpx.AsyncClient`；
@@ -124,7 +124,7 @@
     3. `artifact_preview.py` 为 `cache_key` 增加 `(path, mtime_ns, size)` 有界 LRU 缓存并淘汰瞬态失败 Future；
     4. `http_proxy` 与 `model_integrity` 缓存全面有界化（不缓存 `None`）；`skill_eval` SSE 接入 `EventStore` 推送通知、`/process` 加 `(run_id, head)` 64 项 LRU 缓存、`collect_unreferenced` 纳入 `previews/` 清理。
 
-- [~] **T2.4 归并 Evals 响应校验、统一 JSON 提取器并冻结冗余 Research 模块（解冲突组 E）**（已完成并跑过全量既有回归，待补新增专测）
+- [x] **T2.4 归并 Evals 响应校验、统一 JSON 提取器并冻结冗余 Research 模块（解冲突组 E）**（PR #37 已合入）
   - **涉及文件**：`backend/evals_scorer.py`、`backend/comparison_scorer.py`、`backend/attribution_client.py`、`backend/insights/generator.py`、`backend/mutations/preview.py`、`backend/iteration/controller.py`、`backend/profiles/recommend.py`、`backend/analysis/__init__.py`、`backend/rubric_evolution/{__init__,pipeline,judge_executor}.py`
   - **改动内容**：
     1. `evals_scorer.py` 强校验非空/有限/`[0,1]` 分数与维度 ID 匹配；`comparison_scorer` 与 `attribution_client` 优先对齐冻结 `scoring-work` 快照目录；
@@ -134,34 +134,31 @@
 
 ---
 
-### Phase 3：核心架构解耦（Adapter 抽象 + Canonical Trajectory + 前端拆巨石）
+### Phase 3：核心架构解耦（Adapter 抽象 + ATIF/Wire 7 家对等 + 前端拆巨石 — 本次 PR 待合入）
 
-> 目标：根治最大的长期维护成本（6 套事件解析器、7 份重复 Adapter、3,734 行前端巨石）。
+> 目标：根治长期维护成本最高的巨石模块、管道死锁、7 家观测不对等与前端反转依赖。已通过后端 392 passed + 前端 187 passed + `vite build` 路由分包。
 
-- [ ] **T3.1 抽取 `BaseCliAdapter` 与拆分 `blade_service.py`（解冲突组 F）**
-  - **涉及文件**：`backend/adapters/{base_cli.py, claude_code.py, codex.py, kimi_code.py, opencode_family.py, dsh.py, blade_cli.py}`、`backend/adapters/blade/`（拆自 `blade_service.py`）
+- [~] **T3.1 抽取 CLI Adapter 公共底座 `cli_common.py` 与拆分/加固 `blade_service.py`（解冲突组 F）**
+  - **涉及文件**：`backend/adapters/{cli_common,claude_code,codex,kimi_code,opencode_family,blade_service}.py`、新增 `backend/adapters/blade/{__init__,artifacts,extraction,interactions}.py`
   - **改动内容**：
-    1. 统一 CLI 子进程公共基类：并发抽干 `stderr`（根治 64KB 死锁）、上下文管理器管理 `ConversationTraceWriter`、统一注入 `X-Octagon-Turn-Id` / `X-Octagon-Turn-Index`、统一沙盒路径与超时处理；
-    2. 将 `blade_service.py`（3,555 行）拆分为传输客户端、执行编排、恢复逻辑（修复每事件 3 次 REST 轮询风暴）、产物同步与软件工厂子模块；
-    3. 复用统一 Blade 边界供 `skill_eval/runtime.py` 调用。
-  - **前置依赖**：T1.3、T2.2。
+    1. `cli_common.py` 统一并发抽干 4 个 CLI Adapter 的 `stderr`（根治 64KB 管道死锁并按轮次追加 `stderr.txt`）与 `finally` 安全关闭 `ConversationTraceWriter`；
+    2. 将 `blade_service.py` 从 3,555 行精简至 2,672 行（拆出 `artifacts`/`extraction`/`interactions` 3 个子模块并保持全部导出兼容）；修复恢复期每事件 3 次 REST 风暴（按 `progress_poll_interval_seconds` 节流并保留完整 token/model/tool 统计）、非 `BladeChatError` 异常路径清理远端会话与取消监控任务、自动应答循环上限（`_MAX_UNEXPECTED_AUTO_ANSWERS=20`）以及会话级 `httpx.AsyncClient` 复用。
 
-- [ ] **T3.2 建立后端 Canonical Trajectory 单一事实源（解冲突组 B）**
-  - **涉及文件**：`backend/atif/`、`backend/wire/normalizers/`、`backend/security/toolcalls.py`、`backend/api.py`
+- [~] **T3.2 补齐 7 家 Agent ATIF / Wire 观测对等、来源感知成本语义与遗留修复（解冲突组 B）**
+  - **涉及文件**：`backend/atif/converters/blade_agent.py`、新增 `backend/wire/normalizers/kimi_code.py`、`backend/wire/normalizers/runner.py`、`backend/cost/estimate.py`、`backend/experiments/recovery.py`、`backend/run_service.py`
   - **改动内容**：
-    1. 补齐 `blade-agent` (SDK) 的 ATIF 转换与 `kimi-code` 的 Wire Native 解析，实现 7 家 Agent 100% 观测对等；
-    2. 将 `wire/normalizers/`、`atif/converters/` 与 `security/toolcalls.py` 的重复格式解析合并为每个 Agent 一套共享提取器，输出统一的 Canonical Trajectory/Steps；
-    3. 后端提供标准化步骤/对话 API，供前端直接消费（不再把 7 家私有原始 JSONL 解析塞给浏览器）。
-  - **前置依赖**：T3.1。
+    1. `atif/converters/blade_agent.py` 兼容 `blade_service.py` SDK `{kind, raw}` 事件格式，实现 7 家 Agent ATIF-v1.7 全覆盖；
+    2. 新增 `KimiCodeNormalizer` 并注册进 `wire/normalizers/runner.py`，实现 7 家 Agent Wire Native 轨迹全覆盖；
+    3. `cost/estimate.py` 支持来源感知的 `input_semantics`（避免 Kimi 等经 HTTP 代理回填 inclusive `prompt_tokens` 重复计费）；
+    4. `experiments/recovery.py` 活跃状态补 `'scoring'`；`run_service._create_locks` 按 event loop 清理避免内存泄漏。
 
-- [ ] **T3.3 拆分前端巨石 `RunDetail.tsx` 并解除 `skillEval` 反转依赖（解冲突组 D）**
-  - **涉及文件**：`web/src/pages/RunDetail.tsx` → 拆出 `web/src/components/viewers/`、`web/src/wire/WirePanel.tsx`、`web/src/cost/RunCostCard.tsx`、`web/src/pages/RunDetail/*`；`web/src/skillEval/ArtifactPreview.tsx`、`web/src/main.tsx`
+- [~] **T3.3 拆分前端巨石 `RunDetail.tsx`、解除 `skillEval` 反转依赖与代码分割（解冲突组 D）**
+  - **涉及文件**：新增 `web/src/components/viewers/ArtifactViewers.tsx`、`web/src/components/ArtifactsPanel.tsx`、`web/src/cost/RunCostCard.tsx`、`web/src/wire/WirePanel.tsx`；改造 `web/src/pages/RunDetail.tsx`、`web/src/skillEval/{ArtifactPreview,ProcessView,RunDetail}.tsx`、`web/src/main.tsx`、`web/src/pages/{ExperimentBuilder,RunGroupLive,RunList}.tsx`
   - **改动内容**：
-    1. 抽离共享 Office/HTML 预览器、Wire 面板、Cost 卡片，消除 `skillEval → pages/RunDetail` 反转依赖；
-    2. `main.tsx` 接入 `React.lazy` 路由级代码分割；
-    3. 统一前端请求层（支持 `AbortSignal` 与 `/capabilities` 缓存）与类型化 i18n（收编 `skillEval` 内联文案）；
-    4. 待 T3.2 就绪后，将前端对话/步骤视图切到后端 Canonical API，删除 `RunDetail.tsx` 中手写的 7 家事件解析器。
-  - **前置依赖**：T0.1（必须先有全量单测护栏）、T1.5。
+    1. 将 `RunDetail.tsx` 从 3,751 行缩减至 1,552 行（-58.6%），抽离共享预览器、产物树（修复 SSE 刷新折叠已展开目录）、成本卡片与 Wire 面板并保持向后 re-export；
+    2. `skillEval/ArtifactPreview.tsx` 改为直接引用 `components/viewers/ArtifactViewers`，彻底消除 `skillEval → pages/RunDetail` 反转依赖；
+    3. `main.tsx` 全面接入路由级 `React.lazy` + `<Suspense>`，主包从 639.55 kB 降至 404.81 kB（消除 Vite >500 kB 警告）；
+    4. 修复 `ProcessView` `following` 过期闭包、SSE 健康时暂停 3s 冗余轮询、`ExperimentBuilder` 切场景竞态、`RunGroupLive` 语言 locale 与 `RunList` 页面隐藏暂停轮询。
 
 ---
 

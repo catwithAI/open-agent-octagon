@@ -1,8 +1,8 @@
 # 02 — Adapters、Wire 可观测性、ATIF、Cost 与 Conversation 审计
 
-> 审计日期：2026-11-27 · 审计基线：`9c4cfaf` · **状态更新**：2026-11-27（PR #36 已合入，PR #37 待合入）
+> 审计日期：2026-11-27 · 审计基线：`9c4cfaf` · **状态更新**：2026-11-28（PR #36、PR #37 已合入 `main`；Phase 3 待合入）
 >
-> 状态图例：`✅ 已合入 (PR #36)` · `🟡 待合入 (PR #37)` · `🟡 部分完成` · `⬜ 未开始`
+> 状态图例：`✅ 已合入 (PR #36/#37)` · `🟡 本 PR 待合入 (Phase 3)` · `🟡 部分完成` · `⬜ 未开始`
 >
 > 审计范围：`backend/adapters/`、`backend/wire/`、`backend/atif/`、`backend/cost/`、`backend/conversation/`、`backend/normalization/`。
 
@@ -14,11 +14,11 @@
 - **位置**：`backend/wire/sources/http_proxy.py:950-963`
 - **根因**：`_UsageProbe._parse_sse_line` 写成 `if usage is not None: self.usage = usage`（整对象替换）。已改为按非 `None` 字段合并。
 
-### 2. [P0 统计失真] Claude Code `result` 事件 Token 2 倍重复计数 & Kimi 成本双计缓存 — `🟡 部分完成`
+### 2. [P0 统计失真] Claude Code `result` 事件 Token 2 倍重复计数 & Kimi 成本双计缓存 — `✅/🟡 已完成`
 - **位置**：`backend/adapters/token_usage.py:147-166`、`backend/cost/estimate.py:54-75`
 - **状态拆解**：
   1. Claude Code `result_usage_tokens()` 2× 重复计数：`✅ 已合入 (PR #36: T1.3)`。
-  2. `cost/estimate.py` 按来源传递 `input_semantics`（解决 Kimi 代理回填 inclusive `prompt_tokens` 重复计费）：`⬜ 待 Phase 3/5`。
+  2. `cost/estimate.py` 按来源传递 `input_semantics`（解决 Kimi 代理回填 inclusive `prompt_tokens` 重复计费）：`🟡 待合入 (Phase 3: T3.2)`。
 
 ### 3. [P0 统计失真] 不完整成本账本仍汇报偏低的 `total_cost_usd` — `✅ 已合入 (PR #36: T1.3)`
 - **位置**：`backend/cost/ledger.py:387-423`
@@ -32,39 +32,39 @@
 - **位置**：`backend/adapters/opencode_family.py:398`、`backend/adapters/dsh.py:415, 419, 468, 475`
 - **根因**：已统一改用 `sandbox.path(workspace)` 与 `sandbox.translate_url(task.env_base_url)`。
 
-### 6. [P1 对等性缺陷] `dsh` 虚报 `iterative_session` & Blade SDK 版 ATIF 恒为空 — `🟡 部分完成`
-- **位置**：`backend/adapters/dsh.py:277`、`backend/atif/converters/blade_agent.py:6-14, 74-80`
+### 6. [P1 对等性缺陷] `dsh` 虚报 `iterative_session` & Blade SDK 版 ATIF 恒为空 — `✅/🟡 已完成`
+- **位置**：`backend/adapters/dsh.py:277`、`backend/atif/converters/blade_agent.py`
 - **状态拆解**：
   1. `dsh.iterative_session = False`：`✅ 已合入 (PR #36: T1.3)`。
-  2. `atif/converters/blade_agent.py` 兼容 `blade_service.py` SDK 格式：`⬜ 待 Phase 3 (T3.2)`。
+  2. `atif/converters/blade_agent.py` 兼容 `blade_service.py` SDK `{kind, raw}` 格式：`🟡 待合入 (Phase 3: T3.2)`。
 
-### 7. [P1 会话泄漏与风暴] `blade_service.py` 异常跳过清理、恢复期 REST 风暴、自动应答无上限 — `⬜ 待 Phase 3 (T3.1)`
-- **位置**：`backend/adapters/blade_service.py:1225, 1248-1294, 1434, 1447-1449, 1547-1555, 2270-2317, 2506-2510`、`backend/adapters/blade_cli.py:315-334`
-- **说明**：排入 `T3.1` 拆解 `blade_service.py` 时一并彻底修复。
+### 7. [P1 会话泄漏与风暴] `blade_service.py` 异常跳过清理、恢复期 REST 风暴、自动应答无上限 — `🟡 待合入 (Phase 3: T3.1B)`
+- **位置**：`backend/adapters/blade_service.py`、`backend/adapters/blade/`
+- **处理**：按 `progress_poll_interval_seconds` 节流恢复快照并保留完整 token/model/tool；异常路径取消 `monitor_task`、关闭 trace 并清理远端会话；增加 `_MAX_UNEXPECTED_AUTO_ANSWERS=20` 上限并复用会话级 `httpx.AsyncClient`。
 
-### 8. [P1 安全与句柄泄漏] `blade_cli.py` 凭据文件泄漏、Zip-Slip 绕过与 `ConversationTraceWriter` 泄漏 — `🟡 部分完成`
-- **位置**：`backend/adapters/blade_cli.py`；`claude_code.py` / `kimi_code.py` / `opencode_family.py` / `blade_service.py`
+### 8. [P1 安全与句柄泄漏] `blade_cli.py` 凭据文件泄漏、Zip-Slip 绕过与 `ConversationTraceWriter` 泄漏 — `✅/🟡 已完成`
+- **位置**：`backend/adapters/cli_common.py`、`blade_cli.py`、`claude_code.py`、`codex.py`、`kimi_code.py`、`opencode_family.py`、`blade_service.py`
 - **状态拆解**：
-  1. `blade_cli.py` 凭据文件 `0600`+清理、zip-slip `is_relative_to`、`isawaitable`、`ConversationTraceWriter` `finally`：`✅ 已合入 (PR #36: T1.1)`。
-  2. 其余 4 个 Adapter 的 `ConversationTraceWriter` 句柄保护：`⬜ 待 Phase 3 (T3.1)` 抽 `BaseCliAdapter` 统一根治。
+  1. `blade_cli.py` 全项：`✅ 已合入 (PR #36: T1.1)`。
+  2. 其余 4 个 CLI Adapter + `blade_service.py` `ConversationTraceWriter` `finally` 关闭：`🟡 待合入 (Phase 3: T3.1A / T3.1B)`。
 
 ---
 
 ## 二、架构问题
 
-1. **7 个 Adapter × 6 个 Wire Normalizer × 6 个 ATIF Converter 巨量代码复制** — `⬜ 待 Phase 3 (T3.1 / T3.2)`
-2. **`blade_service.py` 巨石单体（3,555 LOC）** — `⬜ 待 Phase 3 (T3.1)`
-3. **事件与 Token 语义缺乏统一契约** — `⬜ 待 Phase 3 (T3.2)`
+1. **7 个 Adapter × 6 个 Wire Normalizer × 6 个 ATIF Converter 巨量代码复制** — `🟡 部分完成 (Phase 3: T3.1A / T3.2)`（已抽 `cli_common.py` 并补齐 `kimi-code` Wire Normalizer 与 Blade SDK ATIF）
+2. **`blade_service.py` 巨石单体（3,555 → 2,672 LOC）** — `🟡 待合入 (Phase 3: T3.1B)`（拆出 `backend/adapters/blade/{artifacts,extraction,interactions}.py`）
+3. **事件与 Token 语义缺乏统一契约** — `🟡 大部完成 (Phase 3: T3.2)`（7 家 ATIF/Wire 全面对等 + 来源感知成本语义）
 4. **新旧两套并行成本系统** — `⬜ 待后续清理`
 
 ---
 
 ## 三、优先优化建议
 
-1. **消除 Wire 热路径的事件循环阻塞与统一 `_open_sync`** — `🟡 待合入 (PR #37: T2.1 / T2.3)`
-2. **修复 4 个 CLI Adapter 的 `stderr` 管道 64KB 死锁** — `⬜ 待 Phase 3 (T3.1)`
-3. **控制进程级缓存增长（`_sealed` / `_ATTEMPT_RUN_CACHE` / `_FINALIZE_LOCKS` / `_EXPECTED_CACHE`）** — `🟡 待合入 (PR #37: T2.1 / T2.3)`
-4. **抑制 `blade_service.py` 恢复风暴与 HTTP 连接抖动** — `⬜ 待 Phase 3 (T3.1)`
+1. **消除 Wire 热路径的事件循环阻塞与统一 `_open_sync`** — `✅ 已合入 (PR #37: T2.1 / T2.3)`
+2. **修复 4 个 CLI Adapter 的 `stderr` 管道 64KB 死锁** — `🟡 待合入 (Phase 3: T3.1A)`
+3. **控制进程级缓存增长（`_sealed` / `_ATTEMPT_RUN_CACHE` / `_FINALIZE_LOCKS` / `_EXPECTED_CACHE`）** — `✅ 已合入 (PR #37: T2.1 / T2.3)`
+4. **抑制 `blade_service.py` 恢复风暴与 HTTP 连接抖动** — `🟡 待合入 (Phase 3: T3.1B)`
 
 ---
 
