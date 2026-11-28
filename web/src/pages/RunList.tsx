@@ -35,9 +35,21 @@ export function RunList() {
         setRows(data.items);
       } catch (e) { if (alive) setErr(String(e)); }
     };
-    tick();
-    const id = setInterval(tick, 4000);
-    return () => { alive = false; clearInterval(id); };
+    const poll = () => {
+      if (document.visibilityState === "hidden") return;
+      void tick();
+    };
+    const onVisibility = () => {
+      if (document.visibilityState === "visible") void tick();
+    };
+    void tick();
+    const id = setInterval(poll, 4000);
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      alive = false;
+      clearInterval(id);
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
   }, [page]);
 
   const pageCount = Math.max(1, Math.ceil(total / PAGE_SIZE));

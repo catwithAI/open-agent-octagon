@@ -249,7 +249,7 @@ export function RunGroupLive() {
                 <div><strong>{scopeLabel(String(data.scope_key ?? ""))} · {leaderReasonLabel(String(data.reason ?? ""), lang)}</strong>
                   <p>{String(data.previous_value ?? "—")} → {String(data.current_value ?? "—")}
                     {data.delta !== null && data.delta !== undefined ? ` · Δ ${String(data.delta)}` : ""}</p></div>
-                <time>{event.created_at ? new Date(event.created_at).toLocaleTimeString("zh-CN") : t("runGroupLive.justNow")}</time>
+                <time>{event.created_at ? new Date(event.created_at).toLocaleTimeString(lang === "zh" ? "zh-CN" : "en-US") : t("runGroupLive.justNow")}</time>
               </article>;
             })}
             {timeline.length === 0 && <div className="live-timeline-empty">{t("runGroupLive.noLeaderEvents")}</div>}

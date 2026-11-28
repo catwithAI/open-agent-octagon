@@ -12,25 +12,26 @@ import {createIdempotencyKey} from "../api/idempotency";
 import type {Interaction,Run,RunMessage} from "./types";
 import "./styles.css";
 
-function LiveRunConnection({runId,onUpdate}:{runId:string;onUpdate:()=>void}){
+function LiveRunConnection({runId,onUpdate,onState}:{runId:string;onUpdate:()=>void;onState:(state:string)=>void}){
   const c=useCopy();
   const stream=useRunEvents(runId,onUpdate);
+  useEffect(()=>{onState(stream.state);},[stream.state,onState]);
   return <small>{c("连接：","Connection: ")}{stream.state}</small>;
 }
 
 export function RunDetail(){
   const {runId=""}=useParams();const [params,setParams]=useSearchParams();const c=useCopy(),action=useAction(),selection=useCompareSelection();
-  const [loadedRun,setRun]=useState<Run|null>(null),[messages,setMessages]=useState<RunMessage[]>([]),[interactions,setInteractions]=useState<Interaction[]>([]),[error,setError]=useState<unknown>(null),[refresh,setRefresh]=useState(0),[readOnly,setReadOnly]=useState(false),[preview,setPreview]=useState<string|null>(null);
+  const [loadedRun,setRun]=useState<Run|null>(null),[messages,setMessages]=useState<RunMessage[]>([]),[interactions,setInteractions]=useState<Interaction[]>([]),[error,setError]=useState<unknown>(null),[refresh,setRefresh]=useState(0),[readOnly,setReadOnly]=useState(false),[preview,setPreview]=useState<string|null>(null),[streamState,setStreamState]=useState("connecting");
   const run=loadedRun?.id===runId?loadedRun:null;
-  useEffect(()=>{setMessages([]);setInteractions([]);setPreview(null);},[runId]);
+  useEffect(()=>{setMessages([]);setInteractions([]);setPreview(null);setStreamState("connecting");},[runId]);
   const update=useCallback(()=>setRefresh(value=>value+1),[]);
   useEffect(()=>{const abort=new AbortController();Promise.all([request<Run>(`/runs/${runId}`,{signal:abort.signal}),request<{items:RunMessage[]}>(`/runs/${runId}/messages`,{signal:abort.signal}),request<{items:Interaction[]}>(`/runs/${runId}/interactions`,{signal:abort.signal})]).then(([r,m,i])=>{setRun(r);setMessages(m.items);setInteractions(i.items);setError(null);}).catch(e=>{if(!abort.signal.aborted)setError(e);});return()=>abort.abort();},[runId,refresh]);
   useEffect(()=>{request<{display_only:boolean}>("/capabilities").then(cap=>setReadOnly(cap.display_only)).catch(()=>{});},[]);
-  useEffect(()=>{if(!run||["completed","failed","cancelled"].includes(run.run_status))return;const interval=setInterval(update,3000);return()=>clearInterval(interval);},[run?.run_status,update]);
+  useEffect(()=>{if(!run||["completed","failed","cancelled"].includes(run.run_status)||streamState==="connected")return;const poll=()=>{if(document.visibilityState==="hidden")return;update();};const interval=setInterval(poll,3000);return()=>clearInterval(interval);},[run?.run_status,streamState,update]);
   const view=params.get("view")||"result",ended=Boolean(run&&["completed","failed","cancelled"].includes(run.run_status));const pending=interactions.find(item=>item.state==="pending");
   const back=params.get("from")?.startsWith("/skill-eval")?params.get("from")!:run?`/skill-eval/skills/${run.skill_id}`:"/skill-eval";
   return <div className="se"><header className="se-page-header"><div><Link to={back}>{c("返回 Skill 与历史","Back to Skill and history")}</Link><h1>{run?.skill.name||c("运行详情","Run details")}</h1><p>{run?.experiment.name} · {run?.source_release_label||c("临时内容","Temporary content")} · {run?.requested_model}</p></div>{run&&<Status value={run.run_status}/>}</header><ErrorBox error={error}/><ErrorBox error={action.error}/>
-    {run&&<><div className="se-toolbar"><button aria-pressed={view==="result"} onClick={()=>{const next=new URLSearchParams(params);next.set("view","result");setParams(next,{replace:true});}}>{c("结果与对话","Result and conversation")}</button><button aria-pressed={view==="process"} onClick={()=>{const next=new URLSearchParams(params);next.set("view","process");setParams(next,{replace:true});}}>{c("完整流程","Complete process")}</button>{ended?<small>{c("连接：","Connection: ")}{c("已结束","closed")}</small>:<LiveRunConnection runId={run.id} onUpdate={update}/>}
+    {run&&<><div className="se-toolbar"><button aria-pressed={view==="result"} onClick={()=>{const next=new URLSearchParams(params);next.set("view","result");setParams(next,{replace:true});}}>{c("结果与对话","Result and conversation")}</button><button aria-pressed={view==="process"} onClick={()=>{const next=new URLSearchParams(params);next.set("view","process");setParams(next,{replace:true});}}>{c("完整流程","Complete process")}</button>{ended?<small>{c("连接：","Connection: ")}{c("已结束","closed")}</small>:<LiveRunConnection runId={run.id} onUpdate={update} onState={setStreamState}/>}
       {!ended&&<><button disabled={readOnly||action.busy||!(["queued","running","stopping"].includes(run.generation_status)||["queued","preparing"].includes(run.run_status))} onClick={()=>void action.act(async()=>{await post(`/runs/${run.id}/stop-generation`);update();})}>{c("停止当前生成","Stop generation")}</button><button disabled={readOnly||action.busy||run.run_status==="finishing"} onClick={()=>void action.act(async()=>{await post(`/runs/${run.id}/finish`);update();})}>{c("结束本次运行","End this run")}</button></>}
       <Link className="se-button" to={`/skill-eval/runs/${run.id}/refine`}>{c("基于结果微调 Skill","Refine Skill from this result")}</Link><a className="se-button" href={url(`/runs/${run.id}/skill/export`)}>{c("导出本次 Skill","Export this run's Skill")}</a>{ended&&<button onClick={()=>selection.toggle(run.id)}>{selection.selected.includes(run.id)?c("取消比较选择","Remove from comparison"):c("加入比较","Add to comparison")}</button>}
     </div>

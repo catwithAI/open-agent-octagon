@@ -56,6 +56,13 @@ from .base import (
     prompt_context,
     time_budget_notice,
 )
+from .cli_common import (
+    append_stderr_file,
+    cancel_stream_drain,
+    close_quietly,
+    drain_stream_to_bytes,
+    finish_stream_drain,
+)
 from .token_usage import (
     estimate_tokens_from_event,
     compact_usage,
@@ -396,15 +403,15 @@ class ClaudeCodeAdapter:
         conversation_trace = ConversationTraceWriter(
             attempt_dir / CONVERSATION_FILENAME, attempt_id=task.attempt_id,
         )
-        conversation_trace.conversation_started(
-            turn_count=len(plan.turns), is_legacy=plan.is_legacy,
-            score_turn_id=plan.score_turn.turn_id,
-        )
         current_turn_id: str | None = None
         current_turn_index: int | None = None
         proc: asyncio.subprocess.Process | None = None
 
         try:
+            conversation_trace.conversation_started(
+                turn_count=len(plan.turns), is_legacy=plan.is_legacy,
+                score_turn_id=plan.score_turn.turn_id,
+            )
             async def _run_turn(turn: Any, *, is_first: bool) -> None:
                 """跑一轮：spawn 一个 claude -p 子进程并消费其 stdout 到结束。"""
                 nonlocal proc, events_count, thinking_count, last_event_at
@@ -521,29 +528,39 @@ class ClaudeCodeAdapter:
                                     (turn_base.get(field) or 0) + value
                                 )
 
-                async with sandbox.exec(ExecSpec(
-                    argv=_build_cmd(turn, is_first=is_first),
-                    cwd=str(workspace),
-                    env=subprocess_env,
-                    turn_id=getattr(turn, "turn_id", None),
-                )) as proc:
-                    turn_proc = proc
-                    try:
-                        await asyncio.wait_for(
-                            _consume(), timeout=deadline.remaining(),
+                stderr_task: asyncio.Task[bytes] | None = None
+                stderr_bytes = b""
+                try:
+                    async with sandbox.exec(ExecSpec(
+                        argv=_build_cmd(turn, is_first=is_first),
+                        cwd=str(workspace),
+                        env=subprocess_env,
+                        turn_id=getattr(turn, "turn_id", None),
+                    )) as proc:
+                        turn_proc = proc
+                        stderr_task = asyncio.create_task(
+                            drain_stream_to_bytes(turn_proc.stderr),
                         )
-                        await asyncio.wait_for(turn_proc.wait(), timeout=5)
-                    except asyncio.TimeoutError:
-                        error_message = f"timeout after {task.timeout_seconds}s"
+                        try:
+                            await asyncio.wait_for(
+                                _consume(), timeout=deadline.remaining(),
+                            )
+                            await asyncio.wait_for(turn_proc.wait(), timeout=5)
+                        except asyncio.TimeoutError:
+                            error_message = f"timeout after {task.timeout_seconds}s"
+                    stderr_bytes = await finish_stream_drain(stderr_task)
+                finally:
+                    await cancel_stream_drain(stderr_task)
 
-                if turn_proc.stderr:
-                    stderr_bytes = await turn_proc.stderr.read()
+                if stderr_bytes:
                     stderr_text = stderr_bytes.decode(
                         "utf-8", errors="replace"
                     ).strip()
                     if stderr_text:
-                        (attempt_dir / "stderr.txt").write_text(
-                            stderr_text, encoding="utf-8",
+                        append_stderr_file(
+                            attempt_dir / "stderr.txt",
+                            stderr_text,
+                            turn_index=getattr(turn, "turn_index", current_turn_index),
                         )
                         if (
                             not error_message
@@ -682,7 +699,6 @@ class ClaudeCodeAdapter:
                 iteration_refs["iteration_final_round"] = int(
                     getattr(dynamic_decision, "round_index", 0)
                 )
-            conversation_trace.close()
 
         except FileNotFoundError:
             return AdapterResult(
@@ -702,7 +718,7 @@ class ClaudeCodeAdapter:
                 conversation_trace.conversation_failed(
                     error_code=failure_code, error_summary=str(exc),
                 )
-            conversation_trace.close()
+            close_quietly(conversation_trace)
             return AdapterResult(
                 attempt_id=task.attempt_id,
                 status=failure_status,
@@ -726,6 +742,8 @@ class ClaudeCodeAdapter:
                 ),
                 conversation_summary=summarize_conversation(attempt_dir),
             )
+        finally:
+            close_quietly(conversation_trace)
 
         duration_ms = int((datetime.now(timezone.utc) - started_at).total_seconds() * 1000)
         # proc 是最后一轮的进程；轮间预算耗尽时可能一轮都没跑（proc is None），

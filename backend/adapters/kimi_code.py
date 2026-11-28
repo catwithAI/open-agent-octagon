@@ -67,6 +67,13 @@ from .base import (
     prompt_context,
     time_budget_notice,
 )
+from .cli_common import (
+    append_stderr_file,
+    cancel_stream_drain,
+    close_quietly,
+    drain_stream_to_bytes,
+    finish_stream_drain,
+)
 from .error_taxonomy import classify as classify_cli_error
 from .token_usage import compact_usage, empty_usage
 
@@ -435,15 +442,15 @@ class KimiCodeAdapter:
         conversation_trace = ConversationTraceWriter(
             attempt_dir / CONVERSATION_FILENAME, attempt_id=task.attempt_id,
         )
-        conversation_trace.conversation_started(
-            turn_count=len(plan.turns), is_legacy=plan.is_legacy,
-            score_turn_id=plan.score_turn.turn_id,
-        )
         current_turn_id: str | None = None
         current_turn_index: int | None = None
         final_texts: list[str] = []
 
         try:
+            conversation_trace.conversation_started(
+                turn_count=len(plan.turns), is_legacy=plan.is_legacy,
+                score_turn_id=plan.score_turn.turn_id,
+            )
             async def _run_turn(turn: Any, *, is_first: bool) -> None:
                 nonlocal proc, events_count, thinking_count, last_event_at
                 nonlocal error_message, session_id
@@ -537,26 +544,35 @@ class KimiCodeAdapter:
                             if msg and not error_message:
                                 error_message = msg[:500]
 
-                async with sandbox.exec(ExecSpec(
-                    argv=_build_cmd(turn, is_first=is_first),
-                    cwd=str(workspace),
-                    env=subprocess_env,
-                    turn_id=getattr(turn, "turn_id", None),
-                )) as proc:
-                    turn_proc = proc
-                    try:
-                        await asyncio.wait_for(_consume(), timeout=deadline.remaining())
-                        await asyncio.wait_for(turn_proc.wait(), timeout=5)
-                    except asyncio.TimeoutError:
-                        error_message = f"timeout after {task.timeout_seconds}s"
+                stderr_task: asyncio.Task[bytes] | None = None
+                stderr_bytes = b""
+                try:
+                    async with sandbox.exec(ExecSpec(
+                        argv=_build_cmd(turn, is_first=is_first),
+                        cwd=str(workspace),
+                        env=subprocess_env,
+                        turn_id=getattr(turn, "turn_id", None),
+                    )) as proc:
+                        turn_proc = proc
+                        stderr_task = asyncio.create_task(
+                            drain_stream_to_bytes(turn_proc.stderr),
+                        )
+                        try:
+                            await asyncio.wait_for(_consume(), timeout=deadline.remaining())
+                            await asyncio.wait_for(turn_proc.wait(), timeout=5)
+                        except asyncio.TimeoutError:
+                            error_message = f"timeout after {task.timeout_seconds}s"
+                    stderr_bytes = await finish_stream_drain(stderr_task)
+                finally:
+                    await cancel_stream_drain(stderr_task)
 
-                if turn_proc.stderr:
-                    stderr = (
-                        await turn_proc.stderr.read()
-                    ).decode("utf-8", errors="replace").strip()
+                if stderr_bytes:
+                    stderr = stderr_bytes.decode("utf-8", errors="replace").strip()
                     if stderr:
-                        (attempt_dir / "stderr.txt").write_text(
-                            stderr, encoding="utf-8",
+                        append_stderr_file(
+                            attempt_dir / "stderr.txt",
+                            stderr,
+                            turn_index=getattr(turn, "turn_index", current_turn_index),
                         )
                         # kimi 的致命错误（config.invalid / failed to run prompt）
                         # 只出现在 stderr，stdout 一行都没有——非 0 退出时必须
@@ -615,7 +631,6 @@ class KimiCodeAdapter:
                 conversation_trace.conversation_failed(
                     error_code=None, error_summary=error_message,
                 )
-            conversation_trace.close()
 
         except FileNotFoundError:
             return AdapterResult(
@@ -631,6 +646,8 @@ class KimiCodeAdapter:
                 error_code="unexpected_error",
                 error_message=str(exc),
             )
+        finally:
+            close_quietly(conversation_trace)
 
         if final_texts:
             (attempt_dir / "kimi_final.txt").write_text(

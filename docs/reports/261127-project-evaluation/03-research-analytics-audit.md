@@ -1,8 +1,8 @@
 # 03 — Research/Experiments、Insights、Rubric Evolution、Iteration 与 Scorers 审计
 
-> 审计日期：2026-11-27 · 审计基线：`9c4cfaf` · **状态更新**：2026-11-27（PR #36 已合入，PR #37 待合入）
+> 审计日期：2026-11-27 · 审计基线：`9c4cfaf` · **状态更新**：2026-11-28（PR #36、PR #37 已合入 `main`；Phase 3 待合入）
 >
-> 状态图例：`✅ 已合入 (PR #36)` · `🟡 待合入 (PR #37)` · `⏸️ 已冻结/废弃 (D1)` · `🟡 部分完成` · `⬜ 未开始`
+> 状态图例：`✅ 已合入 (PR #36/#37)` · `🟡 本 PR 待合入 (Phase 3)` · `⏸️ 已冻结/废弃 (D1)` · `⬜ 未开始`
 >
 > 审计范围：`backend/research_api.py`、`experiments/`、`insights/`、`rubric_evolution/`、`iteration/`、`mutations/`、`analysis/`、`feedback/`、`profiles/`、`comparison_scorer.py`、`evals_scorer.py`、`attribution_client.py`。
 
@@ -14,11 +14,11 @@
 - **位置**：`backend/analysis/`、`backend/rubric_evolution/`
 - **处理**：按确认决策 D1 明确标记 `analysis` 废弃待删、`rubric_evolution` 冻结不再投入。
 
-### 2. [P1 竞态] Experiments 取消后仍继续创建 Run 并拉起 Agent 子进程 — `🟡 部分完成`
-- **位置**：`backend/experiments/coordinator.py:119, 148, 161-169, 325-410`、`backend/experiments/recovery.py:112-123, 194-200`
+### 2. [P1 竞态] Experiments 取消后仍继续创建 Run 并拉起 Agent 子进程 — `✅/🟡 已完成`
+- **位置**：`backend/experiments/coordinator.py`、`backend/experiments/recovery.py`
 - **状态拆解**：
   1. `coordinator.py` 校验 `transition_cell` 返回值与 `stop_group` 取消 `group:{id}` 任务：`✅ 已合入 (PR #36: T1.5)`。
-  2. `experiments/recovery.py` 查询活跃状态补 `'scoring'`：`⬜ 待后续补充`。
+  2. `experiments/recovery.py` 查询活跃状态补 `'scoring'`：`🟡 待合入 (Phase 3: T3.2)`。
 
 ### 3. [P1 全局卡死] Leader Outbox 消费者遇到异常行永久堵死 — `✅ 已合入 (PR #36: T1.5)`
 - **位置**：`backend/experiments/leader.py:21, 76, 101-129`
@@ -31,15 +31,15 @@
 ### 5. [P1 逻辑缺陷] `active_loop.py` 金标自证循环 & 演进调度器零退避重试风暴 — `⏸️ 已冻结 (PR #37: T2.4 / D1)`
 - **位置**：`backend/rubric_evolution/active_loop.py`、`scheduler.py`
 
-### 6. [P1 评分校验漏洞] 外部 Scorer 缺边界校验、对比评分读错目录、JSON 提取器 3 份坏拷贝 — `🟡 待合入 (PR #37: T2.4)`
+### 6. [P1 评分校验漏洞] 外部 Scorer 缺边界校验、对比评分读错目录、JSON 提取器 3 份坏拷贝 — `✅ 已合入 (PR #37: T2.4)`
 - **位置**：`backend/evals_scorer.py`、`backend/comparison_scorer.py`、`backend/attribution_client.py`、`backend/insights/generator.py`、`backend/rubric_evolution/{pipeline,judge_executor}.py`
-- **处理**：强校验非空/有限/`[0,1]` 与维度 ID 匹配；对齐冻结 `scoring-work` 快照目录；统一复用 `insights/jsonutil.parse_json_object`（同步更新 2 处测试桩）。
+- **处理**：强校验非空/有限/`[0,1]` 与维度 ID 匹配；对齐冻结 `scoring-work` 快照目录；统一复用 `insights/jsonutil.parse_json_object`。
 
-### 7. [P1 逻辑错误] 中性反馈污染 EMA & 推荐学习结果被 `INSERT OR IGNORE` 丢弃 — `✅/🟡 已完成`
+### 7. [P1 逻辑错误] 中性反馈污染 EMA & 推荐学习结果被 `INSERT OR IGNORE` 丢弃 — `✅ 已合入 (PR #36/#37)`
 - **位置**：`backend/feedback/learning.py:95`、`backend/profiles/recommend.py:115-117, 143`
-- **状态拆解**：`feedback/learning.py` 跳过中性信号 `✅ 已合入 (PR #36: T1.5)`；`profiles/recommend.py` 改 `ON CONFLICT DO UPDATE` `🟡 待合入 (PR #37: T2.4)`。
+- **状态拆解**：`feedback/learning.py` 跳过中性信号 `✅ 已合入 (PR #36: T1.5)`；`profiles/recommend.py` 改 `ON CONFLICT DO UPDATE` `✅ 已合入 (PR #37: T2.4)`。
 
-### 8. [P1 性能与边界] `research_api.py` 阻塞事件循环、`iteration/` 租约易断、`preview_token` 绑定不全 — `🟡 待合入 (PR #37: T2.3 / T2.4)`
+### 8. [P1 性能与边界] `research_api.py` 阻塞事件循环、`iteration/` 租约易断、`preview_token` 绑定不全 — `✅ 已合入 (PR #37: T2.3 / T2.4)`
 - **位置**：`backend/research_api.py`、`backend/iteration/controller.py`、`backend/mutations/preview.py`
 - **处理**：`research_api` 全量 `asyncio.to_thread`；`iteration` 增加 reviewer 隔离工作目录、续租锁重试与 `asyncio.Future` 替代 100Hz 忙等；`preview_token` 绑定 `source_hash` 与 `env_name`。
 

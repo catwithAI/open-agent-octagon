@@ -203,15 +203,19 @@ export function ExperimentBuilder() {
 
   useEffect(() => {
     if (!envName) return;
+    let alive = true;
     api.listEnvTasks(envName).then((items) => {
+      if (!alive) return;
       setTasks(items);
       setTaskId(items[0]?.id ?? "");
-    }).catch((reason) => setError(String(reason)));
+    }).catch((reason) => { if (alive) setError(String(reason)); });
     setMetaYaml("");
     setMetaError("");
     api.getEnvMeta(envName).then((result) => {
+      if (!alive) return;
       setMetaYaml(result.meta_yaml);
-    }).catch((reason) => setMetaError(String(reason)));
+    }).catch((reason) => { if (alive) setMetaError(String(reason)); });
+    return () => { alive = false; };
   }, [envName]);
 
   const selectedEnv = envs.find((env) => env.name === envName);
