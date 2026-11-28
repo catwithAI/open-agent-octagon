@@ -1,33 +1,35 @@
-import React from "react";
+import React, { Suspense, lazy } from "react";
 import ReactDOM from "react-dom/client";
 import { BrowserRouter, Route, Routes } from "react-router-dom";
 
 import { Submit } from "./pages/Submit";
-import { SameModelSubmit } from "./pages/SameModelSubmit";
-import { MultiModelSubmit } from "./pages/MultiModelSubmit";
 import { RunList } from "./pages/RunList";
-import { RunDetail } from "./pages/RunDetail";
-import { Scenarios } from "./pages/Scenarios";
-import { ExperimentBuilder } from "./pages/ExperimentBuilder";
-import { RunGroupLive } from "./pages/RunGroupLive";
-import { ResearchResults } from "./pages/ResearchResults";
-import { ExperimentInsights } from "./pages/ExperimentInsights";
-import { ExperimentList } from "./pages/ExperimentList";
-import { ExperimentOverview } from "./pages/ExperimentOverview";
-import { Profiles } from "./pages/Profiles";
-import { SystemCapabilities } from "./pages/SystemCapabilities";
-import { ResearchOverview } from "./pages/ResearchOverview";
-import { ScenarioDetail } from "./pages/ScenarioDetail";
 import { skillEvalRoutes } from "./skillEval/routes";
 import { AppShell } from "./components/AppShell";
 import { I18nProvider } from "./i18n";
 import "./styles.css";
+
+const SameModelSubmit = lazy(() => import("./pages/SameModelSubmit").then((m) => ({ default: m.SameModelSubmit })));
+const MultiModelSubmit = lazy(() => import("./pages/MultiModelSubmit").then((m) => ({ default: m.MultiModelSubmit })));
+const RunDetail = lazy(() => import("./pages/RunDetail").then((m) => ({ default: m.RunDetail })));
+const Scenarios = lazy(() => import("./pages/Scenarios").then((m) => ({ default: m.Scenarios })));
+const ScenarioDetail = lazy(() => import("./pages/ScenarioDetail").then((m) => ({ default: m.ScenarioDetail })));
+const ExperimentBuilder = lazy(() => import("./pages/ExperimentBuilder").then((m) => ({ default: m.ExperimentBuilder })));
+const RunGroupLive = lazy(() => import("./pages/RunGroupLive").then((m) => ({ default: m.RunGroupLive })));
+const ResearchResults = lazy(() => import("./pages/ResearchResults").then((m) => ({ default: m.ResearchResults })));
+const ExperimentInsights = lazy(() => import("./pages/ExperimentInsights").then((m) => ({ default: m.ExperimentInsights })));
+const ExperimentList = lazy(() => import("./pages/ExperimentList").then((m) => ({ default: m.ExperimentList })));
+const ExperimentOverview = lazy(() => import("./pages/ExperimentOverview").then((m) => ({ default: m.ExperimentOverview })));
+const Profiles = lazy(() => import("./pages/Profiles").then((m) => ({ default: m.Profiles })));
+const SystemCapabilities = lazy(() => import("./pages/SystemCapabilities").then((m) => ({ default: m.SystemCapabilities })));
+const ResearchOverview = lazy(() => import("./pages/ResearchOverview").then((m) => ({ default: m.ResearchOverview })));
 
 function App() {
   return (
     <I18nProvider>
     <BrowserRouter>
       <AppShell>
+        <Suspense fallback={<div className="muted" style={{ padding: 24 }}>Loading…</div>}>
         <Routes>
           {skillEvalRoutes}
           <Route path="/overview" element={<ResearchOverview />} />
@@ -47,6 +49,7 @@ function App() {
           <Route path="/profiles" element={<Profiles />} />
           <Route path="/system" element={<SystemCapabilities />} />
         </Routes>
+        </Suspense>
       </AppShell>
     </BrowserRouter>
     </I18nProvider>

@@ -1,5 +1,5 @@
 import {useEffect,useState} from "react";
-import {DocumentViewer,PresentationViewer,WorkbookViewer,HtmlArtifactView} from "../pages/RunDetail";
+import {DocumentViewer,PresentationViewer,WorkbookViewer,HtmlArtifactView} from "../components/viewers/ArtifactViewers";
 import type {ArtifactPreviewDescriptor} from "../api/client";
 import {request} from "./api";
 import {ErrorBox,useCopy} from "./common";
